@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include <algorithm>
 #include <array>
 #include <cstdlib>
@@ -33,7 +34,7 @@ struct StageMemory {
 };
 
 struct RelocationTrace {
-    std::mutex mutex;
+    AgcDriver::Mutex mutex;
     std::unordered_map<std::uint64_t, std::vector<StageMemory>> last;
     std::uint64_t draws = 0, repeats = 0, stages = 0, layoutDiffer = 0, contentSame = 0, contentSameInPlace = 0, regions = 0, words = 0, movedRegions = 0, differingMoved = 0, differingStatic = 0;
     std::array<std::uint64_t, 5> buckets{};
@@ -42,7 +43,7 @@ struct RelocationTrace {
 };
 
 struct DrawKeyTrace {
-    std::mutex mutex;
+    AgcDriver::Mutex mutex;
     std::unordered_map<std::uint64_t, std::array<std::uint32_t, 96>> last;
     std::uint64_t lookups = 0, hits = 0, repeats = 0, fresh = 0, sameWords = 0;
     std::map<std::uint32_t, std::uint64_t> differing;

@@ -1,4 +1,5 @@
 #include <cstdio>
+#include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/State.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
@@ -184,7 +185,7 @@ DepthTarget decodeDepthTarget(const Registers& cx) {
     const auto size = read(cx, 0x007);
     depth.extent = {(size & 0x3fffu) + 1u, ((size >> 16u) & 0x3fffu) + 1u};
     static const bool traceView = std::getenv("APS5_TRACE_DEPTH_VIEW") != nullptr;
-    static std::mutex traceMutex;
+    static AgcDriver::Mutex traceMutex;
     static std::set<std::pair<std::uint64_t, std::uint32_t>> traced;
     if (traceView && (view & 0x00ffffffu) != 0 && [&] { std::lock_guard lock(traceMutex); return traced.emplace(depth.address, view).second; }()) std::fprintf(stderr, "[depth-view] address 0x%llx stencil 0x%llx %ux%u view 0x%08x\n", static_cast<unsigned long long>(depth.address), static_cast<unsigned long long>(depth.stencilAddress), depth.extent.width, depth.extent.height, view);
     if (const auto slice = view & 0x1fffu; slice != 0) {

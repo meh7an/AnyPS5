@@ -2,6 +2,7 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_DRIVER_SHADERREGISTRY_HPP
 
 #include "prx/libSceAgcDriver/Execution/include/ShaderMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include <array>
 #include <atomic>
 #include <cstddef>
@@ -20,7 +21,7 @@ struct HandleMemos {
         std::shared_ptr<const ShaderRecompiler::SourceHandle> handle;
         std::shared_ptr<const std::string> failure;
     };
-    std::mutex mutex;
+    AgcDriver::Mutex mutex;
     std::array<Entry, 8> entries;
     std::size_t next = 0;
     std::atomic<std::uint32_t> poisoned{0};

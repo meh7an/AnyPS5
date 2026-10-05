@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include <cstdlib>
 #include <cstring>
@@ -56,7 +57,7 @@ void Driver::traceLabel(std::span<const std::uint32_t> packet, std::uint32_t que
     }
     if (kind == nullptr) return;
     if (std::string_view(kind) != "WAIT_REG_MEM") {
-        static std::mutex historyMutex;
+        static AgcDriver::Mutex historyMutex;
         std::lock_guard lock(historyMutex);
         auto& entry = writeHistory()[writeCursor()++ % writeHistory().size()];
         entry = {target, length, queue, opcode};

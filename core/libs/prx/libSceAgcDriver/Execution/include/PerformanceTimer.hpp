@@ -2,6 +2,7 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_PERFORMANCETIMER_HPP
 
 #include <algorithm>
+#include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -147,7 +148,7 @@ private:
         return std::chrono::duration<double, std::milli>(elapsed).count();
     }
 
-    std::mutex mutex;
+    AgcDriver::Mutex mutex;
     std::map<std::pair<std::string_view, std::string_view>, Metric> metrics;
     std::uint64_t id;
     std::uint64_t firstSerial = 0;

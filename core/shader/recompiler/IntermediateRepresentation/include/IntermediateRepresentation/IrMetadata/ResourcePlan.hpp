@@ -9,6 +9,7 @@
 #include "IntermediateRepresentation/IrMetadata/ShaderInfo.hpp"
 #include "IntermediateRepresentation/IrMetadata/ShaderStage.hpp"
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -52,9 +53,11 @@ struct UniformFillPlan {
 inline constexpr std::uint32_t NativePushConstantSize = sizeof(PushData);
 
 // A plan's compiled runtime walk (Optimization's Detail::SrtTape), made on first use by the captures
-// sharing the plan and kept with it; type-erased here.
+// sharing the plan and kept with it; type-erased here. `ready` lets the uses after the first skip
+// std::call_once (a winpthreads call on MinGW).
 struct SrtTapeSlot {
     std::once_flag once;
+    std::atomic<bool> ready{false};
     std::shared_ptr<const void> tape;
 };
 

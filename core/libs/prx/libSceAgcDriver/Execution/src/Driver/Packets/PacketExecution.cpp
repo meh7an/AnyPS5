@@ -17,13 +17,18 @@ namespace AgcDriver::DriverDetail {
 
 template <typename TWork>
 void Driver::timed(double WorkerProfile::*bucket, TWork&& work) {
+    // Only the report reads the totals: without it, no clock reads (two per packet).
+    static const bool report = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    if (!report) {
+        work();
+        return;
+    }
     static thread_local WorkerProfile profile;
     const auto begin = std::chrono::steady_clock::now();
     work();
     const auto end = std::chrono::steady_clock::now();
     profile.*bucket += std::chrono::duration<double, std::milli>(end - begin).count();
-    static const bool report = std::getenv("APS5_PROFILE_DRAW") != nullptr;
-    if (report && end - profile.reported > std::chrono::seconds(10)) {
+    if (end - profile.reported > std::chrono::seconds(10)) {
         profile.reported = end;
         AgcDriver::ProfilePrint_nid_no_patch( "[gpu] worker at %.0f s: dispatch %.1f s, draw %.1f s, wait %.1f s\n", std::chrono::duration<double>(end - profile.start).count(), profile.dispatchMs / 1000, profile.drawMs / 1000, profile.waitMs / 1000);
     }
@@ -134,7 +139,7 @@ void Driver::execute(const Submission& submission) {
 
         const auto flushStart = profilePackets ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         flushBetweenPackets(submission.queue, header, opcode == 0x49 || opcode == 0x37);
-        PacketTimer packetTimer{profilePackets, header == FlipPacketHeader ? 0xffffu : opcode, submission.queue, packetProfile, std::chrono::steady_clock::now()};
+        PacketTimer packetTimer{profilePackets, header == FlipPacketHeader ? 0xffffu : opcode, submission.queue, packetProfile, profilePackets ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{}};
 
         if (profilePackets) {
             packetStartedAt() = packetTimer.start;

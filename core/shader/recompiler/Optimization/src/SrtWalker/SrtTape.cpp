@@ -307,13 +307,16 @@ std::shared_ptr<const SrtTape> SrtTape::Compile(const IrResourcePlan& plan) {
 const SrtTape* SrtTape::For(const IrResourcePlan& plan) {
     auto* slot = plan.tapeSlot.get();
     if (slot == nullptr || !Enabled()) return nullptr;
-    std::call_once(slot->once, [&] {
-        try {
-            slot->tape = Compile(plan);
-        } catch (...) {
-            slot->tape = nullptr;
-        }
-    });
+    if (!slot->ready.load(std::memory_order_acquire)) {
+        std::call_once(slot->once, [&] {
+            try {
+                slot->tape = Compile(plan);
+            } catch (...) {
+                slot->tape = nullptr;
+            }
+        });
+        slot->ready.store(true, std::memory_order_release);
+    }
     return static_cast<const SrtTape*>(slot->tape.get());
 }
 
