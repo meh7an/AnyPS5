@@ -64,6 +64,45 @@ void require(bool condition, const char* reason) {
     if (!condition) throw std::runtime_error(std::string("Vulkan presentation: ") + reason);
 }
 
+// The swapchain's presentation mode and image count. FIFO with the surface's minimum of two images
+// holds the queue on the previous presentation until its vblank: under the Windows compositor a flip
+// then costs two refreshes, 30 frames per second for a title flipping every vblank. Flips are paced
+// by the emulated vblank (VideoOut) already, so MAILBOX (tear-free, never holding the queue) is taken
+// when the surface offers it, with three images. APS5_PRESENT_MODE=fifo|mailbox|immediate|relaxed and
+// APS5_SWAPCHAIN_IMAGES=<n> override (a mode the surface lacks falls back to FIFO, always offered).
+struct PresentationChoice {
+    VkPresentModeKHR mode;
+    std::uint32_t images;
+};
+
+PresentationChoice ChoosePresentation(PFN_vkGetPhysicalDeviceSurfacePresentModesKHR getModes, VkPhysicalDevice physical, VkSurfaceKHR surface, const VkSurfaceCapabilitiesKHR& capabilities) {
+    std::vector<VkPresentModeKHR> modes;
+    std::uint32_t count = 0;
+    if (getModes != nullptr && getModes(physical, surface, &count, nullptr) == VK_SUCCESS && count != 0) {
+        modes.resize(count);
+        if (getModes(physical, surface, &count, modes.data()) != VK_SUCCESS) count = 0;
+        modes.resize(count);
+    }
+    const auto offered = [&](VkPresentModeKHR mode) { return mode == VK_PRESENT_MODE_FIFO_KHR || std::find(modes.begin(), modes.end(), mode) != modes.end(); };
+    PresentationChoice choice{offered(VK_PRESENT_MODE_MAILBOX_KHR) ? VK_PRESENT_MODE_MAILBOX_KHR : VK_PRESENT_MODE_FIFO_KHR, std::max<std::uint32_t>(capabilities.minImageCount, 3u)};
+    if (const char* text = std::getenv("APS5_PRESENT_MODE"); text != nullptr) {
+        const std::string name(text);
+        const auto wanted = name == "mailbox" ? VK_PRESENT_MODE_MAILBOX_KHR : name == "immediate" ? VK_PRESENT_MODE_IMMEDIATE_KHR : name == "relaxed" ? VK_PRESENT_MODE_FIFO_RELAXED_KHR : VK_PRESENT_MODE_FIFO_KHR;
+        choice.mode = offered(wanted) ? wanted : VK_PRESENT_MODE_FIFO_KHR;
+    }
+    if (const char* text = std::getenv("APS5_SWAPCHAIN_IMAGES"); text != nullptr) {
+        const auto parsed = std::strtoul(text, nullptr, 10);
+        if (parsed != 0) choice.images = std::max<std::uint32_t>(capabilities.minImageCount, static_cast<std::uint32_t>(parsed));
+    }
+    if (capabilities.maxImageCount != 0) choice.images = std::min(choice.images, capabilities.maxImageCount);
+    static std::atomic<bool> reported{false};
+    if (!reported.exchange(true)) {
+        const char* name = choice.mode == VK_PRESENT_MODE_MAILBOX_KHR ? "mailbox" : choice.mode == VK_PRESENT_MODE_IMMEDIATE_KHR ? "immediate" : choice.mode == VK_PRESENT_MODE_FIFO_RELAXED_KHR ? "fifo-relaxed" : "fifo";
+        std::fprintf(stderr, "[present] swapchain: %s, %u images (surface minimum %u)\n", name, choice.images, capabilities.minImageCount);
+    }
+    return choice;
+}
+
 // The ShaderResources content cache dispatches share with recorded draws: Graphics::ResourceCache,
 // one process-wide instance (see SharedResourceCache) that the State references so this file keeps
 // its Find/Insert/Remove/Clear calls; the device clears it at teardown before its descriptor caches
@@ -1138,9 +1177,10 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
         std::vector<VkSurfaceFormatKHR> formats(formatCount);
         check(getFormats(selected, state->surface, &formatCount, formats.data()), "vkGetPhysicalDeviceSurfaceFormatsKHR");
         require(std::any_of(formats.begin(), formats.end(), [](const auto& format) { return format.format == VK_FORMAT_B8G8R8A8_UNORM && format.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR; }), "BGRA8 sRGB-nonlinear surface format is unavailable");
+        const auto presentation = ChoosePresentation(state->InstanceFunction<PFN_vkGetPhysicalDeviceSurfacePresentModesKHR>("vkGetPhysicalDeviceSurfacePresentModesKHR"), selected, state->surface, surface);
         VkSwapchainCreateInfoKHR swapchain{VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR};
         swapchain.surface = state->surface;
-        swapchain.minImageCount = surface.minImageCount;
+        swapchain.minImageCount = presentation.images;
         swapchain.imageFormat = VK_FORMAT_B8G8R8A8_UNORM;
         swapchain.imageColorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
         swapchain.imageExtent = state->extent;
@@ -1149,7 +1189,7 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
         swapchain.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
         swapchain.preTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
         swapchain.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
-        swapchain.presentMode = VK_PRESENT_MODE_FIFO_KHR;
+        swapchain.presentMode = presentation.mode;
         swapchain.clipped = VK_FALSE;
         check(state->DeviceFunction<PFN_vkCreateSwapchainKHR>("vkCreateSwapchainKHR")(state->device, &swapchain, nullptr, &state->swapchain), "vkCreateSwapchainKHR");
         std::uint32_t imageCount = 0;
@@ -1796,9 +1836,10 @@ void VulkanDevice::Resize(std::uint32_t width, std::uint32_t height) {
     }
     require(width >= surface.minImageExtent.width && width <= surface.maxImageExtent.width && height >= surface.minImageExtent.height && height <= surface.maxImageExtent.height, "unsupported resized output extent");
     require((surface.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_DST_BIT) != 0 && (surface.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR) != 0 && (surface.supportedTransforms & VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR) != 0, "resized surface capabilities are unsupported");
+    const auto presentation = ChoosePresentation(state->InstanceFunction<PFN_vkGetPhysicalDeviceSurfacePresentModesKHR>("vkGetPhysicalDeviceSurfacePresentModesKHR"), state->physical, state->surface, surface);
     VkSwapchainCreateInfoKHR create{VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR};
     create.surface = state->surface;
-    create.minImageCount = surface.minImageCount;
+    create.minImageCount = presentation.images;
     create.imageFormat = VK_FORMAT_B8G8R8A8_UNORM;
     create.imageColorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
     create.imageExtent = {width, height};
@@ -1807,7 +1848,7 @@ void VulkanDevice::Resize(std::uint32_t width, std::uint32_t height) {
     create.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
     create.preTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
     create.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
-    create.presentMode = VK_PRESENT_MODE_FIFO_KHR;
+    create.presentMode = presentation.mode;
     create.oldSwapchain = state->swapchain;
     state->retiredSwapchains.reserve(state->retiredSwapchains.size() + 1);
     VkSwapchainKHR replacement = VK_NULL_HANDLE;
@@ -2507,6 +2548,10 @@ std::optional<std::string> VulkanDevice::KnownDrawRejection(const Graphics::Stat
 
 void VulkanDevice::ColorMetadataPass(const Graphics::ColorMetadataPass& pass) {
     Graphics::RunColorMetadataPass(graphicsContext(), pass);
+}
+
+void VulkanDevice::DepthClearPass(const Graphics::DepthClearPass& pass) {
+    Graphics::ClearDepthSurface(graphicsContext(), pass.target, pass.depth, pass.stencil);
 }
 
 void VulkanDevice::Draw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, std::span<const Graphics::GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipe) {

@@ -3,6 +3,8 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <limits>
 #include <mutex>
 #include <stdexcept>
@@ -436,6 +438,8 @@ int APS5_VABI sceKernelDeleteTimerEvent(KernelEqueue eq, int id) {
 }
 
 int APS5_VABI sceKernelAddAmprEvent(KernelEqueue eq, int id, void* udata) {
+    static const bool trace = std::getenv("APS5_TRACE_APR") != nullptr;
+    if (trace) std::fprintf(stderr, "[apr] add event equeue=0x%llx ident=%d udata=%p\n", static_cast<unsigned long long>(eq), id, udata);
     if (eq == 0) {
         return EQUEUE_OK;
     }

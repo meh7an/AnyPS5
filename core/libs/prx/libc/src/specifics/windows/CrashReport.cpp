@@ -12,6 +12,11 @@
 #include <cstring>
 #include <utility>
 #include <mutex>
+#include <algorithm>
+#include <iterator>
+#include <string>
+#include <unordered_map>
+#include <vector>
 #include "Sse4aEmulation.hpp"
 
 namespace {
@@ -234,7 +239,10 @@ bool HandleSse4a(EXCEPTION_POINTERS* info) {
     sse4a::Field field;
     if (!sse4a::Emulate(bytes, available, *context, &instruction, &field)) return false;
     const auto count = ++g_sse4aEmulated;
-    if (g_sse4aTrace) TraceSse4a(rip, instruction, field, count);
+    if (g_sse4aTrace) {
+        TraceSse4a(rip, instruction, field, count);
+        if (count % 100000 == 0) Report("[sse4a] %llu instructions emulated so far (tick %llu ms)\n", static_cast<unsigned long long>(count), static_cast<unsigned long long>(GetTickCount64()));
+    }
     return true;
 }
 
@@ -424,6 +432,297 @@ void ReportAllThreads() {
     if (skippedCount != 0) Report("  %llu further thread(s) left out\n", static_cast<unsigned long long>(skippedCount));
 }
 
+unsigned long long EnvironmentSeconds(const char* name, unsigned long long fallback) {
+    const char* text = std::getenv(name);
+    if (text == nullptr || text[0] < '0' || text[0] > '9') return fallback;
+    char* end = nullptr;
+    const auto value = std::strtoull(text, &end, 10);
+    return end != nullptr && *end == 0 ? value : fallback;
+}
+
+// APS5_SAMPLE_SECONDS: after APS5_SAMPLE_DELAY seconds (default 60), every thread's instruction
+// pointer is sampled for that many seconds; the busy threads and the hottest module offsets are
+// reported. A thread is suspended only for the context read: nothing is allocated while it is held.
+DWORD WINAPI SampleProfiler(LPVOID param) {
+    const auto seconds = static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(param));
+    Sleep(static_cast<DWORD>(EnvironmentSeconds("APS5_SAMPLE_DELAY", 60) * 1000ull));
+    struct Sampled {
+        DWORD id;
+        HANDLE handle;
+        std::string name;
+        unsigned long long busy = 0;
+        unsigned long long total = 0;
+    };
+    const DWORD self = GetCurrentThreadId();
+    const DWORD pid = GetCurrentProcessId();
+    std::vector<Sampled> threads;
+    std::unordered_map<std::uint64_t, unsigned long long> hits;
+    // Every sample is charged to its stack, unwound over a copy taken while the thread was
+    // suspended. A leaf just after a syscall instruction is a kernel call; one of the wait services
+    // is a blocked thread, any other is work.
+    struct Range {
+        std::uint64_t begin;
+        std::uint64_t end;
+        bool own;
+    };
+    std::vector<Range> code;
+    {
+        HANDLE modules = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, pid);
+        if (modules != INVALID_HANDLE_VALUE) {
+            MODULEENTRY32 module{};
+            module.dwSize = sizeof(module);
+            if (Module32First(modules, &module)) {
+                do {
+                    const std::string name = module.szModule;
+                    const bool own = name.size() > 4 && (name.compare(name.size() - 4, 4, ".prx") == 0 || name.compare(name.size() - 4, 4, ".exe") == 0);
+                    const auto base = reinterpret_cast<std::uint64_t>(module.modBaseAddr);
+                    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+                    if (dos->e_magic != IMAGE_DOS_SIGNATURE) continue;
+                    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + static_cast<std::uint64_t>(dos->e_lfanew));
+                    if (nt->Signature != IMAGE_NT_SIGNATURE) continue;
+                    const auto* section = IMAGE_FIRST_SECTION(nt);
+                    for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++section) {
+                        if ((section->Characteristics & IMAGE_SCN_MEM_EXECUTE) == 0 || (section->Characteristics & IMAGE_SCN_MEM_READ) == 0) continue;
+                        const auto size = std::max<std::uint64_t>(section->Misc.VirtualSize, section->SizeOfRawData);
+                        code.push_back({base + section->VirtualAddress, base + section->VirtualAddress + size, own});
+                    }
+                } while (Module32Next(modules, &module));
+            }
+            CloseHandle(modules);
+        }
+    }
+    std::sort(code.begin(), code.end(), [](const Range& a, const Range& b) { return a.begin < b.begin; });
+    const auto codeAt = [&](std::uint64_t address) -> const Range* {
+        auto it = std::upper_bound(code.begin(), code.end(), address, [](std::uint64_t value, const Range& range) { return value < range.begin; });
+        if (it == code.begin()) return nullptr;
+        --it;
+        return address < it->end ? &*it : nullptr;
+    };
+    // Module+offset, or the nearest export for a system module (ntdll's Nt services).
+    std::unordered_map<std::uint64_t, std::string> names;
+    const auto nameOf = [&](std::uint64_t address) -> const std::string& {
+        auto [it, inserted] = names.try_emplace(address);
+        if (!inserted) return it->second;
+        HMODULE module = nullptr;
+        char path[MAX_PATH] = "?";
+        char text[MAX_PATH + 160];
+        if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, reinterpret_cast<LPCSTR>(address), &module) || module == nullptr) {
+            std::snprintf(text, sizeof(text), "0x%llx", static_cast<unsigned long long>(address));
+            it->second = text;
+            return it->second;
+        }
+        GetModuleFileNameA(module, path, sizeof(path));
+        const char* name = path;
+        for (const char* cursor = path; *cursor; ++cursor) {
+            if (*cursor == '\\' || *cursor == '/') name = cursor + 1;
+        }
+        const auto base = reinterpret_cast<std::uint64_t>(module);
+        const auto* range = codeAt(address);
+        const char* best = nullptr;
+        std::uint64_t bestAddress = 0;
+        if (range == nullptr || !range->own) {
+            const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + static_cast<std::uint64_t>(reinterpret_cast<const IMAGE_DOS_HEADER*>(base)->e_lfanew));
+            const auto& directory = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+            if (directory.VirtualAddress != 0 && directory.Size != 0) {
+                const auto* exports = reinterpret_cast<const IMAGE_EXPORT_DIRECTORY*>(base + directory.VirtualAddress);
+                const auto* functions = reinterpret_cast<const DWORD*>(base + exports->AddressOfFunctions);
+                const auto* exportNames = reinterpret_cast<const DWORD*>(base + exports->AddressOfNames);
+                const auto* ordinals = reinterpret_cast<const WORD*>(base + exports->AddressOfNameOrdinals);
+                for (DWORD i = 0; i < exports->NumberOfNames; ++i) {
+                    const auto function = base + functions[ordinals[i]];
+                    if (function <= address && function > bestAddress) {
+                        bestAddress = function;
+                        best = reinterpret_cast<const char*>(base + exportNames[i]);
+                    }
+                }
+            }
+        }
+        if (best != nullptr && address - bestAddress < 0x4000) std::snprintf(text, sizeof(text), "%s!%s+0x%llx", name, best, static_cast<unsigned long long>(address - bestAddress));
+        else std::snprintf(text, sizeof(text), "%s+0x%llx", name, static_cast<unsigned long long>(address - base));
+        it->second = text;
+        return it->second;
+    };
+    struct Kinds {
+        unsigned long long run = 0;
+        unsigned long long kernel = 0;
+        unsigned long long wait = 0;
+    };
+    std::unordered_map<DWORD, Kinds> kinds;
+    std::unordered_map<std::string, unsigned long long> stacks;
+    // The stack copy, with as much zeroed margin past it: the unwinder may read a frame's saved
+    // registers beyond the copied part.
+    constexpr std::size_t StackCopyBytes = 128 * 1024;
+    constexpr std::size_t MaxFrames = 24;
+    auto* stackCopy = static_cast<std::uint8_t*>(VirtualAlloc(nullptr, StackCopyBytes * 2, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    if (stackCopy == nullptr) return 0;
+    const auto refresh = [&] {
+        HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+        if (snapshot == INVALID_HANDLE_VALUE) return;
+        THREADENTRY32 entry{};
+        entry.dwSize = sizeof(entry);
+        if (Thread32First(snapshot, &entry)) {
+            do {
+                if (entry.th32OwnerProcessID != pid || entry.th32ThreadID == self) continue;
+                if (std::any_of(threads.begin(), threads.end(), [&](const Sampled& known) { return known.id == entry.th32ThreadID; })) continue;
+                HANDLE thread = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, entry.th32ThreadID);
+                if (!thread) continue;
+                std::string name;
+                PWSTR description = nullptr;
+                if (SUCCEEDED(GetThreadDescription(thread, &description)) && description) {
+                    char text[128] = "";
+                    WideCharToMultiByte(CP_UTF8, 0, description, -1, text, sizeof(text), nullptr, nullptr);
+                    name = text;
+                    LocalFree(description);
+                }
+                threads.push_back({entry.th32ThreadID, thread, name});
+            } while (Thread32Next(snapshot, &entry));
+        }
+        CloseHandle(snapshot);
+    };
+    const auto end = GetTickCount64() + seconds * 1000ull;
+    auto nextRefresh = 0ull;
+    unsigned long long rounds = 0;
+    while (GetTickCount64() < end) {
+        if (GetTickCount64() >= nextRefresh) {
+            refresh();
+            nextRefresh = GetTickCount64() + 1000ull;
+        }
+        for (auto& thread : threads) {
+            if (SuspendThread(thread.handle) == static_cast<DWORD>(-1)) continue;
+            CONTEXT context{};
+            context.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
+            const BOOL read = GetThreadContext(thread.handle, &context);
+            std::size_t copied = 0;
+            if (read) {
+                MEMORY_BASIC_INFORMATION region{};
+                if (VirtualQuery(reinterpret_cast<LPCVOID>(context.Rsp), &region, sizeof(region)) != 0 && region.State == MEM_COMMIT) {
+                    const auto end = reinterpret_cast<std::uint64_t>(region.BaseAddress) + region.RegionSize;
+                    copied = static_cast<std::size_t>(std::min<std::uint64_t>(StackCopyBytes, end - context.Rsp));
+                    std::memcpy(stackCopy, reinterpret_cast<const void*>(context.Rsp), copied);
+                }
+            }
+            ResumeThread(thread.handle);
+            if (!read) continue;
+            // The frames, unwound through the modules' unwind tables over the copy (registers that
+            // point into the thread's stack are moved into the copy first; a frame leaving the copy
+            // ends the walk). A function without unwind data is a leaf: its return address is at RSP.
+            std::uint64_t frames[MaxFrames];
+            std::size_t frameCount = 0;
+            {
+                CONTEXT unwind = context;
+                const auto originalLow = context.Rsp;
+                const auto originalHigh = context.Rsp + copied;
+                const auto copyLow = reinterpret_cast<std::uint64_t>(stackCopy);
+                const auto copyHigh = copyLow + copied;
+                const auto rebase = [&] {
+                    for (DWORD64* value : {&unwind.Rsp, &unwind.Rbp, &unwind.Rbx, &unwind.Rsi, &unwind.Rdi, &unwind.R12, &unwind.R13, &unwind.R14, &unwind.R15}) {
+                        if (*value >= originalLow && *value < originalHigh) *value = *value - originalLow + copyLow;
+                    }
+                };
+                rebase();
+                while (frameCount < MaxFrames) {
+                    frames[frameCount++] = unwind.Rip;
+                    if (copied == 0 || unwind.Rsp < copyLow || unwind.Rsp + 8 > copyHigh || codeAt(unwind.Rip) == nullptr) break;
+                    DWORD64 imageBase = 0;
+                    auto* function = RtlLookupFunctionEntry(unwind.Rip, &imageBase, nullptr);
+                    if (function == nullptr) {
+                        unwind.Rip = *reinterpret_cast<const DWORD64*>(unwind.Rsp);
+                        unwind.Rsp += 8;
+                    } else {
+                        PVOID handlerData = nullptr;
+                        DWORD64 establisher = 0;
+                        RtlVirtualUnwind(UNW_FLAG_NHANDLER, imageBase, unwind.Rip, function, &unwind, &handlerData, &establisher, nullptr);
+                    }
+                    rebase();
+                    if (unwind.Rip == 0 || unwind.Rsp < copyLow || unwind.Rsp > copyHigh) break;
+                }
+            }
+            ++thread.total;
+            const auto* leafCode = codeAt(context.Rip);
+            const auto* leafBytes = reinterpret_cast<const std::uint8_t*>(context.Rip);
+            const bool kernel = leafCode != nullptr && context.Rip >= leafCode->begin + 2 && leafBytes[-2] == 0x0f && leafBytes[-1] == 0x05;
+            const auto& leaf = nameOf(context.Rip);
+            const bool waiting = kernel && (leaf.find("Wait") != std::string::npos || leaf.find("Delay") != std::string::npos || leaf.find("RemoveIoCompletion") != std::string::npos);
+            auto& kind = kinds[thread.id];
+            if (waiting) ++kind.wait;
+            else if (kernel) ++kind.kernel;
+            else ++kind.run;
+            if (!waiting) {
+                ++thread.busy;
+                ++hits[context.Rip];
+            }
+            std::string key = std::to_string(thread.id) + (waiting ? " wait " : kernel ? " kernel " : " run ") + leaf;
+            for (std::size_t frame = 1; frame < frameCount; ++frame) {
+                key += " <- ";
+                // A return address names its call: one byte back lies inside the calling instruction.
+                key += nameOf(frames[frame] - 1);
+            }
+            ++stacks[key];
+        }
+        ++rounds;
+        Sleep(1);
+    }
+    // APS5_SAMPLE_OUT names a file for the report (other threads' stderr lines cannot interleave
+    // with it there); stderr otherwise.
+    HANDLE out = INVALID_HANDLE_VALUE;
+    if (const char* path = std::getenv("APS5_SAMPLE_OUT"); path != nullptr && path[0] != 0) out = CreateFileA(path, GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    const auto emit = [&](const char* format, ...) {
+        char buffer[2048];
+        va_list args;
+        va_start(args, format);
+        int length = std::vsnprintf(buffer, sizeof(buffer), format, args);
+        va_end(args);
+        if (length <= 0) return;
+        if (length > static_cast<int>(sizeof(buffer)) - 1) length = sizeof(buffer) - 1;
+        DWORD written = 0;
+        WriteFile(out != INVALID_HANDLE_VALUE ? out : GetStdHandle(STD_ERROR_HANDLE), buffer, static_cast<DWORD>(length), &written, nullptr);
+    };
+    std::sort(threads.begin(), threads.end(), [](const Sampled& a, const Sampled& b) { return a.busy > b.busy; });
+    emit("[sample] %llu rounds over %llu s; threads by samples running / in other kernel calls / blocked in a wait (of all):\n", rounds, seconds);
+    std::unordered_map<DWORD, bool> busyThread;
+    for (std::size_t i = 0; i < threads.size() && i < 24 && threads[i].busy != 0; ++i) {
+        const auto& kind = kinds[threads[i].id];
+        emit("[sample]   thread %lu '%s' run %llu kernel %llu wait %llu / %llu\n", static_cast<unsigned long>(threads[i].id), threads[i].name.c_str(), kind.run, kind.kernel, kind.wait, threads[i].total);
+        busyThread[threads[i].id] = threads[i].busy * 50 >= threads[i].total;
+    }
+    std::unordered_map<std::string, unsigned long long> byOffset;
+    unsigned long long busy = 0;
+    for (const auto& [rip, count] : hits) {
+        char line[MAX_PATH + 64];
+        DescribeAddress(rip, line, sizeof(line));
+        byOffset[line] += count;
+        busy += count;
+    }
+    std::vector<std::pair<std::string, unsigned long long>> ranked(byOffset.begin(), byOffset.end());
+    std::sort(ranked.begin(), ranked.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+    emit("[sample] hottest instructions (%llu busy samples):\n", busy);
+    for (std::size_t i = 0; i < ranked.size() && i < 80; ++i) emit("[sample]   %6llu %5.2f%% %s\n", ranked[i].second, busy != 0 ? 100.0 * static_cast<double>(ranked[i].second) / static_cast<double>(busy) : 0.0, ranked[i].first.c_str());
+    // Every stack of a thread busy at least 2% of its samples (its waits too: they show what it
+    // blocks on), then the other threads' most common waits.
+    std::vector<std::pair<std::string, unsigned long long>> rankedStacks(stacks.begin(), stacks.end());
+    std::sort(rankedStacks.begin(), rankedStacks.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+    const auto threadOf = [](const std::string& key) { return static_cast<DWORD>(std::strtoul(key.c_str(), nullptr, 10)); };
+    emit("[sample] stacks of the busy threads (thread, kind, leaf <- return addresses: system frames up to the first emulator or game frame, then emulator and game frames):\n");
+    std::size_t emitted = 0;
+    for (const auto& [key, count] : rankedStacks) {
+        if (emitted >= 3000) break;
+        if (!busyThread[threadOf(key)] || count < 2) continue;
+        emit("[sample-stack] %6llu %s\n", count, key.c_str());
+        ++emitted;
+    }
+    emit("[sample] other threads' stacks:\n");
+    emitted = 0;
+    for (const auto& [key, count] : rankedStacks) {
+        if (emitted >= 150) break;
+        if (busyThread[threadOf(key)]) continue;
+        emit("[sample-stack] %6llu %s\n", count, key.c_str());
+        ++emitted;
+    }
+    if (out != INVALID_HANDLE_VALUE) CloseHandle(out);
+    for (const auto& thread : threads) CloseHandle(thread.handle);
+    return 0;
+}
+
 DWORD WINAPI HangWatchdog(LPVOID param) {
     const auto seconds = static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(param));
     Sleep(static_cast<DWORD>(seconds * 1000ull));
@@ -480,6 +779,7 @@ const bool g_crashReportInstalled = [] {
         }
         if (seconds > 0) CreateThread(nullptr, 0, HangWatchdog, reinterpret_cast<LPVOID>(static_cast<std::uintptr_t>(seconds)), 0, nullptr);
     }
+    if (const auto seconds = EnvironmentSeconds("APS5_SAMPLE_SECONDS", 0); seconds > 0) CreateThread(nullptr, 0, SampleProfiler, reinterpret_cast<LPVOID>(static_cast<std::uintptr_t>(seconds)), 0, nullptr);
     return true;
 }();
 

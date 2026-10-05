@@ -97,7 +97,9 @@ void Driver::execute(const Submission& submission) {
     }
     PacketHistory recent{submission.commands};
 
-    static const bool profilePackets = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    // APS5_PROFILE_DRAW_PHASES=1: the packet and draw phase timers alone, without the rest of
+    // APS5_PROFILE_DRAW's instrumentation (which slows draws several times over).
+    static const bool profilePackets = std::getenv("APS5_PROFILE_DRAW") != nullptr || std::getenv("APS5_PROFILE_DRAW_PHASES") != nullptr;
 
     thread_local PacketProfile* packetProfileSlot = nullptr;
     auto& packetProfile = ShaderRecompiler::ThreadOwned(packetProfileSlot);

@@ -96,6 +96,15 @@ private:
     void dispatch(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::uint64_t indirectArguments = 0);
     void verifyDataHit(const ShaderSnapshot& snapshot, std::size_t codeOffset, std::uint64_t deviceSerial, ShaderRecompiler::RecompileRequest request, std::span<const ShaderRecompiler::MemoryRegion> memory, std::uint64_t address, const DispatchVariant& variant, std::span<const std::uint32_t> liveWords, const ShaderRecompiler::RecompileResult& patched);
     static bool drawEntries();
+    // Whether this draw uses the draw cache (key, lookup, insertion). A title that writes its per-draw
+    // constants to fresh addresses every frame changes the user data words of every draw, so the
+    // register key never repeats and the cache only costs: a probe window of lookups hitting under
+    // 1 in 32 parks the cache for DrawCacheParkDraws draws, then another window probes again.
+    // APS5_DRAW_CACHE_ALWAYS=1 never parks it.
+    bool drawCacheActive();
+    void noteDrawCacheLookup(bool hit);
+    static constexpr std::uint32_t DrawCacheProbeLookups = 2048;
+    static constexpr std::uint64_t DrawCacheParkDraws = 60000;
     static bool verifyDrawEntries();
     static bool registerKeyEnabled();
     static bool verifyDrawRecipe();
@@ -106,6 +115,9 @@ private:
     void attachDrawRecipe(std::uint64_t key, const std::vector<std::shared_ptr<DispatchVariant>>& stages, std::shared_ptr<const DrawRecipe> recipe);
     void reportDrawCache(DrawEntryCounters& counters);
     static std::uint64_t drawRegisterKey(const QueueState& queue, const ShaderRegistry& registry, std::uint64_t deviceSerial);
+    // APS5_TRACE_DRAWKEY: how often a missed draw key differs from an earlier draw's only in the
+    // user data words, and in which of them.
+    static void traceDrawKey(const QueueState& queue, const ShaderRegistry& registry, std::uint64_t deviceSerial, bool hit);
     static bool sameVertexInfo(const ShaderRecompiler::ShaderVertexStageInfo& a, const ShaderRecompiler::ShaderVertexStageInfo& b);
     static bool sameDecode(const DrawDecode& a, const DrawDecode& b);
     std::shared_ptr<DrawDecode> decodeDraw(const QueueState& queue, const Submission& submission);
@@ -262,6 +274,13 @@ private:
     std::list<std::uint64_t> drawOrder;
     std::mutex drawCacheMutex;
     std::uint64_t drawCacheHits = 0, drawCacheEvictions = 0, drawCacheVariants = 0, drawCacheVariantBytes = 0;
+    // The draw cache parks itself while it does not pay (drawCacheActive): draws counted, the draw
+    // count the park lasts until, and the current probe window's lookups and hits.
+    std::atomic<std::uint64_t> drawCacheDraws{0};
+    std::atomic<std::uint64_t> drawCacheParkedUntil{0};
+    std::atomic<std::uint32_t> drawCacheWindowLookups{0};
+    std::atomic<std::uint32_t> drawCacheWindowHits{0};
+    std::atomic<std::uint64_t> drawCacheParks{0};
 
     DrawEntryCounters drawEntryCounters;
 

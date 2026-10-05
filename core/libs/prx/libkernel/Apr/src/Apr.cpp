@@ -106,7 +106,11 @@ bool _resolve(const char* guestPath, std::uint32_t* id, std::uint64_t* size) {
     if (!guestPath) return false;
     auto hostPath = ResolvePath_nid_no_patch(guestPath);
     std::uint64_t bytes = 0;
-    if (!_fileSize(hostPath, bytes)) return false;
+    if (!_fileSize(hostPath, bytes)) {
+        static const bool trace = std::getenv("APS5_TRACE_APR") != nullptr;
+        if (trace) std::fprintf(stderr, "[apr] resolve %s: not found (%s)\n", guestPath, hostPath.string().c_str());
+        return false;
+    }
     std::lock_guard lock(g_filesLock);
     const auto key = hostPath.string();
     auto found = g_idsByPath.find(key);
@@ -590,7 +594,9 @@ void _execute(const Apr::CommandBufferObject& buffer) {
         }
         case Apr::Opcode::WriteKernelEventQueue: {
             const auto command = _read<Apr::WriteKernelEventQueueCommand>(buffer, cursor);
-            EqueueTriggerEvent_nid_postfix(static_cast<KernelEqueue>(command.equeue), static_cast<uintptr_t>(command.ident), EVFILT_AMPR, reinterpret_cast<void*>(command.data));
+            const int triggered = EqueueTriggerEvent_nid_postfix(static_cast<KernelEqueue>(command.equeue), static_cast<uintptr_t>(command.ident), EVFILT_AMPR, reinterpret_cast<void*>(command.data));
+            static const bool trace = std::getenv("APS5_TRACE_APR") != nullptr;
+            if (trace) std::fprintf(stderr, "[apr] event equeue=0x%llx ident=%lld data=0x%llx -> %d\n", static_cast<unsigned long long>(command.equeue), static_cast<long long>(command.ident), static_cast<unsigned long long>(command.data), triggered);
             break;
         }
         case Apr::Opcode::WriteAddressFromTimeCounter: {
@@ -704,7 +710,22 @@ int APS5_VABI sceKernelAprGetFileStat(uint32_t id, FileStat* stat) {
 
 int APS5_VABI sceKernelAprSubmitCommandBuffer(const Apr::CommandBufferObject* buffer, uint32_t priority) {
     (void)priority;
-    if (!buffer || buffer->type != Apr::BufferType::Apr) return _fail(GUEST_EINVAL);
+    static const bool trace = std::getenv("APS5_TRACE_APR") != nullptr;
+    if (!buffer || (buffer->type != Apr::BufferType::Apr && buffer->type != Apr::BufferType::Generic)) {
+        if (trace) std::fprintf(stderr, "[apr] submit rejected: buffer %p type %d\n", static_cast<const void*>(buffer), buffer ? static_cast<int>(buffer->type) : -1);
+        return _fail(GUEST_EINVAL);
+    }
+    if (trace) {
+        std::string opcodes;
+        for (std::uint32_t cursor = 0, index = 0; index < buffer->numCommands && cursor + sizeof(Apr::CommandHeader) <= buffer->offset; ++index) {
+            Apr::CommandHeader header;
+            std::memcpy(&header, buffer->base + cursor, sizeof(header));
+            opcodes += " " + std::to_string(static_cast<std::uint32_t>(header.opcode));
+            if (header.bytes == 0) break;
+            cursor += header.bytes;
+        }
+        std::fprintf(stderr, "[apr] submit %u commands:%s\n", buffer->numCommands, opcodes.c_str());
+    }
     _execute(*buffer);
     return 0;
 }

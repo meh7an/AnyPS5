@@ -6,6 +6,7 @@
 #include "prx/libSceAgcDriver/Execution/include/QueueState.hpp"
 #include <vector>
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -110,6 +111,15 @@ struct ColorMetadataPass {
     std::vector<ColorTarget> targets;
 };
 std::optional<ColorMetadataPass> DecodeColorMetadataPass(const QueueState& queue);
+
+// A DB_RENDER_CONTROL depth/stencil clear draw over a whole depth surface without color writes;
+// empty for any other draw (a partial or combined clear keeps the DecodeState rejection).
+struct DepthClearPass {
+    DepthTarget target;
+    bool depth;
+    bool stencil;
+};
+std::optional<DepthClearPass> DecodeDepthClearPass(const QueueState& queue);
 // The message DecodeState (or the pixel stage decode after it) would throw for the register rules
 // this precheck covers, evaluated without exceptions before the draw is decoded; empty when they
 // pass (DecodeState still checks everything). A register a rule needs that is absent is no verdict.
@@ -128,7 +138,31 @@ struct RegisterRead {
     std::uint32_t offset;
 };
 std::vector<RegisterRead>*& RegisterReadLog();
+// Register read logs open in the process. The decoders note hundreds of reads per draw, and on
+// MinGW every thread_local access is an emulated TLS lookup that takes a lock: while no log is open
+// (always, outside APS5_VERIFY_DRAW_RECIPE and the tests) a read leaves the thread-local alone.
+inline std::atomic<std::uint32_t> RegisterReadLogsOpen{0};
+// Points this thread's register reads at `log` (null: none) for the scope's lifetime.
+class RegisterReadLogScope {
+public:
+    explicit RegisterReadLogScope(std::vector<RegisterRead>* log) : active(log != nullptr) {
+        if (!active) return;
+        RegisterReadLogsOpen.fetch_add(1, std::memory_order_relaxed);
+        RegisterReadLog() = log;
+    }
+    ~RegisterReadLogScope() {
+        if (!active) return;
+        RegisterReadLog() = nullptr;
+        RegisterReadLogsOpen.fetch_sub(1, std::memory_order_relaxed);
+    }
+    RegisterReadLogScope(const RegisterReadLogScope&) = delete;
+    RegisterReadLogScope& operator=(const RegisterReadLogScope&) = delete;
+
+private:
+    bool active;
+};
 inline void NoteRegisterRead(RegisterBank bank, std::uint32_t offset) {
+    if (RegisterReadLogsOpen.load(std::memory_order_relaxed) == 0) return;
     if (auto* log = RegisterReadLog()) log->push_back({bank, offset});
 }
 inline const char* RegisterBankName(RegisterBank bank) {

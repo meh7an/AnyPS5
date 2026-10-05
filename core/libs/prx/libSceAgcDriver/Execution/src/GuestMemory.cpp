@@ -6,7 +6,10 @@
 #include "prx/libc/include/GuestWriteWatch.hpp"
 #include <mutex>
 #include <array>
+#include <bit>
 #include <chrono>
+#include <map>
+#include <set>
 #include <atomic>
 #include <algorithm>
 #include <functional>
@@ -399,6 +402,9 @@ struct PageSpan {
 
 struct PageStates {
     std::once_flag once;
+    // Set once initialize ran: libstdc++'s call_once touches thread-locals on every call (an
+    // emulated TLS lookup taking a lock on MinGW), and every verification passes through here.
+    std::atomic<bool> ready{false};
     PageSpan arena;
     PageSpan image;
 
@@ -446,6 +452,7 @@ void ForgetPages(std::uintptr_t address, std::size_t bytes) {
 }
 
 void PageStates::initialize() {
+    if (ready.load(std::memory_order_acquire)) return;
     std::call_once(once, [&] {
         GuestArena::GuestArenaRange_nid_postfix(&arena.base, &arena.size);
         const bool arenaCached = arena.allocate();
@@ -468,6 +475,7 @@ void PageStates::initialize() {
         }
 #endif
         if (arenaCached || imageCached) GuestAllocations::GuestAllocationsSetInvalidator_nid_postfix(&ForgetPages);
+        ready.store(true, std::memory_order_release);
     });
 }
 
@@ -603,7 +611,37 @@ bool onOwnLiveStack(std::uintptr_t address, std::size_t bytes) {
 // an empty string when it is, otherwise why it is not.
 std::string verify(std::uintptr_t address, std::size_t bytes, bool writable) {
     const TimedAccess timed(CounterVerify, bytes);
-    if (onOwnLiveStack(address, bytes)) return {};
+    // A range starting inside the guest arena or image is no host stack: the page states answer it
+    // without the thread-local stack bounds (an emulated TLS lookup on MinGW).
+    auto& pages = Pages();
+    pages.initialize();
+    if (pages.spanOf(address) == nullptr && onOwnLiveStack(address, bytes)) return {};
+    // A large range (a vertex or index heap a draw verifies whole) walks one page entry per 4 KiB.
+    // An answer of "accessible" holds until a mapping change forgets pages, which moves
+    // forgetSerial before and after it: the last few such answers are kept per thread with the
+    // serial read before their walk (an even one: no forget was in flight).
+    // APS5_NO_VERIFY_MEMO=1 walks every range.
+    struct VerifiedRange {
+        std::uintptr_t address = 0;
+        std::size_t bytes = 0;
+        bool writable = false;
+        std::uint64_t serial = 1;
+    };
+    static const bool memoEnabled = std::getenv("APS5_NO_VERIFY_MEMO") == nullptr;
+    constexpr std::size_t MemoBytes = 64 * 1024;
+    const bool memo = memoEnabled && bytes >= MemoBytes;
+    std::uint64_t serial = 1;
+    std::array<VerifiedRange, 8>* verified = nullptr;
+    if (memo) {
+        thread_local std::array<VerifiedRange, 8> ranges{};
+        verified = &ranges;
+        serial = forgetSerial.load(std::memory_order_acquire);
+        if ((serial & 1u) == 0) {
+            for (const auto& range : ranges) {
+                if (range.serial == serial && (range.writable || !writable) && address >= range.address && bytes <= range.bytes && address - range.address <= range.bytes - bytes) return {};
+            }
+        }
+    }
     std::string reason;
     const bool queried = describePages(address, bytes, [&](const PageRun& run) {
         if (!run.readable) {
@@ -616,7 +654,44 @@ std::string verify(std::uintptr_t address, std::size_t bytes, bool writable) {
         return reason.empty();
     });
     if (!queried && reason.empty()) reason = "cannot query guest memory";
+    if (memo && reason.empty() && (serial & 1u) == 0) {
+        thread_local std::uint32_t next = 0;
+        (*verified)[next++ % verified->size()] = {address, bytes, writable, serial};
+    }
     return reason;
+}
+
+}
+
+namespace {
+
+// APS5_TRACE_VERIFY: verifications by calling site and size class (powers of two), with how many
+// distinct ranges each site asked about, every 10 s.
+void traceVerify(std::uintptr_t address, std::size_t bytes, const void* caller) {
+    struct Site {
+        std::uint64_t calls = 0;
+        std::set<std::pair<std::uintptr_t, std::size_t>> ranges;
+    };
+    static std::mutex mutex;
+    static std::map<std::pair<unsigned long long, unsigned>, Site> sites;
+    static auto lastReport = std::chrono::steady_clock::now();
+    std::lock_guard lock(mutex);
+    auto& site = sites[{ModuleOffset(caller), static_cast<unsigned>(std::bit_width(bytes))}];
+    ++site.calls;
+    if (site.ranges.size() < 100000) site.ranges.insert({address, bytes});
+    const auto now = std::chrono::steady_clock::now();
+    if (now - lastReport < std::chrono::seconds(10)) return;
+    lastReport = now;
+    std::vector<std::pair<std::uint64_t, std::pair<unsigned long long, unsigned>>> ranked;
+    for (const auto& [key, value] : sites) ranked.push_back({value.calls, key});
+    std::sort(ranked.begin(), ranked.end(), std::greater<>());
+    std::fprintf(stderr, "[verify] by site (10 s):");
+    for (std::size_t i = 0; i < ranked.size() && i < 12; ++i) {
+        const auto& site = sites[ranked[i].second];
+        std::fprintf(stderr, " +0x%llx <2^%u B: %llu calls, %zu ranges;", ranked[i].second.first, ranked[i].second.second, static_cast<unsigned long long>(ranked[i].first), site.ranges.size());
+    }
+    std::fprintf(stderr, "\n");
+    sites.clear();
 }
 
 }
@@ -626,6 +701,8 @@ void CheckRange(const void* pointer, std::size_t bytes, std::size_t alignment, b
     const auto address = reinterpret_cast<std::uintptr_t>(pointer);
     require(address != 0 && address % alignment == 0, "null or misaligned address");
     require(bytes <= std::numeric_limits<std::uintptr_t>::max() - address, "address range overflow");
+    static const bool trace = std::getenv("APS5_TRACE_VERIFY") != nullptr;
+    if (trace) traceVerify(address, bytes, __builtin_return_address(0));
     const auto reason = verify(address, bytes, writable);
     if (!reason.empty()) {
         // Debug aid: APS5_TRACE_UNREADABLE names the code that checked an inaccessible range.
@@ -637,6 +714,8 @@ void CheckRange(const void* pointer, std::size_t bytes, std::size_t alignment, b
 
 bool Accessible(const void* pointer, std::size_t bytes, bool writable) {
     const auto address = reinterpret_cast<std::uintptr_t>(pointer);
+    static const bool trace = std::getenv("APS5_TRACE_VERIFY") != nullptr;
+    if (trace) traceVerify(address, bytes, __builtin_return_address(0));
     return address != 0 && bytes <= std::numeric_limits<std::uintptr_t>::max() - address && verify(address, bytes, writable).empty();
 }
 

@@ -11,6 +11,8 @@
 #include <cmath>
 #include <cstdlib>
 #include <limits>
+#include <mutex>
+#include <set>
 #include <sstream>
 
 namespace AgcDriver::Graphics {
@@ -61,6 +63,9 @@ std::string vteMessage(std::uint32_t viewportControl) {
 // Render target index, viewport index and the misc export vector that carries them are accepted but
 // not routed: color targets are single-layer, so layered draws land in layer 0.
 constexpr std::uint32_t LayerExports = (1u << 18u) | (1u << 19u) | (1u << 21u) | (1u << 24u);
+// Clip distances (CLIP_DIST_ENA_0-7 and the CCDIST vectors carrying them) only clip with the matching
+// PA_CL_CLIP_CNTL UCP_ENA bits, which that register's rule rejects: accepted, they have no effect.
+constexpr std::uint32_t ClipDistanceExports = 0xffu | (1u << 22u) | (1u << 23u);
 constexpr std::uint32_t DepthControlMask = ~0x007007f0u;
 // EXEC_ON_HIER_FAIL / EXEC_ON_NOOP / EXEC_IF_OVERLAPPED (bits 9, 10, 17) only force the pixel shader
 // to run, which it always does here.
@@ -68,6 +73,8 @@ constexpr std::uint32_t ShaderControlMask = ~(0x0000f870u | 0x00020600u | 0x0001
 constexpr std::uint32_t PixelStageRunsMask = 0x00020747u;
 constexpr std::uint32_t AlphaToCoverageMask = ~0x0001ff00u;
 constexpr std::uint32_t ScanModeMask = ~2u;
+// Bit 17 (MULTI_SHADER_ENGINE_PRIM_DISCARD_ENABLE) only lets each shader engine skip the primitives
+// another engine rasterizes; every primitive is still drawn once.
 constexpr std::uint32_t ScanControlMask = ~0x06023fffu;
 constexpr std::uint32_t ScreenOffsetMask = ~0x01ff01ffu;
 // Bits 26/27 (ZCLIP_NEAR/FAR_DISABLE) become depth clamping; bit 19 selects the [0, 1] clip space.
@@ -155,8 +162,7 @@ VkStencilOpState stencilFace(std::uint32_t compare, std::uint32_t ops, std::uint
     return face;
 }
 
-void decodeDepth(const Registers& cx, std::uint32_t depthControl, State& result) {
-    zero(cx, 0x000, 0x00001f9fu, "depth/stencil clear, copy, resummarize or decompress draws (DB_RENDER_CONTROL)");
+DepthTarget decodeDepthTarget(const Registers& cx) {
     const auto view = read(cx, 0x002);
     zero(cx, 0x002, 0x3c000000u, "depth mips (DB_DEPTH_VIEW MIP_LEVEL)");
     zero(cx, 0x010, 0x000f100cu, "multisampled, partially resident or mipmapped depth (DB_Z_INFO)");
@@ -164,8 +170,6 @@ void decodeDepth(const Registers& cx, std::uint32_t depthControl, State& result)
     const auto zFormat = read(cx, 0x010) & 3u;
     const bool stencil = (read(cx, 0x011) & 1u) != 0;
     Require(zFormat != 2, "Z_24 depth is unsupported");
-    if (zFormat == 0) depthControl &= ~6u;
-    if (!stencil) depthControl &= ~1u;
     const auto base = [&](std::uint32_t low, std::uint32_t highOffset) {
         const auto high = find(cx, highOffset);
         return (high == cx.end() ? 0ull : static_cast<std::uint64_t>(high->second & 0xffu) << 40u) | (static_cast<std::uint64_t>(read(cx, low)) << 8u);
@@ -179,6 +183,10 @@ void decodeDepth(const Registers& cx, std::uint32_t depthControl, State& result)
     Require(!stencil || stencilReadOnly || base(0x015, 0x01d) == depth.stencilAddress, "stencil read and written at different addresses is unsupported");
     const auto size = read(cx, 0x007);
     depth.extent = {(size & 0x3fffu) + 1u, ((size >> 16u) & 0x3fffu) + 1u};
+    static const bool traceView = std::getenv("APS5_TRACE_DEPTH_VIEW") != nullptr;
+    static std::mutex traceMutex;
+    static std::set<std::pair<std::uint64_t, std::uint32_t>> traced;
+    if (traceView && (view & 0x00ffffffu) != 0 && [&] { std::lock_guard lock(traceMutex); return traced.emplace(depth.address, view).second; }()) std::fprintf(stderr, "[depth-view] address 0x%llx stencil 0x%llx %ux%u view 0x%08x\n", static_cast<unsigned long long>(depth.address), static_cast<unsigned long long>(depth.stencilAddress), depth.extent.width, depth.extent.height, view);
     if (const auto slice = view & 0x1fffu; slice != 0) {
         if (depth.address != 0) depth.address += static_cast<std::uint64_t>(slice) * DepthSliceBytes(depth.extent, zFormat == 1 ? 2u : 4u);
         if (depth.stencilAddress != 0) depth.stencilAddress += static_cast<std::uint64_t>(slice) * DepthSliceBytes(depth.extent, 1u);
@@ -186,6 +194,18 @@ void decodeDepth(const Registers& cx, std::uint32_t depthControl, State& result)
     depth.format = zFormat == 1 ? (stencil ? VK_FORMAT_D16_UNORM_S8_UINT : VK_FORMAT_D16_UNORM) : (stencil ? VK_FORMAT_D32_SFLOAT_S8_UINT : VK_FORMAT_D32_SFLOAT);
     depth.clearDepth = readFloat(cx, 0x00b);
     depth.clearStencil = static_cast<std::uint8_t>(read(cx, 0x00a) & 0xffu);
+    return depth;
+}
+
+void decodeDepth(const Registers& cx, std::uint32_t depthControl, State& result) {
+    zero(cx, 0x000, 0x00001f9fu, "depth/stencil clear, copy, resummarize or decompress draws (DB_RENDER_CONTROL)");
+    const auto depth = decodeDepthTarget(cx);
+    const auto view = read(cx, 0x002);
+    const bool depthReadOnly = (view & 0x01000000u) != 0;
+    const bool stencilReadOnly = (view & 0x02000000u) != 0;
+    const auto zFormat = read(cx, 0x010) & 3u;
+    if (zFormat == 0) depthControl &= ~6u;
+    if (depth.stencilAddress == 0) depthControl &= ~1u;
     result.depth = depth;
     result.depthTest = (depthControl & 2u) != 0;
     result.depthWrite = result.depthTest && (depthControl & 4u) != 0 && !depthReadOnly;
@@ -461,7 +481,7 @@ State DecodeState(const QueueState& queue) {
             std::fprintf(stderr, "[gpu] layer/viewport index vertex exports are ignored (PA_CL_VS_OUT_CNTL=0x%08x)\n", read(cx, 0x207));
         }
     }
-    zero(cx, 0x207, ~LayerExports, "clip distances, layer, viewport or auxiliary vertex exports");
+    zero(cx, 0x207, ~(LayerExports | ClipDistanceExports), "cull distances, layer, viewport or auxiliary vertex exports");
     {
         const auto depthControl = read(cx, 0x200);
         if ((depthControl & 0xbu) != 0 && depthSurfaceBound(cx)) {
@@ -758,6 +778,38 @@ std::optional<ColorMetadataPass> DecodeColorMetadataPass(const QueueState& queue
     return pass;
 }
 
+std::optional<DepthClearPass> DecodeDepthClearPass(const QueueState& queue) {
+    const auto& cx = queue.context;
+    const auto control = find(cx, 0x000);
+    if (control == cx.end() || (control->second & 3u) == 0 || (control->second & 0x00001f9cu) != 0 || !depthSurfaceBound(cx)) return std::nullopt;
+    const auto targetMask = find(cx, 0x8e);
+    const auto shaderMask = find(cx, 0x8f);
+    if (targetMask != cx.end() && shaderMask != cx.end() && (targetMask->second & shaderMask->second) != 0) return std::nullopt;
+    const auto multisample = find(cx, 0x2f8);
+    if (multisample != cx.end() && multisample->second != 0) return std::nullopt;
+    const auto viewportControl = find(cx, 0x206);
+    if (viewportControl == cx.end() || viewportControl->second != 0x43fu) return std::nullopt;
+    DepthClearPass pass{decodeDepthTarget(cx), false, false};
+    pass.depth = (control->second & 1u) != 0 && pass.target.address != 0;
+    pass.stencil = (control->second & 2u) != 0 && pass.target.stencilAddress != 0;
+    if (!pass.depth && !pass.stencil) return std::nullopt;
+    const auto xs = std::fabs(readFloat(cx, 0x10f));
+    const auto xo = readFloat(cx, 0x110);
+    const auto ys = std::fabs(readFloat(cx, 0x111));
+    const auto yo = readFloat(cx, 0x112);
+    VkRect2D covered{{0, 0}, {0x7fffu, 0x7fffu}};
+    intersect(covered, cx, 0xc, true);
+    intersect(covered, cx, 0x81, false);
+    intersect(covered, cx, 0x90, false);
+    if ((read(cx, 0x292) & 2u) != 0) intersect(covered, cx, 0x94, false);
+    const auto width = static_cast<float>(pass.target.extent.width);
+    const auto height = static_cast<float>(pass.target.extent.height);
+    const bool viewportCovers = xo - xs <= 0.0f && xo + xs >= width && yo - ys <= 0.0f && yo + ys >= height;
+    const bool scissorCovers = covered.offset.x == 0 && covered.offset.y == 0 && covered.extent.width >= pass.target.extent.width && covered.extent.height >= pass.target.extent.height;
+    if (!viewportCovers || !scissorCovers) return std::nullopt;
+    return pass;
+}
+
 std::string DrawRejection(const QueueState& queue, bool indexed) {
     const auto& cx = queue.context;
     // A register a rule needs that is absent gives no verdict here: DecodeState reports it.
@@ -780,7 +832,7 @@ std::string DrawRejection(const QueueState& queue, bool indexed) {
         if (value(queue.userConfig, 0x242, primitive) && (primitive & 0x3fu) != 1 && (primitive & 0x3fu) != 2 && (primitive & 0x3fu) != 3 && (primitive & 0x3fu) != 4 && (primitive & 0x3fu) != 5 && (primitive & 0x3fu) != 6) return "AGC graphics: primitive restart is only supported for point, line and triangle topologies";
         if (value(cx, 0x103, resetIndex) && (resetIndex & 0xffffu) != 0xffffu) return "AGC graphics: primitive restart index other than all ones is unsupported";
     }
-    if (auto reason = nonzero(cx, 0x207, ~LayerExports, "clip distances, layer, viewport or auxiliary vertex exports"); !reason.empty()) return reason;
+    if (auto reason = nonzero(cx, 0x207, ~(LayerExports | ClipDistanceExports), "cull distances, layer, viewport or auxiliary vertex exports"); !reason.empty()) return reason;
     if (value(cx, 0x200, word)) {
         const bool surface = (word & 0xbu) != 0 && depthSurfaceBound(cx);
         if (!surface && !((word & 3u) != 0 && depthPlanesAbsent(cx)) && !depthPassThrough(word) && !IgnoreDepthTest() && (effectiveDepthControl(word) & DepthControlMask) != 0) return zeroMessage(0x200, word, "depth, stencil or conditional color writes");
@@ -820,7 +872,7 @@ std::string DrawRejection(const QueueState& queue, bool indexed) {
 bool PixelProgramSkipped(const QueueState& queue) {
     const auto low = find(queue.shader, 0x008, RegisterBank::Shader);
     const auto high = find(queue.shader, 0x009, RegisterBank::Shader);
-    if (low != queue.shader.end() && high != queue.shader.end() && low->second == 0 && high->second == 0) return true;
+    if ((low == queue.shader.end() || low->second == 0) && (high == queue.shader.end() || high->second == 0)) return true;
     const auto& cx = queue.context;
     const auto targetMask = find(cx, 0x8e);
     const auto shaderMask = find(cx, 0x8f);

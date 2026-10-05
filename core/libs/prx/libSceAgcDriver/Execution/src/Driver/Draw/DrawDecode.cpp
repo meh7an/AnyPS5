@@ -95,7 +95,12 @@ std::shared_ptr<DrawDecode> Driver::decodeDraw(const QueueState& queue, const Su
             const auto rejection = Graphics::NullPixelProgramRejection(queue);
             require(rejection.empty(), rejection.c_str());
         }
-        append(0x008, 1, Stage::Fragment, 0x00b, 0x00c, Role::Fragment);
+        if (nullPixel) {
+            programs.push_back(prepare(0, 1, Stage::Fragment, 0x00b, 0x00c));
+            roles.push_back(Role::Fragment);
+        } else {
+            append(0x008, 1, Stage::Fragment, 0x00b, 0x00c, Role::Fragment);
+        }
         programs.back().firstUserSgpr = 0;
         product->pixel = Graphics::DecodePixelStageInfo(queue.context, Graphics::ExportMappings(graphics), nullPixel);
         return product;
@@ -105,10 +110,7 @@ std::shared_ptr<DrawDecode> Driver::decodeDraw(const QueueState& queue, const Su
 void Driver::resolveDrawDecode(const QueueState& queue, const Submission& submission, std::shared_ptr<const DrawDecode>& decode, bool registerKey, std::uint64_t drawKey, bool profile) {
     if (decode == nullptr || verifyDrawRecipe()) {
         std::vector<Graphics::RegisterRead> readLog;
-        struct LogScope {
-            explicit LogScope(std::vector<Graphics::RegisterRead>* log) { Graphics::RegisterReadLog() = log; }
-            ~LogScope() { Graphics::RegisterReadLog() = nullptr; }
-        } logScope(verifyDrawRecipe() && registerKey ? &readLog : nullptr);
+        const Graphics::RegisterReadLogScope logScope(verifyDrawRecipe() && registerKey ? &readLog : nullptr);
         auto fresh = decodeDraw(queue, submission);
         if (verifyDrawRecipe() && registerKey) {
             std::uint64_t facadeMismatches = 0;

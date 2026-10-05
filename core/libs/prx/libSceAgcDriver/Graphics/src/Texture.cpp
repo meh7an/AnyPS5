@@ -86,6 +86,19 @@ std::atomic<std::uint64_t> pretestSkipped{0}, unregisteredDropped{0}, keyFlipKep
 // Images stored by a FlushPending after a hook skip of theirs (AccessKeptByCpu), of which by the
 // hook for the read site of the last skip; images evictStale dropped (the [hooksync] and [storage] lines).
 std::atomic<std::uint64_t> flushedAfterSkip{0}, flushedAfterSkipSameSite{0}, staleEvicted{0};
+// Refresh passes the memo answered, and those taken whole; APS5_TRACE_REFRESH_MEMO prints both every
+// 10 s (from a pass taken whole).
+std::atomic<std::uint64_t> refreshMemoHits{0}, refreshMemoMisses{0};
+
+void reportRefreshMemo() {
+    static const bool trace = std::getenv("APS5_TRACE_REFRESH_MEMO") != nullptr;
+    if (!trace) return;
+    static std::atomic<std::int64_t> last{0};
+    const auto now = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    auto previous = last.load(std::memory_order_relaxed);
+    if (now - previous < 10 || !last.compare_exchange_strong(previous, now)) return;
+    std::fprintf(stderr, "[refresh] memo (10 s): %llu passes answered, %llu taken whole\n", static_cast<unsigned long long>(refreshMemoHits.exchange(0)), static_cast<unsigned long long>(refreshMemoMisses.exchange(0)));
+}
 
 struct StorageTraffic {
     std::mutex mutex;
@@ -449,7 +462,7 @@ bool Texture::CanCopyFrom(const StorageTexture& source, const GuestTextureResour
     if (IsBlockCompressed(descriptor.format) || IsBlockCompressed(from.format)) return false;
     // Same memory, same layout, same texel size: the GPU copy reinterprets the texels exactly as a
     // guest read through the sampled descriptor would.
-    return descriptor.baseAddress == from.baseAddress && descriptor.width == from.width && descriptor.height == from.height && descriptor.dimension == from.dimension && descriptor.tileMode == from.tileMode && descriptor.mipCount <= from.mipCount && descriptor.depthOrLastArray == from.depthOrLastArray && BytesPerElement(descriptor.format) == BytesPerElement(from.format) && BlockWidth(descriptor.format) == BlockWidth(from.format);
+    return descriptor.baseAddress == from.baseAddress && descriptor.width == from.width && descriptor.height == from.height && SurfaceDimension(descriptor) == SurfaceDimension(from) && descriptor.tileMode == from.tileMode && descriptor.mipCount <= from.mipCount && descriptor.depthOrLastArray == from.depthOrLastArray && BytesPerElement(descriptor.format) == BytesPerElement(from.format) && BlockWidth(descriptor.format) == BlockWidth(from.format);
 }
 
 Texture::Texture(const Context& context, const std::shared_ptr<StorageTexture>& source, const GuestTextureResource& descriptor, VkComponentMapping components) : context(context), storageSource(source) {
@@ -491,15 +504,15 @@ Texture::Texture(const Context& context, const std::shared_ptr<StorageTexture>& 
     }
 }
 
-Texture::Texture(const Context& context, VkImage depthImage, VkFormat depthFormat, VkImageAspectFlags aspect, VkComponentMapping components) : context(context) {
+Texture::Texture(const Context& context, VkImage depthImage, VkFormat depthFormat, VkImageAspectFlags aspect, VkComponentMapping components, VkImageViewType viewType, std::uint32_t layers) : context(context) {
     layout = VK_IMAGE_LAYOUT_GENERAL;
     VkImageViewCreateInfo viewInfo{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
     viewInfo.image = depthImage;
-    viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    viewInfo.viewType = viewType;
     viewInfo.format = depthFormat;
     viewFormat = depthFormat;
     viewInfo.components = components;
-    viewInfo.subresourceRange = {aspect, 0, 1, 0, 1};
+    viewInfo.subresourceRange = {aspect, 0, 1, 0, layers};
     Check(context.Function<PFN_vkCreateImageView>("vkCreateImageView")(context.device, &viewInfo, nullptr, &view), "vkCreateImageView depth plane");
     viewRange = {viewInfo.viewType, viewInfo.subresourceRange.levelCount, viewInfo.subresourceRange.layerCount};
 }
@@ -556,12 +569,31 @@ VkFormat StorageFormatOrUndefined(const Context& context, VkFormat format) {
         std::unordered_map<std::uint64_t, VkFormat> formats;
     };
     static Table table;
+    // Every texture binding asks: the core formats of the first physical device asked about are
+    // answered without the mutex (an entry is written once, before it is published as known).
+    struct Fast {
+        std::atomic<VkPhysicalDevice> physical{VK_NULL_HANDLE};
+        std::array<std::atomic<std::int32_t>, 256> formats;
+        Fast() {
+            for (auto& entry : formats) entry.store(-1, std::memory_order_relaxed);
+        }
+    };
+    static Fast fast;
+    VkPhysicalDevice expected = VK_NULL_HANDLE;
+    fast.physical.compare_exchange_strong(expected, context.physical, std::memory_order_acq_rel);
+    const bool fastSlot = fast.physical.load(std::memory_order_acquire) == context.physical && static_cast<std::uint32_t>(format) < fast.formats.size();
+    if (fastSlot) {
+        if (const auto known = fast.formats[static_cast<std::uint32_t>(format)].load(std::memory_order_acquire); known >= 0) return static_cast<VkFormat>(known);
+    }
     // The key names the physical device: the headless and the windowed device share one GPU, but a
     // second GPU would answer differently.
     const auto key = (static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(context.physical)) << 20u) ^ static_cast<std::uint64_t>(format);
     {
         std::lock_guard lock(table.mutex);
-        if (const auto found = table.formats.find(key); found != table.formats.end()) return found->second;
+        if (const auto found = table.formats.find(key); found != table.formats.end()) {
+            if (fastSlot) fast.formats[static_cast<std::uint32_t>(format)].store(static_cast<std::int32_t>(found->second), std::memory_order_release);
+            return found->second;
+        }
     }
     const auto supports = [&](VkFormat candidate) {
         VkFormatProperties properties{};
@@ -585,6 +617,7 @@ VkFormat StorageFormatOrUndefined(const Context& context, VkFormat format) {
     }
     std::lock_guard lock(table.mutex);
     table.formats.emplace(key, storage);
+    if (fastSlot) fast.formats[static_cast<std::uint32_t>(format)].store(static_cast<std::int32_t>(storage), std::memory_order_release);
     return storage;
 }
 
@@ -1126,6 +1159,21 @@ VkImageView StorageTexture::View(std::uint32_t mip) {
     return created;
 }
 
+VkImageView StorageTexture::ArrayView(std::uint32_t mip) {
+    if (const auto found = arrayViews.find(mip); found != arrayViews.end()) return found->second;
+    Require(mip < descriptor.mipCount && geometry.imageLayers == 1 && descriptor.dimension == TextureDimension::k2D, "a one-slice array storage view needs a 2D surface");
+    VkImageViewCreateInfo viewInfo{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    viewInfo.image = image;
+    viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+    viewInfo.format = storageFormat;
+    viewInfo.components = {VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY};
+    viewInfo.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, mip, 1u, 0u, 1u};
+    VkImageView created = VK_NULL_HANDLE;
+    Check(context.Function<PFN_vkCreateImageView>("vkCreateImageView")(context.device, &viewInfo, nullptr, &created), "vkCreateImageView storage array");
+    arrayViews.emplace(mip, created);
+    return created;
+}
+
 VkImageView StorageTexture::FirstLayerView(std::uint32_t mip) {
     const auto found = firstLayerViews.find(mip);
     if (found != firstLayerViews.end()) return found->second;
@@ -1200,6 +1248,26 @@ bool StorageTexture::Refresh() {
     // flush below and the compare through the hook skip it).
     refreshing = this;
     NoteProved();
+    // The last pass's answer (current, no alias) holds while the pending registry is as that pass
+    // left it (no other image's results to store first; an image becoming pending over the surface
+    // moves the serial), no DCC keys need proving and nothing wrote the surface since its
+    // generation: the pass then only collects the writes and moves the generation, as a whole pass
+    // finding it unchanged does. APS5_NO_REFRESH_MEMO=1 takes every pass whole.
+    static const bool memoEnabled = std::getenv("APS5_NO_REFRESH_MEMO") == nullptr;
+    if (memoEnabled && refreshMemo && descriptor.dccAddress == 0 && PendingSerial() == refreshSerial) {
+        const auto current = GuestMemory::CollectWrites(descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
+        if (GuestMemory::UnchangedSince(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), generation)) {
+            ++Profile().storageReused;
+            layerGeneration.assign(trackedLayers, current);
+            refreshGeneration();
+            refreshMemoHits.fetch_add(1, std::memory_order_relaxed);
+            if (profile) LookupOutcomes::Add(LookupOutcomes::RefreshUnchanged, start);
+            return true;
+        }
+    }
+    refreshMemo = false;
+    refreshMemoMisses.fetch_add(1, std::memory_order_relaxed);
+    reportRefreshMemo();
     // Results of other images pending in this memory must reach it first, except an alias's: its
     // units are taken on the device below (borrowUnits), so it stays pending. The keys read for
     // that decision are read again after the flush, which may store keys itself. The exemption
@@ -1208,6 +1276,7 @@ bool StorageTexture::Refresh() {
     // stamped); an untracked unit is stored whole by that write-back, and a unit pending in both
     // images takes the old order (store, then this image re-uploads it).
     auto alias = pendingAlias();
+    const bool aliasFree = alias == nullptr;
     if (alias != nullptr && !(ProvedClearKeys(descriptor, guestBytes, keyProof) == DccKeys::Uncompressed && HostImportFor(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes)) != nullptr)) alias = nullptr;
     if (alias != nullptr) {
         std::vector<std::uint8_t> aliasStamped(trackedLayers);
@@ -1333,6 +1402,8 @@ bool StorageTexture::Refresh() {
         ++Profile().storageReused;
         layerGeneration.assign(trackedLayers, current);
         refreshGeneration();
+        refreshMemo = aliasFree;
+        refreshSerial = PendingSerial();
         if (profile) LookupOutcomes::Add(stamped ? LookupOutcomes::RefreshUnchanged : LookupOutcomes::RefreshCompared, start);
         return true;
     }
@@ -2233,7 +2304,9 @@ void StorageTexture::refreshGeneration() {
 void StorageTexture::markLayersPending(std::uint32_t first, std::uint32_t count) {
     CaptureTrace::Log("image-write image=%llx first=%u count=%u generation=%llu", static_cast<unsigned long long>(descriptor.baseAddress), first, count, static_cast<unsigned long long>(generation));
     static const bool eager = std::getenv("APS5_EAGER_WRITEBACK") != nullptr || std::getenv("APS5_NO_TEXTURE_CACHE") != nullptr;
-    for (std::uint32_t layer = first; layer < first + count; ++layer) layerPending[layer] = true;
+    // A draw marks its whole target (one unit per 64 KiB block): the bit vector fills a word at a time.
+    if (first == 0 && count == layerPending.size()) layerPending.assign(count, true);
+    else for (std::uint32_t layer = first; layer < first + count; ++layer) layerPending[layer] = true;
     // Results of this image now cover the alias's results borrowed into these units: this image
     // stores them, the alias no longer has to (its results, unchanged since the borrow, are in
     // this image's content). An alias written since keeps its own newer results pending.
@@ -3747,6 +3820,8 @@ void StorageTexture::release() noexcept {
     atomicViews.clear();
     for (const auto& [key, uint] : uintViews) context.Function<PFN_vkDestroyImageView>("vkDestroyImageView")(context.device, uint, nullptr);
     uintViews.clear();
+    for (const auto& [mip, extra] : arrayViews) context.Function<PFN_vkDestroyImageView>("vkDestroyImageView")(context.device, extra, nullptr);
+    arrayViews.clear();
     for (const auto& [format, attachment] : attachmentViews) context.Function<PFN_vkDestroyImageView>("vkDestroyImageView")(context.device, attachment, nullptr);
     attachmentViews.clear();
     if (proxyView) context.Function<PFN_vkDestroyImageView>("vkDestroyImageView")(context.device, proxyView, nullptr);

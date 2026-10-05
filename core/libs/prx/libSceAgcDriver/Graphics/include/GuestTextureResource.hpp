@@ -85,6 +85,12 @@ struct GuestTextureResource {
     std::uint32_t allocatedMipCount = 0;
 };
 
+// The image a surface needs: a 2D array of one slice from slice 0 is the same image as a 2D surface,
+// so descriptors of either kind share it (only their views differ).
+inline TextureDimension SurfaceDimension(const GuestTextureResource& resource) {
+    return resource.dimension == TextureDimension::k2DArray && resource.depthOrLastArray == 0 && resource.baseArray == 0 ? TextureDimension::k2D : resource.dimension;
+}
+
 float EffectiveMinLod(const GuestTextureResource& resource);
 
 GuestTextureResource DecodeTextureResource(std::span<const std::uint32_t> words);

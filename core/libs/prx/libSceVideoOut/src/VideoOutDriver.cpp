@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <bit>
 #include <chrono>
 #include <cstdlib>
@@ -379,9 +380,60 @@ void VideoOutDriver::vblankEnd() {
     }
 }
 
+namespace {
+
+// APS5_TRACE_FLIP_PACING: the flips' pacing, averaged every 5 s (presenter thread only).
+struct FlipPacing {
+    using Clock = std::chrono::steady_clock;
+    std::uint64_t flips = 0;
+    std::uint64_t vblanksBetween = 0;
+    double waitMs = 0, waitMaxMs = 0, presentMs = 0, presentMaxMs = 0, intervalMs = 0, intervalMaxMs = 0;
+    std::uint64_t lastVblank = 0;
+    int flipRate = -1;
+    Clock::time_point lastFlip{};
+    Clock::time_point lastReport = Clock::now();
+
+    static bool Enabled() {
+        static const bool enabled = std::getenv("APS5_TRACE_FLIP_PACING") != nullptr;
+        return enabled;
+    }
+    void Note(int rate, std::uint64_t vblank, Clock::time_point start, Clock::time_point waited, Clock::time_point done) {
+        const auto ms = [](Clock::duration elapsed) { return std::chrono::duration<double, std::milli>(elapsed).count(); };
+        flipRate = rate;
+        ++flips;
+        if (lastVblank != 0) vblanksBetween += vblank - lastVblank;
+        lastVblank = vblank;
+        waitMs += ms(waited - start);
+        waitMaxMs = std::max(waitMaxMs, ms(waited - start));
+        presentMs += ms(done - waited);
+        presentMaxMs = std::max(presentMaxMs, ms(done - waited));
+        if (lastFlip != Clock::time_point{}) {
+            intervalMs += ms(done - lastFlip);
+            intervalMaxMs = std::max(intervalMaxMs, ms(done - lastFlip));
+        }
+        lastFlip = done;
+        if (done - lastReport < std::chrono::seconds(5)) return;
+        const double count = static_cast<double>(flips);
+        std::fprintf(stderr, "[pacing] flips: %llu in %.1f s (%.1f/s), flip rate %d, %.2f vblanks apart; avg/max ms: vblank wait %.2f/%.1f, present %.2f/%.1f, flip to flip %.2f/%.1f\n", static_cast<unsigned long long>(flips), std::chrono::duration<double>(done - lastReport).count(), count / std::chrono::duration<double>(done - lastReport).count(), flipRate, static_cast<double>(vblanksBetween) / count, waitMs / count, waitMaxMs, presentMs / count, presentMaxMs, intervalMs / count, intervalMaxMs);
+        flips = 0;
+        vblanksBetween = 0;
+        waitMs = waitMaxMs = presentMs = presentMaxMs = intervalMs = intervalMaxMs = 0;
+        lastReport = done;
+    }
+};
+
+FlipPacing& Pacing() {
+    static FlipPacing pacing;
+    return pacing;
+}
+
+}
+
 void VideoOutDriver::processFlip(FlipRequest& req) {
     AgcDriver::PerformanceContext timingContext(req.timing.get());
     AgcDriver::PerformanceTimer timing("VideoOut.Flip");
+    const auto pacingStart = std::chrono::steady_clock::now();
+    std::uint64_t pacingVblank = 0;
     {
         std::unique_lock lock(req.cfg->mutex);
         timing.Mark("config_mutex_wait");
@@ -395,7 +447,9 @@ void VideoOutDriver::processFlip(FlipRequest& req) {
         timing.Mark("vblank_wait");
         checkConfig(*req.cfg);
         req.cfg->lastFlipVblank = req.cfg->vblankStatus.count;
+        pacingVblank = req.cfg->vblankStatus.count;
     }
+    const auto pacingWaited = std::chrono::steady_clock::now();
     require(req.width != 0 && req.height != 0 && req.width <= static_cast<uint32_t>(std::numeric_limits<int>::max()) && req.height <= static_cast<uint32_t>(std::numeric_limits<int>::max()), "invalid window dimensions");
     window.Ensure(req.width, req.height);
     unsigned extensionCount = 0;
@@ -460,6 +514,7 @@ void VideoOutDriver::processFlip(FlipRequest& req) {
     req.terminal = true;
     req.cfg->vblankCond.notify_all();
     timing.Mark("notify_game");
+    if (FlipPacing::Enabled()) Pacing().Note(req.flipRate, pacingVblank, pacingStart, pacingWaited, std::chrono::steady_clock::now());
 }
 
 void VideoOutDriver::presentLoop(std::stop_token token) {

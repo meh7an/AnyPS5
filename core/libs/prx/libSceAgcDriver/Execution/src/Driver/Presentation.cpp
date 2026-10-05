@@ -4,6 +4,10 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/WorkerAffinity.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
+#include <algorithm>
+#include <array>
+#include <chrono>
+#include <cstdio>
 #include <cstdlib>
 
 namespace AgcDriver::DriverDetail {
@@ -23,9 +27,60 @@ void Driver::UnregisterVideoOutput(std::uint32_t handle, const std::shared_ptr<I
     outputs.erase(it);
 }
 
+namespace {
+
+// APS5_TRACE_FLIP_PACING: where each presentation's time goes, averaged every 5 s. Present runs on
+// the presenter thread alone, so the totals need no lock.
+struct PresentPacing {
+    using Clock = std::chrono::steady_clock;
+    enum Stage { Retire, Acquire, Blit, Queue, Fence, Total, Count };
+    std::array<double, Count> ms{};
+    std::array<double, Count> maxMs{};
+    std::uint64_t presents = 0;
+    Clock::time_point lastReport = Clock::now();
+    Clock::time_point lap = Clock::now();
+
+    static bool Enabled() {
+        static const bool enabled = std::getenv("APS5_TRACE_FLIP_PACING") != nullptr;
+        return enabled;
+    }
+    void Start() { lap = Clock::now(); }
+    void Mark(Stage stage) {
+        const auto now = Clock::now();
+        const auto elapsed = std::chrono::duration<double, std::milli>(now - lap).count();
+        ms[stage] += elapsed;
+        maxMs[stage] = std::max(maxMs[stage], elapsed);
+        lap = now;
+    }
+    void Finish(Clock::time_point started) {
+        const auto now = Clock::now();
+        const auto elapsed = std::chrono::duration<double, std::milli>(now - started).count();
+        ms[Total] += elapsed;
+        maxMs[Total] = std::max(maxMs[Total], elapsed);
+        ++presents;
+        if (now - lastReport < std::chrono::seconds(5)) return;
+        const double count = static_cast<double>(presents);
+        std::fprintf(stderr, "[pacing] present: %llu in %.1f s; avg/max ms: retire %.2f/%.1f acquire %.2f/%.1f blit %.2f/%.1f queue-present %.2f/%.1f gpu fence %.2f/%.1f total %.2f/%.1f\n", static_cast<unsigned long long>(presents), std::chrono::duration<double>(now - lastReport).count(), ms[Retire] / count, maxMs[Retire], ms[Acquire] / count, maxMs[Acquire], ms[Blit] / count, maxMs[Blit], ms[Queue] / count, maxMs[Queue], ms[Fence] / count, maxMs[Fence], ms[Total] / count, maxMs[Total]);
+        ms.fill(0);
+        maxMs.fill(0);
+        presents = 0;
+        lastReport = now;
+    }
+};
+
+PresentPacing& Pacing() {
+    static PresentPacing pacing;
+    return pacing;
+}
+
+}
+
 void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buffer, bool opaque, void (*gpuReady)(void*), void* context) {
 
     PerformanceContext timingContext(window.timing.get());
+    const bool pacing = PresentPacing::Enabled();
+    const auto pacingStart = PresentPacing::Clock::now();
+    if (pacing) Pacing().Start();
     PerformanceTimer timing("Driver.Present");
     static thread_local bool pinned = false;
     if (!pinned) {
@@ -78,8 +133,10 @@ void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buff
                 waitedMs = presenting->RetirePresents(presenting->PresentWaitsForSlots(buffer) ? 0 : inFlight);
                 timing.Mark("inflight_wait");
             }
+            if (pacing) Pacing().Mark(PresentPacing::Retire);
             presentable = presenting->AcquireImage();
             timing.Mark("acquire_image");
+            if (pacing) Pacing().Mark(PresentPacing::Acquire);
         }
         if (presentable) {
             GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Present);
@@ -96,6 +153,7 @@ void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buff
                 submitted = presenting->PresentClear(window.width, window.height, opaque);
                 timing.Mark("present_clear");
             }
+            if (pacing) Pacing().Mark(PresentPacing::Blit);
             if (submitted && syncFlip) {
                 waitedMs = presenting->FinishPresent();
                 timing.Mark("render_fence_wait");
@@ -104,6 +162,7 @@ void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buff
 
                 presenting->QueuePresent();
                 timing.Mark("queue_present");
+                if (pacing) Pacing().Mark(PresentPacing::Queue);
                 trailing = !syncFlip;
                 submitted = false;
             }
@@ -111,6 +170,7 @@ void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buff
         if (trailing) {
             waitedMs += presenting->FinishPresent();
             timing.Mark("render_fence_wait");
+            if (pacing) Pacing().Mark(PresentPacing::Fence);
         }
         if (submitted) {
             waitedMs = presenting->FinishPresent();
@@ -123,6 +183,7 @@ void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buff
         }
         gpuReady(context);
         timing.Mark("release_and_callback");
+        if (pacing) Pacing().Finish(pacingStart);
         if (profile) reportPresents(waitedMs, inFlight);
         CheckFailure();
     } catch (const ProcessShutdown&) {

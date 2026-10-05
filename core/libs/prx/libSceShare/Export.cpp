@@ -79,6 +79,11 @@ int APS5_VABI sceShareSetContentParam(const char* content_param) {
     return 0;
 }
 
+int APS5_VABI sceShareSetContentParamForApplicationTitle(const void* param) {
+    (void)param;
+    return 0;
+}
+
 int APS5_VABI sceShareSetScreenshotOverlayImage(const char* file_path, int32_t margin_x, int32_t margin_y, int32_t origin) {
     (void)file_path;
     (void)margin_x;
@@ -115,11 +120,6 @@ int APS5_VABI sceShareGetRunningStatus(uint32_t* status) {
         return ERROR_INVALID_PARAM;
     }
     *status = 0;
-    return 0;
-}
-
-int APS5_VABI sceShareSetContentParamForApplicationTitle(void) {
-    NotImplemented_nid_no_patch(__func__);
     return 0;
 }
 

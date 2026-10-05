@@ -331,6 +331,7 @@ private:
     void prepareAddressBindings(std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots);
     VkDescriptorBufferInfo descriptor(Allocation& allocation);
     void noteReusable();
+    void copyWrittenDepthSurfaces();
     void reportDescriptorCaches() const;
     // What a sampled texture was proved current against when the build (or the last full Revalidate)
     // looked it up, so the next Revalidate can repeat the proof from write stamps and the DCC keys
@@ -408,11 +409,15 @@ private:
     std::vector<std::uint32_t> storageMips;
     std::vector<std::uint64_t> storageKeys;
     std::vector<bool> storageFirstLayer;
+    std::vector<bool> storageArrayView;
     std::vector<bool> storageWritten;
     std::vector<bool> storageAtomic;
     std::vector<bool> storageAtomic64;
     std::vector<std::shared_ptr<Sampler>> samplers;
     bool reusable = false;
+    // A storage image over a depth surface (DepthSurface.hpp TransferDepthSurface) or a sampled
+    // array of depth surfaces: their copies are recorded per build, so the set is never reused.
+    bool touchesDepthSurface = false;
     std::vector<DirectRegion> directRegions;
     std::vector<ValidatedSurface> validatedTextures;
     // The pending registry's serial at the last Revalidate that proved this object, taken before

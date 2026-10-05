@@ -3,6 +3,8 @@
 #include "prx/libSceAgc/Command/include/Packet.hpp"
 #include <cstdint>
 #include <cstddef>
+#include <cstdio>
+#include <cstdlib>
 #include "SceTypes.hpp"
 #include "prx/libc/include/General.hpp"
 
@@ -18,6 +20,8 @@ std::uint32_t* APS5_VABI sceAgcCbBranch(CommandBuffer* buf, std::uint8_t mode, s
     const auto address = reinterpret_cast<std::uintptr_t>(compareAddress);
     const auto first = reinterpret_cast<std::uintptr_t>(buffer1);
     const auto second = reinterpret_cast<std::uintptr_t>(buffer2);
+    static const bool trace = std::getenv("APS5_TRACE_BRANCH") != nullptr;
+    if (trace) std::fprintf(stderr, "[branch] mode %u function %u compare 0x%llx mask 0x%llx reference 0x%llx then 0x%llx (%u dwords, policy %u) else 0x%llx (%u dwords, policy %u)\n", mode, compareFunction, static_cast<unsigned long long>(address), static_cast<unsigned long long>(mask), static_cast<unsigned long long>(reference), static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(buffer1)), sizeInDwords1, cachePolicy1, static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(buffer2)), sizeInDwords2, cachePolicy2);
     if (compareFunction != 0) Agc::Command::CheckAddress(address, 8, __func__);
     if (first != 0 || sizeInDwords1 != 0) Agc::Command::CheckAddress(first, 4, __func__);
     if (second != 0 || sizeInDwords2 != 0) Agc::Command::CheckAddress(second, 4, __func__);

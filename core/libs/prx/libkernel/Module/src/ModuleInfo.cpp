@@ -8,7 +8,9 @@
 #include "SceTypes.hpp"
 #include "prx/libc/include/General.hpp"
 #include "prx/libkernel/KernelErrors.hpp"
-#ifndef _WIN32
+#ifdef _WIN32
+#include <windows.h>
+#else
 #include <dlfcn.h>
 #include <link.h>
 #include <unistd.h>
@@ -164,8 +166,31 @@ int APS5_VABI sceKernelGetModuleInfoFromAddr(std::uint64_t address, int flags, M
     if (info->st_size != sizeof(ModuleInfoEx))
         throw std::invalid_argument("sceKernelGetModuleInfoFromAddr: unsupported st_size " + std::to_string(info->st_size));
 #ifdef _WIN32
-    (void)address;
-    NotImplemented_nid_no_patch(__func__);
+    HMODULE module = nullptr;
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, reinterpret_cast<LPCWSTR>(address), &module))
+        return SCE_KERNEL_ERROR_ESRCH;
+    ModuleInfoEx result{};
+    result.st_size = sizeof(ModuleInfoEx);
+    result.id = static_cast<KernelModule>(reinterpret_cast<intptr_t>(module));
+    result.ref_count = 1;
+    char path[MAX_PATH] = {};
+    const DWORD length = GetModuleFileNameA(module, path, MAX_PATH);
+    if (length == 0 || length >= MAX_PATH) throw std::runtime_error("sceKernelGetModuleInfoFromAddr: module path is unavailable");
+    const char* name = std::strrchr(path, '\\');
+    std::strncpy(result.name, name ? name + 1 : path, sizeof(result.name) - 1);
+    const auto* image = reinterpret_cast<const std::byte*>(module);
+    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(image + reinterpret_cast<const IMAGE_DOS_HEADER*>(image)->e_lfanew);
+    const auto* sections = IMAGE_FIRST_SECTION(nt);
+    for (unsigned index = 0; index < nt->FileHeader.NumberOfSections; ++index) {
+        const auto& section = sections[index];
+        if (std::memcmp(section.Name, ".elf", 4) != 0 || (section.Characteristics & IMAGE_SCN_MEM_READ) == 0) continue;
+        if (result.segment_count == std::size(result.segments)) throw std::runtime_error("sceKernelGetModuleInfoFromAddr: module has more than 4 segments");
+        auto& segment = result.segments[result.segment_count++];
+        segment.address = reinterpret_cast<std::uint64_t>(image + section.VirtualAddress);
+        segment.size = section.Misc.VirtualSize;
+        segment.prot = 1 | ((section.Characteristics & IMAGE_SCN_MEM_WRITE) ? 2 : 0) | ((section.Characteristics & IMAGE_SCN_MEM_EXECUTE) ? 4 : 0);
+    }
+    *info = result;
     return 0;
 #else
     Dl_info symbol{};

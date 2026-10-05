@@ -987,6 +987,37 @@ private:
     std::chrono::steady_clock::time_point start;
 };
 
+#ifdef _WIN32
+extern "C" {
+__declspec(dllimport) unsigned short __stdcall RtlCaptureStackBackTrace(unsigned long, unsigned long, void**, unsigned long*);
+__declspec(dllimport) int __stdcall GetModuleHandleExA(unsigned long, const char*, void**);
+__declspec(dllimport) unsigned long __stdcall GetModuleFileNameA(void*, char*, unsigned long);
+}
+#endif
+
+// APS5_TRACE_HOOK_STORE: the first accesses that store pending images and wait for the GPU, with the
+// return addresses (module-relative) of the code that made them.
+void TraceRecordedStoreAccess(std::uint64_t address, std::size_t bytes, bool store) {
+    static const bool trace = std::getenv("APS5_TRACE_HOOK_STORE") != nullptr;
+    static std::atomic<int> printed{0};
+    if (!trace || printed.fetch_add(1, std::memory_order_relaxed) >= 40) return;
+    std::string line = "[hook-store] " + std::string(store ? "store" : "read") + " 0x" + [&] { char text[32]; std::snprintf(text, sizeof(text), "%llx", static_cast<unsigned long long>(address)); return std::string(text); }() + " +" + std::to_string(bytes) + " from";
+#ifdef _WIN32
+    void* frames[16];
+    const auto count = RtlCaptureStackBackTrace(1, 16, frames, nullptr);
+    for (unsigned short i = 0; i < count; ++i) {
+        void* module = nullptr;
+        char name[260] = "?";
+        if (GetModuleHandleExA(0x6u, static_cast<const char*>(frames[i]), &module)) GetModuleFileNameA(module, name, sizeof(name));
+        const char* base = std::strrchr(name, '\\');
+        char text[300];
+        std::snprintf(text, sizeof(text), " %s+0x%llx", base ? base + 1 : name, static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(frames[i]) - reinterpret_cast<std::uintptr_t>(module)));
+        line += text;
+    }
+#endif
+    std::fprintf(stderr, "%s\n", line.c_str());
+}
+
 // GuestMemory flush hook: a CPU access to memory that recorded GPU work will write waits for that
 // work first; then storage image results pending for the range are stored. The recorder is only
 // dereferenced under the GpuMutex (it is destroyed with its device under that lock).
@@ -1043,6 +1074,7 @@ void FlushForAccess(std::uint64_t address, std::size_t bytes) {
         stored = StorageTexture::FlushPending(address, bytes, nullptr, "memory access", scope, &published);
     }
     if (stored || published) {
+        TraceRecordedStoreAccess(address, bytes, site == GuestMemory::ReadSite::Store);
         // Stores into imported memory were only recorded; the CPU is about to read them. The wait
         // targets the batch holding them (the open one: SyncThrough submits it) and runs with the
         // mutex released when this acquisition is the outermost; a nested hook waits locked through

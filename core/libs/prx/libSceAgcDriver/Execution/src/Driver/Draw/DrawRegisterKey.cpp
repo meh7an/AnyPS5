@@ -2,9 +2,115 @@
 #include <algorithm>
 #include <array>
 #include <cstdlib>
+#include <chrono>
+#include <cstdio>
 #include <cstring>
+#include <functional>
+#include <map>
+#include <mutex>
+#include <unordered_map>
+#include <vector>
 
 namespace AgcDriver::DriverDetail {
+
+namespace {
+
+// The shader-bank user data words of the pixel, geometry and hull programs (32 each).
+constexpr std::array<std::uint32_t, 3> UserDataBases{0x00cu, 0x08cu, 0x10cu};
+constexpr const char* UserDataStages[3] = {"ps", "gs", "hs"};
+
+bool userDataRegister(Graphics::RegisterBank bank, std::uint32_t offset) {
+    if (bank != Graphics::RegisterBank::Shader) return false;
+    for (const auto base : UserDataBases) {
+        if (offset >= base && offset < base + 32u) return true;
+    }
+    return false;
+}
+
+struct DrawKeyTrace {
+    std::mutex mutex;
+    std::unordered_map<std::uint64_t, std::array<std::uint32_t, 96>> last;
+    std::uint64_t lookups = 0, hits = 0, repeats = 0, fresh = 0, sameWords = 0;
+    std::map<std::uint32_t, std::uint64_t> differing;
+    std::map<std::uint32_t, std::pair<std::uint32_t, std::uint32_t>> example;
+    std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
+};
+
+}
+
+void Driver::traceDrawKey(const QueueState& queue, const ShaderRegistry& registry, std::uint64_t deviceSerial, bool hit) {
+    // The draw key without the user data words; the words themselves beside it.
+    std::uint64_t key = 0xcbf29ce484222325ull;
+    const auto mix = [&](std::uint64_t value) {
+        key ^= value;
+        key *= 0x100000001b3ull;
+    };
+    mix(deviceSerial);
+    for (const auto& range : Graphics::DrawKeyRegisters) {
+        const auto& bank = range.bank == Graphics::RegisterBank::Context ? queue.context : range.bank == Graphics::RegisterBank::Shader ? queue.shader : queue.userConfig;
+        const auto end = range.first + range.count;
+        for (auto it = bank.lower_bound(range.first); it != bank.end() && it->first < end; ++it) {
+            if (userDataRegister(range.bank, it->first)) continue;
+            mix(it->first);
+            mix(it->second);
+        }
+    }
+    for (const auto base : {0x008u, 0x088u, 0x0c8u, 0x108u, 0x148u}) {
+        const auto low = queue.shader.find(base);
+        const auto high = queue.shader.find(base + 1);
+        if (low == queue.shader.end() || high == queue.shader.end()) {
+            mix(0);
+            continue;
+        }
+        const auto address = (static_cast<std::uint64_t>(low->second) << 8u) | (static_cast<std::uint64_t>(high->second & 0xffu) << 40u);
+        auto it = registry.upper_bound(address);
+        if (it == registry.begin()) {
+            mix(1);
+            continue;
+        }
+        --it;
+        mix(reinterpret_cast<std::uintptr_t>(it->second.get()));
+        mix(address - it->second->codeAddress);
+    }
+    std::array<std::uint32_t, 96> words{};
+    for (std::size_t stage = 0; stage < UserDataBases.size(); ++stage) {
+        for (std::uint32_t i = 0; i < 32; ++i) {
+            const auto found = queue.shader.find(UserDataBases[stage] + i);
+            words[stage * 32 + i] = found == queue.shader.end() ? 0xdeadbeefu : found->second;
+        }
+    }
+    static DrawKeyTrace trace;
+    std::lock_guard lock(trace.mutex);
+    ++trace.lookups;
+    if (hit) ++trace.hits;
+    auto [it, inserted] = trace.last.try_emplace(key, words);
+    if (inserted) {
+        ++trace.fresh;
+    } else if (!hit) {
+        ++trace.repeats;
+        bool any = false;
+        for (std::uint32_t i = 0; i < 96; ++i) {
+            if (it->second[i] == words[i]) continue;
+            any = true;
+            ++trace.differing[i];
+            trace.example[i] = {it->second[i], words[i]};
+        }
+        if (!any) ++trace.sameWords;
+        it->second = words;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (now - trace.lastReport < std::chrono::seconds(10)) return;
+    trace.lastReport = now;
+    std::fprintf(stderr, "[drawkey] %llu lookups (cumulative): %llu hits; misses whose key without user data was seen before %llu (%llu with the same user data too), first seen %llu; %zu keys without user data\n", static_cast<unsigned long long>(trace.lookups), static_cast<unsigned long long>(trace.hits), static_cast<unsigned long long>(trace.repeats), static_cast<unsigned long long>(trace.sameWords), static_cast<unsigned long long>(trace.fresh), trace.last.size());
+    std::vector<std::pair<std::uint64_t, std::uint32_t>> ranked;
+    for (const auto& [position, count] : trace.differing) ranked.push_back({count, position});
+    std::sort(ranked.begin(), ranked.end(), std::greater<>());
+    for (std::size_t i = 0; i < ranked.size() && i < 12; ++i) {
+        const auto position = ranked[i].second;
+        const auto [before, after] = trace.example[position];
+        std::fprintf(stderr, "[drawkey]   %s user word %u differs in %llu repeats (e.g. 0x%08x -> 0x%08x)\n", UserDataStages[position / 32], position % 32, static_cast<unsigned long long>(ranked[i].first), before, after);
+    }
+}
 
 std::uint64_t Driver::drawRegisterKey(const QueueState& queue, const ShaderRegistry& registry, std::uint64_t deviceSerial) {
     static const bool allUserWords = std::getenv("APS5_DRAW_KEY_ALL_USER_WORDS") != nullptr;

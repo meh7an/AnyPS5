@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawCache.hpp"
+#include <cstdio>
 #include <cstdlib>
 
 namespace AgcDriver::DriverDetail {
@@ -19,6 +20,33 @@ bool DrawRecipeRecord::Expired() const {
 bool Driver::drawEntries() {
     static const bool entries = std::getenv("APS5_NO_DRAW_SRT_ENTRIES") == nullptr && !stampValidate();
     return entries;
+}
+
+namespace {
+
+bool drawCacheAlways() {
+    static const bool always = std::getenv("APS5_DRAW_CACHE_ALWAYS") != nullptr;
+    return always;
+}
+
+}
+
+bool Driver::drawCacheActive() {
+    if (drawCacheAlways()) return true;
+    return drawCacheDraws.fetch_add(1, std::memory_order_relaxed) >= drawCacheParkedUntil.load(std::memory_order_relaxed);
+}
+
+void Driver::noteDrawCacheLookup(bool hit) {
+    if (drawCacheAlways()) return;
+    if (hit) drawCacheWindowHits.fetch_add(1, std::memory_order_relaxed);
+    if (drawCacheWindowLookups.fetch_add(1, std::memory_order_relaxed) + 1 < DrawCacheProbeLookups) return;
+    // The lookup that fills the window closes it.
+    const auto hits = drawCacheWindowHits.exchange(0, std::memory_order_relaxed);
+    drawCacheWindowLookups.store(0, std::memory_order_relaxed);
+    if (static_cast<std::uint64_t>(hits) * 32u >= DrawCacheProbeLookups) return;
+    drawCacheParkedUntil.store(drawCacheDraws.load(std::memory_order_relaxed) + DrawCacheParkDraws, std::memory_order_relaxed);
+    const auto parks = drawCacheParks.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (parks <= 3 || parks % 50 == 0) std::fprintf(stderr, "[draw-cache] %u of %u lookups hit: the cache is parked for %llu draws (%llu parks so far)\n", hits, DrawCacheProbeLookups, static_cast<unsigned long long>(DrawCacheParkDraws), static_cast<unsigned long long>(parks));
 }
 
 bool Driver::verifyDrawEntries() {
