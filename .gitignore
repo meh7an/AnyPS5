@@ -94,6 +94,7 @@ downloads/
 *.sdf
 
 *.bat
+!tools/make-exe.bat
 *.jpg
 *.png
 

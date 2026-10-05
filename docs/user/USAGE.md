@@ -1,5 +1,24 @@
 # Relinker usage
 
+## Quick start (Windows)
+
+Drag the dumped game folder onto [`tools/make-exe.bat`](../../tools/make-exe.bat), or run it without arguments to pick the folder. No build tools are needed.
+
+```powershell
+tools\make-exe.bat "D:\Games\MyGame"
+```
+
+The script creates `MyGame-PC\` beside the game folder with `<title>.exe`, `libs\` and `app0\`, ready to start. Fake-signed executables (SELF files whose segments are not encrypted, as made for backports) are unpacked to ELF in `MyGame-PC\prep\` first; encrypted executables are refused. `app0\` links to the game files instead of copying them, and the game folder itself is not modified. It uses a local build from `build\` when one exists, otherwise it downloads the latest release once to `%LOCALAPPDATA%\AnyPS5\releases\`. Intel CPUs are detected automatically.
+
+| Option            | Effect                                                    |
+|-------------------|-----------------------------------------------------------|
+| `-Output <path>`  | Output folder; must be on an NTFS drive.                  |
+| `-Release`        | Use the latest release even when a local build exists.    |
+| `-Cpu intel\|amd` | Override CPU detection.                                   |
+| `-NoConsole`      | Hide the console window (errors are then not visible).    |
+
+The rest of this document describes the relinker itself.
+
 ## Input and conversion
 
 Use a clean ELF executable. Place its bundled ELF modules in `sce_module/`, `sce_modules/`, or `prx/` beside the input executable. `prx/` can coexist with either `sce_module/` or `sce_modules/`. Both `sce_module/` and `sce_modules/` present, or all three absent, is an error.
