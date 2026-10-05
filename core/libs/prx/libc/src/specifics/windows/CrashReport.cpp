@@ -440,12 +440,17 @@ unsigned long long EnvironmentSeconds(const char* name, unsigned long long fallb
     return end != nullptr && *end == 0 ? value : fallback;
 }
 
-// APS5_SAMPLE_SECONDS: after APS5_SAMPLE_DELAY seconds (default 60), every thread's instruction
-// pointer is sampled for that many seconds; the busy threads and the hottest module offsets are
-// reported. A thread is suspended only for the context read: nothing is allocated while it is held.
+// APS5_SAMPLE_SECONDS: after APS5_SAMPLE_DELAY seconds (default 60), or once the file
+// APS5_SAMPLE_TRIGGER names exists, every thread's instruction pointer is sampled for that many
+// seconds; the busy threads and the hottest module offsets are reported. A thread is suspended only
+// for the context read: nothing is allocated while it is held.
 DWORD WINAPI SampleProfiler(LPVOID param) {
     const auto seconds = static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(param));
-    Sleep(static_cast<DWORD>(EnvironmentSeconds("APS5_SAMPLE_DELAY", 60) * 1000ull));
+    if (const char* trigger = std::getenv("APS5_SAMPLE_TRIGGER"); trigger != nullptr && trigger[0] != 0) {
+        while (GetFileAttributesA(trigger) == INVALID_FILE_ATTRIBUTES) Sleep(100);
+    } else {
+        Sleep(static_cast<DWORD>(EnvironmentSeconds("APS5_SAMPLE_DELAY", 60) * 1000ull));
+    }
     struct Sampled {
         DWORD id;
         HANDLE handle;
