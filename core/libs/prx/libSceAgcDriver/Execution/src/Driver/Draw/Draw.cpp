@@ -144,10 +144,13 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         phaseTiming.Phase(DrawRowDecode);
     }
     ShaderMemory shaderMemory(memory, &queryPendingWrite, &observePendingWrite, hookWaitCounter());
-    std::vector<ShaderRecompiler::RecompileResult> results;
+    // The compiled stages of a miss (shared with the capture, never copied) and the rect-list's
+    // generated stages; `stages` points into both.
+    std::vector<std::shared_ptr<const ShaderRecompiler::RecompileResult>> results;
+    std::array<ShaderRecompiler::RecompileResult, 2> rectStages;
     std::vector<Graphics::CompiledShader> stages;
-    results.reserve(programs.size() + (graphics.rectList ? 2u : 0u));
-    stages.reserve(programs.size());
+    results.reserve(programs.size());
+    stages.reserve(programs.size() + (graphics.rectList ? 2u : 0u));
     std::uint32_t pushCursorBytes = 0;
 
     std::vector<const ShaderRecompiler::RecompileResult*> programResults(programs.size(), nullptr);
@@ -209,7 +212,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             resultIndex[i] = results.size();
             results.push_back(compileDrawStage(i, pushCursorBytes, queue, submission, programs, graphics, pixel, vertexInfos, memory, linked, drawParameters, localDevice, shaderMemory, stageCaptures, recompiled, drawHit, matched, matchedRegions, profile, dumpTarget, dumpSlot1, captures, phaseTiming, phaseMs, rejected));
             if (!rejected.empty()) return DrawVerdict::Rejected;
-            programResults[i] = &results.back();
+            programResults[i] = results.back().get();
         }
         const auto& result = *programResults[i];
         if (i == 0 && drawParameters.indirect) {
@@ -235,22 +238,18 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
 
     bool rectListBuilt = false;
 
-    std::size_t rectIndex = 0;
     const auto buildRectList = [&] {
         phaseTiming.Phase(DrawRowVectors);
         require(programs.size() == 2 && programResults[0] != nullptr && programResults[1] != nullptr, "rect-list requires vertex and fragment programs");
         auto rectangle = ShaderRecompiler::BuildRectListShaders(*programResults[0], *programResults[1], localDevice->Target());
+        rectStages[0] = std::move(rectangle.control);
+        rectStages[1] = std::move(rectangle.evaluation);
         if (rectListBuilt) {
-            results[rectIndex] = std::move(rectangle.control);
-            results[rectIndex + 1] = std::move(rectangle.evaluation);
             phaseTiming.Phase(DrawRowRectList);
             return;
         }
         require(stages.size() == 2, "rect-list requires vertex and fragment programs");
-        rectIndex = results.size();
-        results.push_back(std::move(rectangle.control));
-        results.push_back(std::move(rectangle.evaluation));
-        stages.insert(stages.begin() + 1, {{Stage::TessellationControl, &results[rectIndex], 0}, {Stage::TessellationEvaluation, &results[rectIndex + 1], 0}});
+        stages.insert(stages.begin() + 1, {{Stage::TessellationControl, &rectStages[0], 0}, {Stage::TessellationEvaluation, &rectStages[1], 0}});
         rectListBuilt = true;
         phaseTiming.Phase(DrawRowRectList);
     };
@@ -284,14 +283,11 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         const auto indirect = *drawParameters.indirect;
         if (drawHit) {
 
+            // The variants' results, shared: a record's patch replaces its program's entry below.
             for (std::size_t i = 0; i < programs.size(); ++i) {
                 if (programResults[i] == nullptr) continue;
                 resultIndex[i] = results.size();
-                results.push_back(ShaderRecompiler::RecompileResult(*programResults[i]));
-                for (auto& stage : stages) {
-                    if (stage.program == programResults[i]) stage.program = &results[resultIndex[i]];
-                }
-                programResults[i] = &results[resultIndex[i]];
+                results.push_back(matched[i]->compiled);
             }
         }
         recordQueuedLabelsBeforeRead(submission.queue);
@@ -332,11 +328,17 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             }
             for (const auto programIndex : patched) {
                 auto& result = results[resultIndex[programIndex]];
-                const auto pushBytes = result.pushConstants.size();
+                const auto* previous = result.get();
+                const auto pushBytes = result->pushConstants.size();
                 decodeVertexInfo(programIndex);
                 result = compileDrawStage(programIndex, pushOffsets[programIndex], queue, submission, programs, graphics, pixel, vertexInfos, memory, linked, drawParameters, localDevice, shaderMemory, stageCaptures, recompiled, drawHit, matched, matchedRegions, profile, dumpTarget, dumpSlot1, captures, phaseTiming, phaseMs, rejected);
                 if (!rejected.empty()) return DrawVerdict::Rejected;
-                require(result.pushConstants.size() == pushBytes, "patched program changed its push constant layout");
+                require(result->pushConstants.size() == pushBytes, "patched program changed its push constant layout");
+                // The stages name the program's result by address: repoint them at the new one.
+                for (auto& stage : stages) {
+                    if (stage.program == previous) stage.program = result.get();
+                }
+                programResults[programIndex] = result.get();
             }
             fold(*programResults[0], direct);
             if (graphics.rectList && patched.contains(0)) buildRectList();
