@@ -3,6 +3,7 @@
 
 #include "prx/libSceAgcDriver/Execution/include/QueueState.hpp"
 #include "Recompiler.hpp"
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <span>
@@ -13,10 +14,13 @@ namespace AgcDriver::Graphics {
 ShaderRecompiler::ShaderPixelStageInfo DecodePixelStageInfo(const Registers& context, const std::array<std::uint8_t, 8>& exportMappings, bool nullProgram = false);
 ShaderRecompiler::ShaderComputeStageInfo DecodeComputeStageInfo(const Registers& shader, std::span<const std::byte> header);
 // A guest range DecodeVertexStageInfo read (an attribute word, a vertex V#) with the bytes as read:
-// the draw cache validates them by value with the stage's capture (design_cpu_final rule RD).
+// the draw cache validates them by value with the stage's capture (design_cpu_final rule RD). The
+// bytes are kept inline (4 or 16 of them): a draw records two reads per vertex input.
 struct DecodeRead {
     std::uint64_t address;
-    std::vector<std::byte> bytes;
+    std::array<std::byte, 16> data{};
+    std::uint32_t size = 0;
+    std::span<const std::byte> Bytes() const { return {data.data(), size}; }
 };
 ShaderRecompiler::ShaderVertexStageInfo DecodeVertexStageInfo(std::span<const std::byte> header, std::uint64_t headerAddress, std::span<const std::uint32_t> userData, std::vector<DecodeRead>* reads = nullptr);
 

@@ -12,6 +12,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ThreadScratch.hpp"
 #include "prx/libc/include/General.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "Optimization/include/Optimization/ShaderStageInputInfo.hpp"
@@ -524,12 +525,23 @@ std::map<std::vector<std::uint64_t>, std::string>& validationFailures() {
     return failures;
 }
 
-std::set<std::uint32_t> CachedFragmentOutputs(const Context& context, std::span<const CompiledShader> shaders, const State& state, bool& memoized, bool& hit) {
+// The validation key of a draw, built twice per draw (KnownValidationFailure, CachedFragmentOutputs)
+// into the calling thread's buffer: a fresh vector each time was an allocation.
+std::vector<std::uint64_t>& validationKeyScratch() {
+    struct Tag {};
+    auto& key = ThreadScratch<std::vector<std::uint64_t>, Tag>();
+    key.clear();
+    return key;
+}
+
+// The color targets the pixel shader exports to, a bit per target (ValidateShaders' locations, all
+// below the target count): a mask, not the set it was, copied out of the memo on every draw.
+std::uint32_t CachedFragmentOutputs(const Context& context, std::span<const CompiledShader> shaders, const State& state, bool& memoized, bool& hit) {
     memoized = false;
     hit = false;
-    std::vector<std::uint64_t> key;
+    auto& key = validationKeyScratch();
     const bool keyed = ValidationKey(context, shaders, state, key);
-    static std::map<std::vector<std::uint64_t>, std::set<std::uint32_t>> memo;
+    static std::map<std::vector<std::uint64_t>, std::uint32_t> memo;
     if (keyed) {
         memoized = true;
         std::lock_guard lock(validationMutex());
@@ -538,15 +550,18 @@ std::set<std::uint32_t> CachedFragmentOutputs(const Context& context, std::span<
             return found->second;
         }
     }
-    std::set<std::uint32_t> outputs;
+    std::uint32_t outputs = 0;
     try {
-        outputs = ValidateShaders(shaders, state, context.subgroup, context.fragmentShaderBarycentric, context.descriptorIndexing, context.imageInt64Atomics, context.geometryShader, context.sampleRateShading);
+        for (const auto location : ValidateShaders(shaders, state, context.subgroup, context.fragmentShaderBarycentric, context.descriptorIndexing, context.imageInt64Atomics, context.geometryShader, context.sampleRateShading)) {
+            Require(location < 32, "fragment output location exceeds the output mask");
+            outputs |= 1u << location;
+        }
     } catch (const std::exception& error) {
         if (keyed) {
             std::lock_guard lock(validationMutex());
             auto& failures = validationFailures();
             if (failures.size() >= 1024) failures.clear();
-            failures.emplace(std::move(key), error.what());
+            failures.emplace(key, error.what());
         }
         throw;
     }
@@ -554,7 +569,7 @@ std::set<std::uint32_t> CachedFragmentOutputs(const Context& context, std::span<
         std::lock_guard lock(validationMutex());
         // A handful of configurations recur; a runaway key space is dropped wholesale.
         if (memo.size() >= 1024) memo.clear();
-        memo.emplace(std::move(key), outputs);
+        memo.emplace(key, outputs);
     }
     return outputs;
 }
@@ -769,7 +784,8 @@ struct DrawInputs {
     std::vector<std::shared_ptr<Buffer>> vertexBuffers;
     std::vector<VkBuffer> vertexHandles;
     std::vector<VkDeviceSize> vertexOffsets;
-    std::set<std::uint32_t> fragmentOutputs;
+    // A bit per color target the pixel shader exports to (CachedFragmentOutputs).
+    std::uint32_t fragmentOutputs = 0;
     VkPipelineStageFlags shaderStages = 0;
     std::uint32_t meshGroups = 0;
 };
@@ -982,6 +998,8 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         heapBases.assign(plan.copies.size(), 0);
         bases = heapBases.data();
     }
+    inputs.vertexBuffers.reserve(plan.copies.size());
+    inputs.vertexHandles.reserve(attributes.size());
     for (std::size_t copyIndex = 0; copyIndex < plan.copies.size(); ++copyIndex) {
         const auto [begin, end] = plan.copies[copyIndex];
         const auto bytes = static_cast<std::size_t>(end - begin);
@@ -1662,10 +1680,10 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
 // The state with the outputs the pixel shader lacks masked: Vulkan leaves attachments a pixel
 // shader has no output for undefined, so their writes are masked (shaders that only store to
 // images or buffers keep their targets as they were). Empty when no mask must change.
-std::optional<State> maskedState(const State& state, const std::set<std::uint32_t>& fragmentOutputs) {
+std::optional<State> maskedState(const State& state, std::uint32_t fragmentOutputs) {
     std::optional<State> masked;
     for (std::size_t index = 0; index < state.blends.size(); ++index) {
-        if (fragmentOutputs.contains(static_cast<std::uint32_t>(index)) || state.blends[index].colorWriteMask == 0) continue;
+        if ((index < 32 && ((fragmentOutputs >> index) & 1u) != 0) || state.blends[index].colorWriteMask == 0) continue;
         if (!masked.has_value()) masked = state;
         masked->blends[index].colorWriteMask = 0;
     }
@@ -1692,7 +1710,7 @@ bool RecordDraws() {
 }
 
 std::optional<std::string> KnownValidationFailure(const Context& context, std::span<const CompiledShader> shaders, const State& state) {
-    std::vector<std::uint64_t> key;
+    auto& key = validationKeyScratch();
     if (!ValidationKey(context, shaders, state, key)) return std::nullopt;
     std::lock_guard lock(validationMutex());
     const auto& failures = validationFailures();

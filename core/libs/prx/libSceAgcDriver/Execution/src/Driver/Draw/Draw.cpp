@@ -88,10 +88,16 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     resolveDrawDecode(queue, submission, decode, registerKey, drawKey, profile);
     const auto& graphics = decode->state;
     const auto& pixel = decode->pixel;
-    std::vector<DrawProgram> programs = decode->programs;
+    // The decode's programs, read in place. Only a mesh draw (its index buffer descriptor) and an
+    // indirect draw (each record's patches) write user words; they work on a copy, made here
+    // before anything refers into the programs.
+    const bool writesPrograms = graphics.stages.mesh || drawParameters.indirect;
+    std::vector<DrawProgram> writablePrograms;
+    if (writesPrograms) writablePrograms = decode->programs;
+    const std::vector<DrawProgram>& programs = writesPrograms ? writablePrograms : decode->programs;
     const auto setMeshIndexBuffer = [&](const Pm4::DrawParameters& parameters) {
         if (!graphics.stages.mesh) return;
-        auto& words = programs.front().userData;
+        auto& words = writablePrograms.front().userData;
         require(programs.front().firstUserSgpr == 0 && words.size() >= ShaderRecompiler::MeshIndexBufferUserWord + 4, "mesh program lacks the hidden user words");
         const auto descriptor = Graphics::MeshIndexBufferDescriptor(parameters);
         std::copy(descriptor.begin(), descriptor.end(), words.begin() + ShaderRecompiler::MeshIndexBufferUserWord);
@@ -121,8 +127,12 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         indirect.startInstanceSgpr = sgprOf(indirect.startInstanceLocation);
         indirect.drawIndexSgpr = sgprOf(indirect.drawIndexLocation);
     }
+    // The regions the stages read: two per program here, then the captures' and the decode reads.
+    // Reserved once: grown a push at a time, the list was reallocated several times per draw.
     std::vector<ShaderRecompiler::MemoryRegion> memory;
+    memory.reserve(2 * programs.size() + 32);
     std::vector<ShaderRecompiler::LinkedProgram> linked;
+    linked.reserve(programs.size());
     for (std::size_t i = 0; i < programs.size(); ++i) {
         const auto& program = programs[i];
         memory.insert(memory.end(), program.memory.begin(), program.memory.end());
@@ -231,7 +241,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     timing.Mark("shader_compile_and_link");
 
     for (const auto& reads : decodeReads) {
-        for (const auto& read : reads) memory.push_back({read.address, std::as_bytes(std::span(read.bytes))});
+        for (const auto& read : reads) memory.push_back({read.address, read.Bytes()});
     }
 
     if (recordQueuedLabelsAfterCapture(submission.queue, memory)) return draw(queue, packet, submission, rejected);
@@ -257,6 +267,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     std::vector<Graphics::GuestMemorySnapshot> snapshots;
     const auto snapshot = [&] {
         snapshots.clear();
+        snapshots.reserve(memory.size());
         for (const auto& region : memory) snapshots.push_back({region.guestAddress, region.bytes});
     };
     snapshot();
@@ -306,7 +317,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             std::set<std::size_t> patched;
             const auto patch = [&](const std::optional<std::pair<std::size_t, std::size_t>>& word, std::uint32_t value) {
                 if (!word) return;
-                programs[word->first].userData[word->second] = value;
+                writablePrograms[word->first].userData[word->second] = value;
                 patched.insert(word->first);
             };
             patch(baseVertexWord, indirect.recordBytes == 20 ? arguments.vertexOffset : arguments.firstVertexOrIndex);

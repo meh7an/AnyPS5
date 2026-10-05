@@ -2,6 +2,7 @@
 #include "Optimization/SrtWalker/SrtAddressArithmetic.hpp"
 #include "Optimization/SrtWalker/SrtInstructionPredicates.hpp"
 #include "IntermediateRepresentation/IrBuilder.hpp"
+#include "prx/libc/include/HostThreadLocal.hpp"
 
 #include <algorithm>
 #include <bit>
@@ -511,7 +512,19 @@ bool SrtTape::Run(const IrResourcePlan& plan, const SrtRuntime& runtime, std::ve
     }
     Frame frame {runtime, values, states};
 
-    std::vector<std::uint8_t> active(plan.descriptorSources.size(), 1u);
+    // The walk's lists, kept per thread and refilled (a capture runs this for each stage of every
+    // draw): the results are swapped out to the caller, whose own lists are per-thread scratch too.
+    struct Scratch {
+        std::vector<std::uint8_t> active;
+        std::vector<std::uint8_t> visited;
+        std::vector<std::uint32_t> pending;
+        std::vector<DescriptorValue> evaluated;
+        std::vector<std::uint32_t> flattened;
+    };
+    struct ScratchStorage {};
+    auto& scratch = HostThreadLocal<Scratch, ScratchStorage>();
+    auto& active = scratch.active;
+    active.assign(plan.descriptorSources.size(), 1u);
     if (!plan.controlFlow.empty()) {
         for (const auto& block : plan.controlFlow) {
             for (const auto source : block.sources) {
@@ -519,8 +532,10 @@ bool SrtTape::Run(const IrResourcePlan& plan, const SrtRuntime& runtime, std::ve
                 active[source] = 0u;
             }
         }
-        std::vector<std::uint8_t> visited(plan.controlFlow.size());
-        std::vector<std::uint32_t> pending {0};
+        auto& visited = scratch.visited;
+        visited.assign(plan.controlFlow.size(), 0u);
+        auto& pending = scratch.pending;
+        pending.assign(1, 0u);
         while (!pending.empty()) {
             const auto index = pending.back();
             pending.pop_back();
@@ -539,7 +554,8 @@ bool SrtTape::Run(const IrResourcePlan& plan, const SrtRuntime& runtime, std::ve
             }
         }
     }
-    std::vector<DescriptorValue> evaluated;
+    auto& evaluated = scratch.evaluated;
+    evaluated.clear();
     evaluated.reserve(plan.materializationSources.size());
     for (const auto sourceIndex : plan.materializationSources) {
         if (sourceIndex >= plan.descriptorSources.size()) return refuse();
@@ -555,7 +571,8 @@ bool SrtTape::Run(const IrResourcePlan& plan, const SrtRuntime& runtime, std::ve
         }
         evaluated.push_back(value);
     }
-    std::vector<std::uint32_t> flattened(plan.srtReads.size());
+    auto& flattened = scratch.flattened;
+    flattened.assign(plan.srtReads.size(), 0u);
     for (std::size_t slot = 0; slot < plan.srtReads.size(); ++slot) {
         const auto& read = plan.srtReads[slot];
         // A pure slot's leaf read is recorded as such (see EvaluateRuntimeSourcesImpl).
@@ -570,9 +587,10 @@ bool SrtTape::Run(const IrResourcePlan& plan, const SrtRuntime& runtime, std::ve
         if (!ok) return refuse();
         flattened[read.flatOffset] = static_cast<std::uint32_t>(word);
     }
-    results = std::move(evaluated);
-    activeSources = std::move(active);
-    flat = std::move(flattened);
+    results.swap(evaluated);
+    activeSources.swap(active);
+    // The flattened SRT is kept by the caller's snapshot: copied, so this list keeps its capacity.
+    flat.assign(flattened.begin(), flattened.end());
     return true;
 }
 

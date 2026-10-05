@@ -85,8 +85,9 @@ private:
     Page& page(std::uint64_t base);
 
     // Regions given at construction (the registered shader's code and header), referenced as given:
-    // the caller keeps them alive for as long as the capture is used.
-    std::map<std::uint64_t, std::span<const std::byte>> initial;
+    // the caller keeps them alive for as long as the capture is used. Sorted by address in one
+    // vector, not a map: a draw makes one of these, and the map's node per region was an allocation.
+    std::vector<std::pair<std::uint64_t, std::span<const std::byte>>> initial;
     std::map<std::uint64_t, Page> pages;
     PendingWriteQuery pendingWrite = nullptr;
     PendingWriteObserver observe = nullptr;

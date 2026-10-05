@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ThreadScratch.hpp"
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -356,13 +357,14 @@ void append(std::vector<std::byte>& key, const TValue& value) {
     key.insert(key.end(), bytes.begin(), bytes.end());
 }
 
-// Everything the Pipeline objects are built from, or empty when a stage's result has no variant id
-// (the recompiler could not identify it, so nothing else may share its pipeline). The rect-list
-// control and evaluation stages are generated from the vertex and fragment results, which the key
-// already names, so they carry no id of their own.
-std::vector<std::byte> pipelineKey(const Context& context, const State& state, const VertexInputLayout& input, const ShaderResources& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout) {
+// Everything the Pipeline objects are built from, into `key` (CachedPipeline passes its thread's
+// buffer), or nothing when a stage's result has no variant id (the recompiler could not identify
+// it, so nothing else may share its pipeline). The rect-list control and evaluation stages are
+// generated from the vertex and fragment results, which the key already names, so they carry no
+// id of their own.
+void pipelineKey(std::vector<std::byte>& key, const Context& context, const State& state, const VertexInputLayout& input, const ShaderResources& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout) {
     using Stage = ShaderRecompiler::ShaderStage;
-    std::vector<std::byte> key;
+    key.clear();
     // Room for a usual key (a few hundred bytes): growing it value by value reallocated it often.
     key.reserve(1024);
     append(key, context.device);
@@ -371,7 +373,10 @@ std::vector<std::byte> pipelineKey(const Context& context, const State& state, c
     for (const auto& shader : shaders) {
         Require(shader.program != nullptr, "missing compiled shader");
         const bool generated = state.rectList && (shader.stage == Stage::TessellationControl || shader.stage == Stage::TessellationEvaluation);
-        if (!generated && shader.program->variantId == 0) return {};
+        if (!generated && shader.program->variantId == 0) {
+            key.clear();
+            return;
+        }
         append(key, shader.stage);
         append(key, generated ? std::uint64_t{0} : shader.program->variantId);
         // Where the stage's push constants sit in the block (AssemblePushConstants).
@@ -442,7 +447,6 @@ std::vector<std::byte> pipelineKey(const Context& context, const State& state, c
         append(key, tessellation.partitioning);
         append(key, tessellation.outputTopology);
     }
-    return key;
 }
 
 // FNV-1a over eight bytes at a time (and the tail byte-wise): every draw hashes its key, and a byte
@@ -523,8 +527,11 @@ std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& st
     static const bool disabled = std::getenv("APS5_NO_PIPELINE_CACHE") != nullptr;
     if (disabled) return std::make_shared<Pipeline>(context, state, vertexInput, resources, shaders, attachmentLayout);
     auto& store = Pipelines();
-    // The key and its hash need no lock.
-    const auto key = pipelineKey(context, state, vertexInput, resources, shaders, attachmentLayout);
+    // The key and its hash need no lock. The key is built in the calling thread's buffer: a fresh
+    // kilobyte for every draw was an allocation.
+    struct KeyTag {};
+    auto& key = ThreadScratch<std::vector<std::byte>, KeyTag>();
+    pipelineKey(key, context, state, vertexInput, resources, shaders, attachmentLayout);
     const auto hash = key.empty() ? 0 : hashKey(key);
     std::lock_guard lock(store.mutex);
     reportPipelines(store);

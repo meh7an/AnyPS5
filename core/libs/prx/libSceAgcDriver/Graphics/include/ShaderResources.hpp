@@ -153,11 +153,13 @@ public:
         std::vector<Snapshot> snapshots;
         ~DrawBindings();
     };
+    // A data buffer's new words point into the draw's compiled stage (its binding's guest
+    // descriptor), which outlives the draw's PrepareDrawBindings, the only reader.
     struct MovedBuffer {
         std::size_t allocation;
         std::uint64_t address;
         std::size_t size;
-        std::vector<std::uint32_t> words;
+        std::span<const std::uint32_t> words;
     };
     std::shared_ptr<DrawBindings> PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved = {}) const;
     // The largest draw snapshot (and moved data buffer) PrepareDrawBindings copies into the

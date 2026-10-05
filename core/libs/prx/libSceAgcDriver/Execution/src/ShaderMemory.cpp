@@ -88,10 +88,11 @@ void ShaderMemory::SetWaitedMsProvider(WaitedMsProvider provider) {
 }
 
 ShaderMemory::ShaderMemory(std::span<const ShaderRecompiler::MemoryRegion> regions, PendingWriteQuery pendingWrite, PendingWriteObserver observe, HookWaitCounter hookWaits) : pendingWrite(pendingWrite), observe(observe), hookWaits(hookWaits) {
+    // Validated (no empty or overlapping region, so no two share an address), then sorted.
     const ShaderRecompiler::RequestMemoryView validated(regions);
-    for (const auto& region : regions) {
-        initial.emplace(region.guestAddress, region.bytes);
-    }
+    initial.reserve(regions.size());
+    for (const auto& region : regions) initial.emplace_back(region.guestAddress, region.bytes);
+    std::sort(initial.begin(), initial.end(), [](const auto& left, const auto& right) { return left.first < right.first; });
 }
 
 ShaderMemory::Page& ShaderMemory::page(std::uint64_t base) {
@@ -122,7 +123,7 @@ bool ShaderMemory::read(void* context, std::uint64_t address, std::uint32_t* val
     }
     ++CaptureTotals().reads;
     if (!self.initial.empty()) {
-        const auto next = self.initial.upper_bound(address);
+        const auto next = std::upper_bound(self.initial.begin(), self.initial.end(), address, [](std::uint64_t value, const auto& entry) { return value < entry.first; });
         if (next != self.initial.begin()) {
             const auto previous = std::prev(next);
             const auto offset = address - previous->first;
