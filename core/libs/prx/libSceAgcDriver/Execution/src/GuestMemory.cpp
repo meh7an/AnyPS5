@@ -765,6 +765,10 @@ struct WriteTracker {
     // records in the same block (the title's per-job slots are 0x20 apart) must not count.
     std::vector<std::uint32_t> cpuBlocks;
     std::vector<std::uint32_t> writtenBlocks;
+    // The newest stamp of any block per run of CoarseBlocks blocks (4 MiB): a check over a large
+    // range (a render target's whole surface, every draw) skips the runs stamped before its
+    // generation instead of reading each block.
+    std::vector<std::uint32_t> coarseBlocks;
 #else
     static constexpr std::size_t LeafBlocks = std::size_t{1} << 16;
     static constexpr std::size_t LeafCount = std::size_t{1} << 15;
@@ -772,9 +776,11 @@ struct WriteTracker {
         std::array<std::uint32_t, LeafBlocks> blocks{};
         std::array<std::uint32_t, LeafBlocks> cpuBlocks{};
         std::array<std::uint32_t, LeafBlocks> writtenBlocks{};
+        std::array<std::uint32_t, LeafBlocks / 64> coarseBlocks{};
     };
     std::vector<std::unique_ptr<Leaf>> leaves;
 #endif
+    static constexpr std::uint64_t CoarseBlocks = 64;
     // Atomic only so a per-thread memo hit can read it without the mutex (every mutation and every
     // stamp still happen under it): a hit must return the current value, including MarkWritten
     // bumps, or an image refreshed after a stamp would keep failing UnchangedSince until the next
@@ -808,6 +814,7 @@ struct WriteTracker {
         blocks.assign(size / WriteBlockBytes + 1, 0);
         cpuBlocks.assign(size / WriteBlockBytes + 1, 0);
         writtenBlocks.assign(size / WriteBlockBytes + 1, 0);
+        coarseBlocks.assign(blocks.size() / CoarseBlocks + 1, 0);
         pages.resize(1u << 16);
 #else
         watched = GuestWriteWatch::GuestWriteWatchAvailable_nid_postfix();
@@ -914,6 +921,30 @@ struct WriteTracker {
 #endif
     }
 
+    // The newest stampOf of the CoarseBlocks-aligned run holding `block`.
+    std::uint32_t coarseStampOf(std::uint64_t block) const {
+#ifdef _WIN32
+        return coarseBlocks[block / CoarseBlocks];
+#else
+        const auto& leaf = leaves[block / LeafBlocks];
+        return leaf != nullptr ? leaf->coarseBlocks[(block % LeafBlocks) / CoarseBlocks] : 0;
+#endif
+    }
+
+    // Whether no block of [first, last] was stamped after `generation`: whole aligned runs by their
+    // coarse stamp, the rest block by block.
+    bool unchangedBlocks(std::uint64_t first, std::uint64_t last, std::uint64_t generation) const {
+        for (auto block = first; block <= last;) {
+            if (block % CoarseBlocks == 0 && last - block >= CoarseBlocks - 1 && coarseStampOf(block) <= generation) {
+                block += CoarseBlocks;
+                continue;
+            }
+            if (stampOf(block) > generation) return false;
+            ++block;
+        }
+        return true;
+    }
+
     void stamp(std::uint64_t block, std::uint32_t stampGeneration, StampKind kind) {
         const bool cpu = kind != StampKind::Driver;
         const bool written = kind != StampKind::ImportWindow;
@@ -921,12 +952,16 @@ struct WriteTracker {
         blocks[block] = stampGeneration;
         if (cpu) cpuBlocks[block] = stampGeneration;
         if (written) writtenBlocks[block] = stampGeneration;
+        auto& coarse = coarseBlocks[block / CoarseBlocks];
+        coarse = std::max(coarse, stampGeneration);
 #else
         auto& leaf = leaves[block / LeafBlocks];
         if (leaf == nullptr) leaf = std::make_unique<Leaf>();
         leaf->blocks[block % LeafBlocks] = stampGeneration;
         if (cpu) leaf->cpuBlocks[block % LeafBlocks] = stampGeneration;
         if (written) leaf->writtenBlocks[block % LeafBlocks] = stampGeneration;
+        auto& coarse = leaf->coarseBlocks[(block % LeafBlocks) / CoarseBlocks];
+        coarse = std::max(coarse, stampGeneration);
 #endif
     }
 };
@@ -1179,12 +1214,7 @@ bool UnchangedSince(std::uint64_t address, std::size_t bytes, std::uint64_t gene
     const auto lock = lockTracker(tracker);
     tracker.initialize();
     if (!tracker.watched || generation == 0 || bytes == 0 || !tracker.covers(address, bytes)) return false;
-    const auto first = tracker.blockOf(address);
-    const auto last = tracker.blockOf(address + bytes - 1);
-    for (auto block = first; block <= last; ++block) {
-        if (tracker.stampOf(block) > generation) return false;
-    }
-    return true;
+    return tracker.unchangedBlocks(tracker.blockOf(address), tracker.blockOf(address + bytes - 1), generation);
 }
 
 bool UnchangedSinceAll(std::span<const UnchangedQuery> queries) {
@@ -1194,11 +1224,7 @@ bool UnchangedSinceAll(std::span<const UnchangedQuery> queries) {
     if (!tracker.watched) return false;
     for (const auto& [address, bytes, generation] : queries) {
         if (generation == 0 || bytes == 0 || !tracker.covers(address, bytes)) return false;
-        const auto first = tracker.blockOf(address);
-        const auto last = tracker.blockOf(address + bytes - 1);
-        for (auto block = first; block <= last; ++block) {
-            if (tracker.stampOf(block) > generation) return false;
-        }
+        if (!tracker.unchangedBlocks(tracker.blockOf(address), tracker.blockOf(address + bytes - 1), generation)) return false;
     }
     return true;
 }

@@ -1052,8 +1052,53 @@ struct ResolvedResources {
     const ShaderResources::BuildTiming* built = nullptr;
 };
 
+// APS5_PROFILE_DRAW_PHASES: the lookup phase's parts per draw, every 10 s. Under the GPU mutex, as
+// draws are.
+struct LookupParts {
+    enum Part { Key, Find, Revalidate, Moved, Aliases, Count };
+    static constexpr const char* Names[Count] = {"key", "find", "revalidate", "moved buffers", "alias checks"};
+    std::array<double, Count> us{};
+    std::uint64_t draws = 0, keyWords = 0;
+    std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
+    std::chrono::steady_clock::time_point lap{};
+    bool enabled = std::getenv("APS5_PROFILE_DRAW_PHASES") != nullptr;
+    void start() {
+        if (!enabled) return;
+        lap = std::chrono::steady_clock::now();
+        ++draws;
+    }
+    void mark(Part part) {
+        if (!enabled) return;
+        const auto now = std::chrono::steady_clock::now();
+        us[part] += std::chrono::duration<double, std::micro>(now - lap).count();
+        lap = now;
+    }
+    void report() {
+        if (!enabled) return;
+        const auto now = std::chrono::steady_clock::now();
+        if (now - lastReport < std::chrono::seconds(10) || draws == 0) return;
+        lastReport = now;
+        std::string line;
+        for (std::size_t i = 0; i < Count; ++i) {
+            char text[64];
+            std::snprintf(text, sizeof(text), " %s %.2f", Names[i], us[i] / static_cast<double>(draws));
+            line += text;
+        }
+        std::fprintf(stderr, "[lookup-parts] %llu draws (key %.1f words each), us per draw:%s\n", static_cast<unsigned long long>(draws), static_cast<double>(keyWords) / static_cast<double>(draws), line.c_str());
+        us = {};
+        draws = keyWords = 0;
+    }
+};
+
+LookupParts& lookupParts() {
+    static LookupParts parts;
+    return parts;
+}
+
 ResolvedResources resolveDrawResources(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::uint64_t indexBytes, bool recordable, DrawOutcome& outcome, DrawTimer& timer) {
     ResolvedResources resolved;
+    auto& parts = lookupParts();
+    parts.start();
     APS5_LOG_CHARS_OUT_DEBUG("Creating ShaderResources");
     // A recordable draw whose stages' compiled content repeats an earlier one binds that build's
     // descriptor set when it is still valid (see ResourceCache; the dispatch path does the same).
@@ -1069,13 +1114,19 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
     resolved.cacheable = recordable && !noDrawResourceCache && !noTextureCache && std::all_of(shaders.begin(), shaders.end(), [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->variantId != 0; });
     if (resolved.cacheable) {
         resolved.contentKey = DrawResourceKey(context, shaders, state.color, draw.indexAddress, indexBytes, !trimKey);
+        if (parts.enabled) parts.keyWords += resolved.contentKey.size();
+        parts.mark(LookupParts::Key);
         if (auto cached = SharedResourceCache().Find(resolved.contentKey)) {
+            parts.mark(LookupParts::Find);
             const bool valid = cached->Revalidate(shaders);
+            parts.mark(LookupParts::Revalidate);
             auto* recorder = Recorder::Active();
             std::optional<std::vector<ShaderResources::MovedBuffer>> moved;
             if (valid && recorder != nullptr) moved = cached->MovedReadOnlyBuffers(shaders, *recorder);
+            parts.mark(LookupParts::Moved);
             if (moved.has_value()) {
                 if (trimKey) CheckBufferAliases(shaders, state.color, draw.indexAddress, indexBytes);
+                parts.mark(LookupParts::Aliases);
                 resolved.resources = std::move(cached);
                 resolved.moved = std::move(*moved);
                 outcome.kind = KindTemplateHit;
@@ -1090,6 +1141,8 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
     } else {
         countCache(&DrawProfile::uncacheable);
     }
+    parts.mark(LookupParts::Find);
+    parts.report();
     timer.phase(PhaseLookup);
     if (resolved.resources == nullptr) {
         resolved.resources = std::make_shared<ShaderResources>(context, shaders, state.color, draw.indexAddress, static_cast<std::size_t>(indexBytes), snapshots);

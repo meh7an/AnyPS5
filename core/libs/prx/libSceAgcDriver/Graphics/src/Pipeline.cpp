@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <list>
 #include <mutex>
 #include <type_traits>
@@ -361,6 +362,8 @@ void append(std::vector<std::byte>& key, const TValue& value) {
 std::vector<std::byte> pipelineKey(const Context& context, const State& state, const VertexInputLayout& input, const ShaderResources& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout) {
     using Stage = ShaderRecompiler::ShaderStage;
     std::vector<std::byte> key;
+    // Room for a usual key (a few hundred bytes): growing it value by value reallocated it often.
+    key.reserve(1024);
     append(key, context.device);
     append(key, attachmentLayout);
     append(key, shaders.size());
@@ -441,10 +444,19 @@ std::vector<std::byte> pipelineKey(const Context& context, const State& state, c
     return key;
 }
 
+// FNV-1a over eight bytes at a time (and the tail byte-wise): every draw hashes its key, and a byte
+// per step cost more than building it.
 std::uint64_t hashKey(const std::vector<std::byte>& key) {
     std::uint64_t hash = 14695981039346656037ull;
-    for (const auto byte : key) {
-        hash ^= static_cast<std::uint8_t>(byte);
+    std::size_t at = 0;
+    for (; at + sizeof(std::uint64_t) <= key.size(); at += sizeof(std::uint64_t)) {
+        std::uint64_t word = 0;
+        std::memcpy(&word, key.data() + at, sizeof(word));
+        hash ^= word;
+        hash *= 1099511628211ull;
+    }
+    for (; at < key.size(); ++at) {
+        hash ^= static_cast<std::uint8_t>(key[at]);
         hash *= 1099511628211ull;
     }
     return hash;
@@ -510,14 +522,15 @@ std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& st
     static const bool disabled = std::getenv("APS5_NO_PIPELINE_CACHE") != nullptr;
     if (disabled) return std::make_shared<Pipeline>(context, state, vertexInput, resources, shaders, attachmentLayout);
     auto& store = Pipelines();
+    // The key and its hash need no lock.
+    const auto key = pipelineKey(context, state, vertexInput, resources, shaders, attachmentLayout);
+    const auto hash = key.empty() ? 0 : hashKey(key);
     std::lock_guard lock(store.mutex);
     reportPipelines(store);
-    const auto key = pipelineKey(context, state, vertexInput, resources, shaders, attachmentLayout);
     if (key.empty()) {
         ++store.uncached;
         return std::make_shared<Pipeline>(context, state, vertexInput, resources, shaders, attachmentLayout);
     }
-    const auto hash = hashKey(key);
     if (const auto found = store.index.find(hash); found != store.index.end()) {
         const auto it = found->second;
         if (it->key == key) {

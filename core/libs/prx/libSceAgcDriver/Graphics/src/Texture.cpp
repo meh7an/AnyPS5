@@ -1250,16 +1250,21 @@ bool StorageTexture::Refresh() {
     NoteProved();
     // The last pass's answer (current, no alias) holds while the pending registry is as that pass
     // left it (no other image's results to store first; an image becoming pending over the surface
-    // moves the serial), no DCC keys need proving and nothing wrote the surface since its
-    // generation: the pass then only collects the writes and moves the generation, as a whole pass
-    // finding it unchanged does. APS5_NO_REFRESH_MEMO=1 takes every pass whole.
+    // moves the serial), the DCC keys still prove to the ones uploaded (their proof answers from the
+    // key range's write stamps, as the whole pass's first check does) and nothing wrote the surface
+    // since its generation: the pass then only collects the writes and moves the generation, as a
+    // whole pass finding it unchanged does. APS5_NO_REFRESH_MEMO=1 takes every pass whole;
+    // APS5_NO_DCC_REFRESH_MEMO=1 takes the passes over DCC surfaces whole, as before.
     static const bool memoEnabled = std::getenv("APS5_NO_REFRESH_MEMO") == nullptr;
-    if (memoEnabled && refreshMemo && descriptor.dccAddress == 0 && PendingSerial() == refreshSerial) {
+    static const bool dccMemo = std::getenv("APS5_NO_DCC_REFRESH_MEMO") == nullptr;
+    const auto keysCurrent = [&] { return descriptor.dccAddress == 0 || (dccMemo && ProvedClearKeys(descriptor, guestBytes, keyProof) == uploadedKeys); };
+    if (memoEnabled && refreshMemo && PendingSerial() == refreshSerial && keysCurrent()) {
         const auto current = GuestMemory::CollectWrites(descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
         if (GuestMemory::UnchangedSince(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), generation)) {
             ++Profile().storageReused;
             layerGeneration.assign(trackedLayers, current);
-            refreshGeneration();
+            // Every layer is at `current` now: their minimum without the scan.
+            generation = current;
             refreshMemoHits.fetch_add(1, std::memory_order_relaxed);
             if (profile) LookupOutcomes::Add(LookupOutcomes::RefreshUnchanged, start);
             return true;
