@@ -71,6 +71,20 @@ WindowsEntryStub WindowsEntryStubBuilder::Build(const std::uint32_t dataRva, con
     const auto unwindRva = CheckedRva(dataRva + data.size());
     data.insert(data.end(), {1, 10, 6, 0, 10, 0xb2, 6, 0xc0, 4, 0x70, 3, 0x60, 2, 0x50, 1, 0x30});
 
+    // mimalloc's process-wide allocator (see the top-level CMakeLists.txt): its redirection module must
+    // be mapped together with the C runtime and initialize before it, which loading mimalloc.dll first
+    // (it imports the redirection module ahead of the C runtime) gives, before any PRX brings the C
+    // runtime in. From the libraries' folder; optional: a folder without it starts as before.
+    std::vector<std::uint32_t> allocatorPaths;
+    std::vector<std::string> allocatorNames;
+    for (const std::string library : {"mimalloc.dll"}) {
+        auto name = path + library;
+        if (name.size() + 1 >= PathCapacity)
+            throw Domain::RelinkerException("Windows library path exceeds the startup buffer: " + name);
+        allocatorPaths.push_back(addString(name));
+        allocatorNames.push_back(std::move(name));
+    }
+
     std::vector<std::uint32_t> libraryPaths;
     std::vector<std::string> libraryNames;
     for (std::size_t index = 0; index < libraries.size(); ++index) {
@@ -264,6 +278,31 @@ WindowsEntryStub WindowsEntryStubBuilder::Build(const std::uint32_t dataRva, con
     code.Emit({0x49, 0xff, 0xcc, 0x41, 0x80, 0x3c, 0x24, 0x5c});
     code.Rip({0x0f, 0x85}, findSeparator);
     code.Emit({0x49, 0xff, 0xc4});
+
+    // The allocator DLLs, before any library: built into modulePath as the libraries' paths are,
+    // loaded with the same search flags, and a failure ignored.
+    for (std::size_t index = 0; index < allocatorPaths.size(); ++index) {
+        std::optional<std::size_t> tooLong;
+        if (absolutePath) {
+            code.Rip({0x48, 0x8d, 0x0d}, allocatorPaths[index]);
+        } else {
+            // rax = r12 - rbx + length: the joined path's size; past the buffer, skip the load.
+            code.Emit({0x4c, 0x89, 0xe0, 0x48, 0x29, 0xd8, 0x48, 0x05});
+            code.U32(CheckedRva(allocatorNames[index].size() + 1));
+            code.Emit({0x48, 0x3d});
+            code.U32(PathCapacity);
+            tooLong = code.Branch({0x0f, 0x87});
+            code.Emit({0x4c, 0x89, 0xe7});
+            code.Rip({0x48, 0x8d, 0x35}, allocatorPaths[index]);
+            code.Emit({0xb9});
+            code.U32(CheckedRva(allocatorNames[index].size() + 1));
+            code.Emit({0xf3, 0xa4});
+            code.Rip({0x48, 0x8d, 0x0d}, modulePath);
+        }
+        code.Emit({0x31, 0xd2, 0x41, 0xb8, 0, 0x11, 0, 0});
+        call("LoadLibraryExA");
+        if (tooLong) code.PatchBranch(*tooLong, code.GetRva());
+    }
 
     for (std::size_t index = 0; index < libraries.size(); ++index) {
         if (absolutePath && index >= guestModules.size()) {

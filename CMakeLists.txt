@@ -67,6 +67,38 @@ set(SKIP_INSTALL_ALL ON CACHE BOOL "" FORCE)
 add_subdirectory(3rdparty/freetype EXCLUDE_FROM_ALL)
 set_target_properties(freetype PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
+# mimalloc takes over the C runtime allocator of a relinked game's whole process on Windows: the
+# executable's entry stub loads mimalloc.dll from the libraries' folder before any library, and its
+# redirection module (mimalloc-redirect.dll, the prebuilt one mimalloc ships) patches ucrtbase's
+# malloc family as it loads, before the modules' own initialization runs. Every module and the MinGW
+# C++ runtime DLLs then allocate through it; new/delete are not overridden per module, so nothing
+# depends on which allocator a DLL's own code was bound to. MIMALLOC_DISABLE_REDIRECT=1 keeps the C
+# runtime allocator at run time; a libraries' folder without mimalloc.dll starts as before.
+if(WIN32)
+    set(MI_BUILD_SHARED ON CACHE BOOL "" FORCE)
+    set(MI_BUILD_STATIC OFF CACHE BOOL "" FORCE)
+    set(MI_BUILD_OBJECT OFF CACHE BOOL "" FORCE)
+    set(MI_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+    set(MI_OVERRIDE ON CACHE BOOL "" FORCE)
+    set(MI_WIN_REDIRECT ON CACHE BOOL "" FORCE)
+    # A pointer mimalloc does not own (allocated before the redirection) is left alone instead of
+    # being read as one of its blocks.
+    set(MI_FREE_IS_CHECKED SHARED CACHE STRING "" FORCE)
+    add_subdirectory(3rdparty/mimalloc EXCLUDE_FROM_ALL)
+    if(MINGW)
+        # A UCRT toolchain like MSYS2's UCRT64, which mimalloc recognizes by MSYSTEM only: initialize
+        # through the C runtime's hooks as it does there.
+        target_compile_definitions(mimalloc PRIVATE MI_MINGW_UCRT64=1)
+        # Only system DLLs below it (libgcc and winpthreads linked in), so nothing of the MinGW runtime
+        # initializes, and allocates, before it does. Its malloc/free fast paths read the thread from
+        # the TEB; only its rarely used thread locals go through emulated TLS, whose own allocations
+        # (and winpthreads') must not reach the redirected malloc: they take the process heap.
+        target_link_options(mimalloc PRIVATE -static
+                LINKER:--wrap=malloc,--wrap=calloc,--wrap=realloc,--wrap=free,--wrap=strdup,--wrap=_strdup)
+        target_sources(mimalloc PRIVATE ${CMAKE_SOURCE_DIR}/core/libs/allocator/RuntimeHeap.c)
+    endif()
+endif()
+
 add_subdirectory(core/shader/recompiler)
 add_subdirectory(core/Decoder/Jpeg)
 add_subdirectory(core/Decoder/Png)

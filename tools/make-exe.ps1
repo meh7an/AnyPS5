@@ -182,6 +182,8 @@ function Get-LocalTools {
     $libraries = @(Get-ChildItem -LiteralPath $libsDirectory -Filter '*.prx' -File -ErrorAction SilentlyContinue)
     if ($libraries.Count -eq 0) { Fail "Found a local relinker build but no system libraries. Run: cmake --build build --target libs --parallel (or pass -Release to download them)." }
     $files = @($libraries | ForEach-Object FullName)
+    # mimalloc.dll and mimalloc-redirect.dll, which the relinked executable loads first.
+    $files += @(Get-ChildItem -LiteralPath $libsDirectory -Filter '*.dll' -File -ErrorAction SilentlyContinue | ForEach-Object FullName)
     $searchPath = @()
     $minGw = Find-MinGwBin
     if ($minGw) {
