@@ -3,6 +3,8 @@
 
 #include "prx/libSceAgcDriver/Graphics/include/Shaders.hpp"
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <limits>
 #include <set>
 #include <span>
@@ -94,24 +96,64 @@ struct VertexInputLayout {
     std::vector<VkVertexInputAttributeDescription> attributes;
 };
 
+// Whether the device fetches `format` as a vertex attribute. Every draw's layout asks about each of
+// its attributes, and a vkGetPhysicalDeviceFormatProperties call each time cost more than the rest
+// of the layout: the answers for the first physical device asked about are kept (core formats; a
+// context without a physical device, another device or format asks every time).
+inline bool VertexFormatSupported(const Context& context, VkFormat format) {
+    struct Known {
+        std::atomic<VkPhysicalDevice> physical{VK_NULL_HANDLE};
+        // -1 unknown, 0 unsupported, 1 supported; written once, before it is read as known.
+        std::array<std::atomic<std::int8_t>, 256> formats;
+        Known() {
+            for (auto& entry : formats) entry.store(-1, std::memory_order_relaxed);
+        }
+    };
+    static Known known;
+    auto owner = known.physical.load(std::memory_order_acquire);
+    if (owner == VK_NULL_HANDLE && context.physical != VK_NULL_HANDLE) {
+        known.physical.compare_exchange_strong(owner, context.physical, std::memory_order_acq_rel);
+        owner = known.physical.load(std::memory_order_acquire);
+    }
+    const auto slot = static_cast<std::uint32_t>(format);
+    const bool cached = context.physical != VK_NULL_HANDLE && owner == context.physical && slot < known.formats.size();
+    if (cached) {
+        if (const auto answer = known.formats[slot].load(std::memory_order_acquire); answer >= 0) return answer != 0;
+    }
+    Require(context.formatProperties != nullptr, "missing vertex format property query");
+    VkFormatProperties properties{};
+    context.formatProperties(context.physical, format, &properties);
+    const bool supported = (properties.bufferFeatures & VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT) != 0;
+    if (cached) known.formats[slot].store(supported ? 1 : 0, std::memory_order_release);
+    return supported;
+}
+
 inline VertexInputLayout BuildVertexInputLayout(const Context& context, std::span<const ShaderRecompiler::VertexAttribute> attributes) {
     Require(attributes.size() <= context.limits.maxVertexInputBindings && attributes.size() <= context.limits.maxVertexInputAttributes, "vertex input count exceeds device limits");
     VertexInputLayout result;
-    std::set<std::uint32_t> locations;
+    result.bindings.reserve(attributes.size());
+    result.attributes.reserve(attributes.size());
+    // Locations seen: a bit each below 64 (every device's attribute limit so far), a set above.
+    std::uint64_t lowLocations = 0;
+    std::set<std::uint32_t> highLocations;
+    const auto firstUse = [&](std::uint32_t location) {
+        if (location >= 64) return highLocations.insert(location).second;
+        const auto bit = std::uint64_t{1} << location;
+        const bool first = (lowLocations & bit) == 0;
+        lowLocations |= bit;
+        return first;
+    };
     for (const auto& attribute : attributes) {
         const auto& fields = attribute.resource.fields;
         const auto format = DecodeVertexFormat(attribute);
-        Require(attribute.location < context.limits.maxVertexInputAttributes && locations.insert(attribute.location).second, "invalid or duplicate vertex attribute location");
+        Require(attribute.location < context.limits.maxVertexInputAttributes && firstUse(attribute.location), "invalid or duplicate vertex attribute location");
         Require(attribute.fetchIndex <= 1, "unsupported vertex fetch index");
         Require((fields[1] & 0x80000000u) == 0 && (fields[3] & 0x00800000u) == 0 && (fields[3] >> 30u) == 0, "unsupported vertex buffer descriptor flags");
         const auto stride = (fields[1] >> 16u) & 0x3fffu;
         const auto address = fields[0] | (static_cast<std::uint64_t>(fields[1] & 0xffffu) << 32u);
         Require(address != 0 && address % format.alignment == 0 && stride % format.alignment == 0, "unaligned vertex buffer");
         Require(stride <= context.limits.maxVertexInputBindingStride, "vertex stride exceeds device limits");
-        Require(context.formatProperties != nullptr, "missing vertex format property query");
-        VkFormatProperties properties{};
-        context.formatProperties(context.physical, format.format, &properties);
-        Require((properties.bufferFeatures & VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT) != 0, "device does not support vertex format " + std::to_string(format.format));
+        if (!VertexFormatSupported(context, format.format)) Require(false, "device does not support vertex format " + std::to_string(format.format));
         const auto binding = static_cast<std::uint32_t>(result.bindings.size());
         result.bindings.push_back({binding, stride, attribute.fetchIndex == 0 ? VK_VERTEX_INPUT_RATE_VERTEX : VK_VERTEX_INPUT_RATE_INSTANCE});
         result.attributes.push_back({attribute.location, binding, format.format, 0});
@@ -167,17 +209,33 @@ inline VertexCopyPlan PlanVertexCopies(std::span<const VertexFetch> fetches) {
     VertexCopyPlan plan;
     plan.copyOf.assign(fetches.size(), 0);
     plan.offsets.assign(fetches.size(), 0);
-    std::vector<std::size_t> order(fetches.size());
-    for (std::size_t i = 0; i < order.size(); ++i) order[i] = i;
-    std::stable_sort(order.begin(), order.end(), [&](std::size_t a, std::size_t b) {
+    plan.copies.reserve(fetches.size());
+    // By stride, fetch index and address, stable: an insertion sort on the stack (a draw fetches a
+    // handful of attributes; a stable_sort allocated a buffer every draw).
+    std::array<std::size_t, 16> localOrder{};
+    std::vector<std::size_t> heapOrder;
+    auto* order = localOrder.data();
+    if (fetches.size() > localOrder.size()) {
+        heapOrder.resize(fetches.size());
+        order = heapOrder.data();
+    }
+    const auto before = [&](std::size_t a, std::size_t b) {
         const auto& x = fetches[a];
         const auto& y = fetches[b];
         if (x.stride != y.stride) return x.stride < y.stride;
         if (x.fetchIndex != y.fetchIndex) return x.fetchIndex < y.fetchIndex;
         return x.begin < y.begin;
-    });
+    };
+    for (std::size_t i = 0; i < fetches.size(); ++i) {
+        std::size_t at = i;
+        while (at != 0 && before(i, order[at - 1])) {
+            order[at] = order[at - 1];
+            --at;
+        }
+        order[at] = i;
+    }
     std::size_t lead = fetches.size();
-    for (const auto i : order) {
+    for (const auto i : std::span<const std::size_t>(order, fetches.size())) {
         const auto& fetch = fetches[i];
         Require(fetch.begin < fetch.end && fetch.alignment != 0, "empty vertex fetch range");
         const bool joins = lead != fetches.size() && fetch.stride != 0 && fetches[lead].stride == fetch.stride && fetches[lead].fetchIndex == fetch.fetchIndex && fetch.begin - fetches[lead].begin < fetch.stride && (fetch.begin - fetches[lead].begin) % fetch.alignment == 0;

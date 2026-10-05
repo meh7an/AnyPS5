@@ -98,7 +98,8 @@ public:
     std::shared_ptr<Buffer> ReusableDrawSnapshot(std::uint64_t address, std::size_t bytes, SnapshotUse use = SnapshotUse::Storage, std::uint32_t* derived = nullptr);
     void KeepDrawSnapshot(std::uint64_t address, std::size_t bytes, std::uint64_t generation, std::uint64_t registryGeneration, std::shared_ptr<Buffer> buffer, SnapshotUse use = SnapshotUse::Storage, std::uint32_t derived = 0);
     // Draw uploads: small per-draw copies (snapshots of small read-only guest buffers, the words of
-    // moved data buffers) are bump-allocated at the storage buffer offset alignment from one host
+    // moved data buffers, small index and vertex ranges) are bump-allocated at the storage buffer
+    // offset alignment (at least 16, which covers index and vertex offsets) from one host
     // buffer of DrawUploadChunk bytes, instead of a pooled buffer each that the snapshot cache then
     // has to prove unchanged on every use (a collect and a stamp walk under the tracker mutex cost
     // more than copying a few hundred bytes). A slice holds its chunk alive (the draw's bindings

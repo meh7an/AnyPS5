@@ -761,6 +761,8 @@ struct DrawInputs {
     bool nothing = false;
     std::uint64_t indexBytes = 0;
     std::shared_ptr<Buffer> indices;
+    // Where the indices start in `indices` (an upload chunk slice, see Recorder::DrawUpload).
+    VkDeviceSize indexOffset = 0;
     std::uint32_t maxIndex = 0;
     VertexInputLayout vertexInput;
     std::vector<std::shared_ptr<Buffer>> vertexBuffers;
@@ -774,6 +776,68 @@ struct DrawInputs {
 // Draw's validation, index and vertex phases. With `recipe` the fragment outputs, the pipeline
 // stages and the vertex input layout are the recipe's (derived from the same compiled stages)
 // instead of computed.
+// APS5_PROFILE_DRAW_PHASES: the vertex phase's own parts per draw and its copies by size and
+// path, every 10 s. Under the GPU mutex, as draws are.
+struct VertexParts {
+    enum Part { Index, Layout, Fetches, Copies, Handles, Count };
+    static constexpr const char* Names[Count] = {"index", "layout", "fetches", "copies", "handles"};
+    std::array<double, Count> us{};
+    std::uint64_t draws = 0, indexed = 0, indexUploaded = 0, copies = 0, uploaded = 0, reused = 0, made = 0;
+    std::array<std::uint64_t, 6> sizeCount{};
+    std::array<std::uint64_t, 6> sizeBytes{};
+    std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
+    std::chrono::steady_clock::time_point lap{};
+    bool enabled = std::getenv("APS5_PROFILE_DRAW_PHASES") != nullptr;
+    void start() {
+        if (!enabled) return;
+        lap = std::chrono::steady_clock::now();
+        ++draws;
+    }
+    void mark(Part part) {
+        if (!enabled) return;
+        const auto now = std::chrono::steady_clock::now();
+        us[part] += std::chrono::duration<double, std::micro>(now - lap).count();
+        lap = now;
+    }
+    void noteCopy(std::size_t bytes, int path) {
+        if (!enabled) return;
+        ++copies;
+        ++(path == 0 ? uploaded : path == 1 ? reused : made);
+        const std::size_t bucket = bytes <= 256 ? 0 : bytes <= 1024 ? 1 : bytes <= 4096 ? 2 : bytes <= 16384 ? 3 : bytes <= 65536 ? 4 : 5;
+        ++sizeCount[bucket];
+        sizeBytes[bucket] += bytes;
+    }
+    void report() {
+        if (!enabled) return;
+        const auto now = std::chrono::steady_clock::now();
+        if (now - lastReport < std::chrono::seconds(10) || draws == 0) return;
+        lastReport = now;
+        std::string line;
+        for (std::size_t i = 0; i < Count; ++i) {
+            char text[64];
+            std::snprintf(text, sizeof(text), " %s %.2f", Names[i], us[i] / static_cast<double>(draws));
+            line += text;
+        }
+        std::string sizes;
+        static constexpr const char* SizeNames[6] = {"<=256", "<=1K", "<=4K", "<=16K", "<=64K", ">64K"};
+        for (std::size_t i = 0; i < sizeCount.size(); ++i) {
+            char text[64];
+            std::snprintf(text, sizeof(text), " %s %llu (%.1f MiB)", SizeNames[i], static_cast<unsigned long long>(sizeCount[i]), static_cast<double>(sizeBytes[i]) / 1048576.0);
+            sizes += text;
+        }
+        std::fprintf(stderr, "[vertex-parts] %llu draws (%llu indexed, %llu index copies uploaded; %llu vertex copies: %llu uploaded, %llu reused, %llu made), us per draw:%s; vertex copy sizes:%s\n", static_cast<unsigned long long>(draws), static_cast<unsigned long long>(indexed), static_cast<unsigned long long>(indexUploaded), static_cast<unsigned long long>(copies), static_cast<unsigned long long>(uploaded), static_cast<unsigned long long>(reused), static_cast<unsigned long long>(made), line.c_str(), sizes.c_str());
+        us = {};
+        draws = indexed = indexUploaded = copies = uploaded = reused = made = 0;
+        sizeCount = {};
+        sizeBytes = {};
+    }
+};
+
+VertexParts& vertexParts() {
+    static VertexParts parts;
+    return parts;
+}
+
 DrawInputs prepareDrawInputs(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawOutcome& outcome, DrawTimer& timer, const DrawRecipe* recipe) {
     DrawInputs inputs;
     APS5_LOG_OUT_DEBUG("Draw indices=%u instances=%u indexSize=%u flags=%u indexAddress=0x%llx", draw.indexCount, draw.instanceCount, draw.indexSize, draw.flags, static_cast<unsigned long long>(draw.indexAddress));
@@ -837,37 +901,60 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
     ValidateViewport(context, state.viewport);
     ValidateDepthBounds(context, state);
     timer.phase(PhaseValidate);
+    auto& parts = vertexParts();
+    parts.start();
     inputs.maxIndex = draw.indexed ? 0u : draw.firstVertex + draw.indexCount - 1u;
-    if (draw.indexed) {
-        const auto use = draw.indexSize == 2 ? Recorder::SnapshotUse::Index16 : Recorder::SnapshotUse::Index32;
-        auto copy = CopyDrawInput(context, context.recorder, draw.indexAddress, static_cast<std::size_t>(indexBytes), draw.indexSize, use);
-        std::uint32_t highest = copy.derived;
-        if (!copy.reused) {
-            highest = 0;
-            const auto bytes = copy.buffer->Bytes();
-            for (std::size_t offset = 0; offset < indexBytes; offset += draw.indexSize) {
-                std::uint32_t index = 0;
-                if (draw.indexSize == 2) {
-                    std::uint16_t value = 0;
-                    std::memcpy(&value, bytes.data() + offset, sizeof(value));
-                    index = value;
-                } else {
-                    std::memcpy(&index, bytes.data() + offset, sizeof(index));
-                }
-                highest = std::max(highest, index);
+    // Small index and vertex ranges are copied into the recorder's upload chunk on every draw
+    // (Recorder::DrawUpload): cheaper than proving a kept copy unchanged. Larger ones keep their
+    // own copy, reused while the range is unchanged (CopyDrawInput).
+    auto* const uploads = ShaderResources::DrawUploadLimit() != 0 ? context.recorder : nullptr;
+    const auto uploaded = [&](std::size_t bytes) { return uploads != nullptr && bytes != 0 && bytes <= ShaderResources::DrawUploadLimit(); };
+    const auto highestIndex = [&](const std::byte* bytes) {
+        std::uint32_t highest = 0;
+        for (std::size_t offset = 0; offset < indexBytes; offset += draw.indexSize) {
+            std::uint32_t index = 0;
+            if (draw.indexSize == 2) {
+                std::uint16_t value = 0;
+                std::memcpy(&value, bytes + offset, sizeof(value));
+                index = value;
+            } else {
+                std::memcpy(&index, bytes + offset, sizeof(index));
             }
-            KeepDrawInput(context.recorder, draw.indexAddress, copy, use, highest);
+            highest = std::max(highest, index);
+        }
+        return highest;
+    };
+    if (draw.indexed) {
+        std::uint32_t highest = 0;
+        if (parts.enabled) ++parts.indexed;
+        if (uploaded(static_cast<std::size_t>(indexBytes))) {
+            if (parts.enabled) ++parts.indexUploaded;
+            auto slice = uploads->DrawUpload(static_cast<std::size_t>(indexBytes));
+            GuestMemory::Read(draw.indexAddress, std::span<std::byte>(slice.bytes, static_cast<std::size_t>(indexBytes)), draw.indexSize);
+            highest = highestIndex(slice.bytes);
+            inputs.indices = std::move(slice.buffer);
+            inputs.indexOffset = slice.offset;
+        } else {
+            const auto use = draw.indexSize == 2 ? Recorder::SnapshotUse::Index16 : Recorder::SnapshotUse::Index32;
+            auto copy = CopyDrawInput(context, context.recorder, draw.indexAddress, static_cast<std::size_t>(indexBytes), draw.indexSize, use);
+            highest = copy.derived;
+            if (!copy.reused) {
+                highest = highestIndex(copy.buffer->Bytes().data());
+                KeepDrawInput(context.recorder, draw.indexAddress, copy, use, highest);
+            }
+            inputs.indices = std::move(copy.buffer);
         }
         Require(highest <= context.limits.maxDrawIndexedIndexValue, "index exceeds the device's indexed draw limit");
         Require(!state.stages.mesh || state.stages.mesh->inputPrimitive != 5 || !state.primitiveRestart || highest != (draw.indexSize == 2 ? 0xffffu : 0xffffffffu), "primitive restart in a triangle fan geometry draw is unsupported");
         inputs.maxIndex = highest;
-        inputs.indices = std::move(copy.buffer);
     }
     APS5_LOG_CHARS_OUT_DEBUG("Index validation OK");
+    parts.mark(VertexParts::Index);
     const auto& attributes = shaders.front().program->vertexAttributes;
     // Validates the vertex descriptors; the layout also keys and builds the pipeline.
     if (recipe != nullptr) inputs.vertexInput = recipe->vertexInput;
     else inputs.vertexInput = BuildVertexInputLayout(context, attributes);
+    parts.mark(VertexParts::Layout);
     inputs.vertexOffsets.assign(attributes.size(), 0);
     // An indexed draw's vertex offset moves every fetch: the copy must reach the last one.
     if (draw.indexed) {
@@ -885,17 +972,39 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         fetches.push_back({address, address + bytes, (fields[1] >> 16u) & 0x3fffu, attribute.fetchIndex, DecodeVertexFormat(attribute).alignment});
     }
     const auto plan = PlanVertexCopies(fetches);
-    for (const auto& [begin, end] : plan.copies) {
+    parts.mark(VertexParts::Fetches);
+    // Where each copy starts in its buffer (non-zero for upload chunk slices).
+    std::array<VkDeviceSize, 16> localBases{};
+    std::vector<VkDeviceSize> heapBases;
+    auto* bases = localBases.data();
+    if (plan.copies.size() > localBases.size()) {
+        heapBases.assign(plan.copies.size(), 0);
+        bases = heapBases.data();
+    }
+    for (std::size_t copyIndex = 0; copyIndex < plan.copies.size(); ++copyIndex) {
+        const auto [begin, end] = plan.copies[copyIndex];
         const auto bytes = static_cast<std::size_t>(end - begin);
         GuestMemory::CheckRange(reinterpret_cast<const void*>(begin), bytes, 1);
+        if (uploaded(bytes)) {
+            auto slice = uploads->DrawUpload(bytes);
+            GuestMemory::Read(begin, std::span<std::byte>(slice.bytes, bytes), 1);
+            bases[copyIndex] = slice.offset;
+            inputs.vertexBuffers.push_back(std::move(slice.buffer));
+            parts.noteCopy(bytes, 0);
+            continue;
+        }
         auto copy = CopyDrawInput(context, context.recorder, begin, bytes, 1, Recorder::SnapshotUse::Vertex);
         KeepDrawInput(context.recorder, begin, copy, Recorder::SnapshotUse::Vertex, 0);
+        parts.noteCopy(bytes, copy.reused ? 1 : 2);
         inputs.vertexBuffers.push_back(std::move(copy.buffer));
     }
+    parts.mark(VertexParts::Copies);
     for (std::size_t i = 0; i < attributes.size(); ++i) {
         inputs.vertexHandles.push_back(inputs.vertexBuffers[plan.copyOf[i]]->Handle());
-        inputs.vertexOffsets[i] = plan.offsets[i];
+        inputs.vertexOffsets[i] = bases[plan.copyOf[i]] + plan.offsets[i];
     }
+    parts.mark(VertexParts::Handles);
+    parts.report();
     timer.phase(PhaseVertex);
     return inputs;
 }
@@ -1021,7 +1130,7 @@ void recordDrawCommands(const Context& context, VkCommandBuffer commands, const 
         return;
     }
     if (!inputs.vertexHandles.empty()) context.Resolved(&DeviceFunctions::cmdBindVertexBuffers, "vkCmdBindVertexBuffers")(commands, 0, static_cast<std::uint32_t>(inputs.vertexHandles.size()), inputs.vertexHandles.data(), inputs.vertexOffsets.data());
-    if (draw.indexed) context.Resolved(&DeviceFunctions::cmdBindIndexBuffer, "vkCmdBindIndexBuffer")(commands, inputs.indices->Handle(), 0, draw.indexSize == 2 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32);
+    if (draw.indexed) context.Resolved(&DeviceFunctions::cmdBindIndexBuffer, "vkCmdBindIndexBuffer")(commands, inputs.indices->Handle(), inputs.indexOffset, draw.indexSize == 2 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32);
     if (args == nullptr) {
         if (draw.indexed) context.Resolved(&DeviceFunctions::cmdDrawIndexed, "vkCmdDrawIndexed")(commands, draw.indexCount, draw.instanceCount, 0, static_cast<std::int32_t>(draw.firstVertex), draw.firstInstance);
         else context.Resolved(&DeviceFunctions::cmdDraw, "vkCmdDraw")(commands, draw.indexCount, draw.instanceCount, draw.firstVertex, draw.firstInstance);
