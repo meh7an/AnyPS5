@@ -247,6 +247,9 @@ public:
     // the GPU copies out of an import (gpuCopy) notes its read itself when the copy is recorded.
     // For the recorder's read tracking (ShaderResources::MarkGpuWrites); nothing once committed.
     std::vector<std::pair<std::uint64_t, std::uint64_t>> InPlaceReads() const;
+    // Whether one of the InPlaceReads regions holds [address, address + bytes) whole, without
+    // building the list (the per-draw snapshot pass asks this for every element).
+    bool ReadInPlace(std::uint64_t address, std::size_t bytes) const;
 
 private:
     struct Region {

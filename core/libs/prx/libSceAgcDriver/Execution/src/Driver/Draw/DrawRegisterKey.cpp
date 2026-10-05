@@ -27,6 +27,20 @@ bool userDataRegister(Graphics::RegisterBank bank, std::uint32_t offset) {
     return false;
 }
 
+struct StageMemory {
+    std::vector<std::uint32_t> userData;
+    std::vector<std::pair<std::uint64_t, std::vector<std::uint32_t>>> regions;
+};
+
+struct RelocationTrace {
+    std::mutex mutex;
+    std::unordered_map<std::uint64_t, std::vector<StageMemory>> last;
+    std::uint64_t draws = 0, repeats = 0, stages = 0, layoutDiffer = 0, contentSame = 0, contentSameInPlace = 0, regions = 0, words = 0, movedRegions = 0, differingMoved = 0, differingStatic = 0;
+    std::array<std::uint64_t, 5> buckets{};
+    std::vector<std::string> examples;
+    std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
+};
+
 struct DrawKeyTrace {
     std::mutex mutex;
     std::unordered_map<std::uint64_t, std::array<std::uint32_t, 96>> last;
@@ -38,8 +52,7 @@ struct DrawKeyTrace {
 
 }
 
-void Driver::traceDrawKey(const QueueState& queue, const ShaderRegistry& registry, std::uint64_t deviceSerial, bool hit) {
-    // The draw key without the user data words; the words themselves beside it.
+std::uint64_t Driver::structuralDrawKey(const QueueState& queue, const ShaderRegistry& registry, std::uint64_t deviceSerial) {
     std::uint64_t key = 0xcbf29ce484222325ull;
     const auto mix = [&](std::uint64_t value) {
         key ^= value;
@@ -72,6 +85,77 @@ void Driver::traceDrawKey(const QueueState& queue, const ShaderRegistry& registr
         mix(reinterpret_cast<std::uintptr_t>(it->second.get()));
         mix(address - it->second->codeAddress);
     }
+    return key;
+}
+
+void Driver::traceDrawRelocation(std::uint64_t structuralKey, const std::vector<DrawProgram>& programs, const std::vector<StageCapture>& captures) {
+    std::vector<StageMemory> current(captures.size());
+    for (std::size_t stage = 0; stage < captures.size(); ++stage) {
+        if (stage < programs.size()) current[stage].userData = programs[stage].userData;
+        for (const auto& region : captures[stage].regions) {
+            std::vector<std::uint32_t> words(region.bytes.size() / sizeof(std::uint32_t));
+            std::memcpy(words.data(), region.bytes.data(), words.size() * sizeof(std::uint32_t));
+            current[stage].regions.emplace_back(region.guestAddress, std::move(words));
+        }
+    }
+    static RelocationTrace trace;
+    std::lock_guard lock(trace.mutex);
+    ++trace.draws;
+    auto [it, inserted] = trace.last.try_emplace(structuralKey, current);
+    if (!inserted) {
+        ++trace.repeats;
+        const auto& previous = it->second;
+        for (std::size_t stage = 0; stage < std::min(previous.size(), current.size()); ++stage) {
+            const auto& a = previous[stage];
+            const auto& b = current[stage];
+            ++trace.stages;
+            bool sameLayout = a.regions.size() == b.regions.size();
+            for (std::size_t r = 0; sameLayout && r < a.regions.size(); ++r) sameLayout = a.regions[r].second.size() == b.regions[r].second.size();
+            if (!sameLayout) {
+                ++trace.layoutDiffer;
+                continue;
+            }
+            std::size_t differing = 0;
+            bool moved = false;
+            for (std::size_t r = 0; r < a.regions.size(); ++r) {
+                const bool regionMoved = a.regions[r].first != b.regions[r].first;
+                moved = moved || regionMoved;
+                trace.regions += 1;
+                trace.words += b.regions[r].second.size();
+                if (regionMoved) ++trace.movedRegions;
+                for (std::size_t w = 0; w < b.regions[r].second.size(); ++w) {
+                    if (a.regions[r].second[w] == b.regions[r].second[w]) continue;
+                    ++differing;
+                    ++(regionMoved ? trace.differingMoved : trace.differingStatic);
+                    if (trace.examples.size() < 24) {
+                        char text[200];
+                        std::snprintf(text, sizeof(text), "stage %zu region %zu/%zu (%zu words, %s 0x%llx->0x%llx) word %zu: 0x%08x -> 0x%08x", stage, r, a.regions.size(), b.regions[r].second.size(), regionMoved ? "moved" : "fixed", static_cast<unsigned long long>(a.regions[r].first), static_cast<unsigned long long>(b.regions[r].first), w, a.regions[r].second[w], b.regions[r].second[w]);
+                        trace.examples.emplace_back(text);
+                    }
+                }
+            }
+            if (differing == 0) {
+                ++trace.contentSame;
+                if (!moved) ++trace.contentSameInPlace;
+            } else {
+                ++trace.buckets[differing == 1 ? 0 : differing <= 4 ? 1 : differing <= 16 ? 2 : differing <= 64 ? 3 : 4];
+            }
+        }
+        it->second = std::move(current);
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (now - trace.lastReport < std::chrono::seconds(10)) return;
+    trace.lastReport = now;
+    std::fprintf(stderr, "[drawreloc] %llu draws, %llu repeating a structural key (%zu keys); %llu stages compared: layout differs %llu, same words %llu (%llu with nothing moved); differing words per stage 1 / 2-4 / 5-16 / 17-64 / more: %llu / %llu / %llu / %llu / %llu; %llu regions (%llu moved), %llu words; differing words in moved regions %llu, in fixed ones %llu\n", static_cast<unsigned long long>(trace.draws), static_cast<unsigned long long>(trace.repeats), trace.last.size(), static_cast<unsigned long long>(trace.stages), static_cast<unsigned long long>(trace.layoutDiffer), static_cast<unsigned long long>(trace.contentSame), static_cast<unsigned long long>(trace.contentSameInPlace), static_cast<unsigned long long>(trace.buckets[0]), static_cast<unsigned long long>(trace.buckets[1]), static_cast<unsigned long long>(trace.buckets[2]), static_cast<unsigned long long>(trace.buckets[3]), static_cast<unsigned long long>(trace.buckets[4]), static_cast<unsigned long long>(trace.regions), static_cast<unsigned long long>(trace.movedRegions), static_cast<unsigned long long>(trace.words), static_cast<unsigned long long>(trace.differingMoved), static_cast<unsigned long long>(trace.differingStatic));
+    for (const auto& example : trace.examples) std::fprintf(stderr, "[drawreloc]   %s\n", example.c_str());
+    trace.examples.clear();
+    trace.draws = trace.repeats = trace.stages = trace.layoutDiffer = trace.contentSame = trace.contentSameInPlace = trace.regions = trace.words = trace.movedRegions = trace.differingMoved = trace.differingStatic = 0;
+    trace.buckets.fill(0);
+}
+
+void Driver::traceDrawKey(const QueueState& queue, const ShaderRegistry& registry, std::uint64_t deviceSerial, bool hit) {
+    // The draw key without the user data words; the words themselves beside it.
+    const auto key = structuralDrawKey(queue, registry, deviceSerial);
     std::array<std::uint32_t, 96> words{};
     for (std::size_t stage = 0; stage < UserDataBases.size(); ++stage) {
         for (std::uint32_t i = 0; i < 32; ++i) {

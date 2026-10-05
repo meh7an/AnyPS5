@@ -1193,7 +1193,7 @@ void ShaderResources::reportDescriptorCaches() const {
     const auto descriptors = context.descriptorCache != nullptr ? context.descriptorCache->Counters() : DescriptorCache::Stats{};
     const auto samplerHits = context.samplerCache != nullptr ? context.samplerCache->Hits() : 0;
     const auto samplerMisses = context.samplerCache != nullptr ? context.samplerCache->Misses() : 0;
-    AgcDriver::ProfilePrint_nid_no_patch("[descriptors] layouts %llu hits / %llu created, sets %llu from %llu pools and %llu dedicated pools, samplers %llu hits / %llu created\n", static_cast<unsigned long long>(descriptors.layoutHits), static_cast<unsigned long long>(descriptors.layoutMisses), static_cast<unsigned long long>(descriptors.sets), static_cast<unsigned long long>(descriptors.pools), static_cast<unsigned long long>(descriptors.dedicatedPools), static_cast<unsigned long long>(samplerHits), static_cast<unsigned long long>(samplerMisses));
+    AgcDriver::ProfilePrint_nid_no_patch("[descriptors] layouts %llu hits / %llu created, sets %llu from %llu pools and %llu dedicated pools, transient sets %llu from %llu pools (%llu resets), samplers %llu hits / %llu created\n", static_cast<unsigned long long>(descriptors.layoutHits), static_cast<unsigned long long>(descriptors.layoutMisses), static_cast<unsigned long long>(descriptors.sets), static_cast<unsigned long long>(descriptors.pools), static_cast<unsigned long long>(descriptors.dedicatedPools), static_cast<unsigned long long>(descriptors.transientSets), static_cast<unsigned long long>(descriptors.transientPools), static_cast<unsigned long long>(descriptors.transientResets), static_cast<unsigned long long>(samplerHits), static_cast<unsigned long long>(samplerMisses));
 }
 
 std::vector<std::uint32_t> ShaderResources::ContentKey(const CompiledShader& shader, bool dataWords, bool movableBuffers) {
@@ -2106,11 +2106,12 @@ ResourceCache& SharedResourceCache() {
     return *cache;
 }
 
-DescriptorCache::DescriptorCache(const Context& context) : context(context), destroyLayout(context.Function<PFN_vkDestroyDescriptorSetLayout>("vkDestroyDescriptorSetLayout")), destroyPool(context.Function<PFN_vkDestroyDescriptorPool>("vkDestroyDescriptorPool")), freeSets(context.Function<PFN_vkFreeDescriptorSets>("vkFreeDescriptorSets")) {}
+DescriptorCache::DescriptorCache(const Context& context) : context(context), destroyLayout(context.Function<PFN_vkDestroyDescriptorSetLayout>("vkDestroyDescriptorSetLayout")), destroyPool(context.Function<PFN_vkDestroyDescriptorPool>("vkDestroyDescriptorPool")), freeSets(context.Function<PFN_vkFreeDescriptorSets>("vkFreeDescriptorSets")), resetPool(context.Function<PFN_vkResetDescriptorPool>("vkResetDescriptorPool")) {}
 
 DescriptorCache::~DescriptorCache() {
     for (const auto pool : pools) destroyPool(context.device, pool, nullptr);
     for (const auto pool : dedicated) destroyPool(context.device, pool, nullptr);
+    for (const auto& entry : transientPools) destroyPool(context.device, entry.pool, nullptr);
     for (const auto& [key, layout] : layouts) destroyLayout(context.device, layout, nullptr);
 }
 
@@ -2146,6 +2147,103 @@ std::uint32_t SetDescriptorLimit(const VkPhysicalDeviceLimits& limits, VkDescrip
 constexpr std::uint32_t ChainPoolSets = 1024;
 constexpr std::array<VkDescriptorPoolSize, 4> ChainPoolSizes{{{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4096}, {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1024}, {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1024}, {VK_DESCRIPTOR_TYPE_SAMPLER, 512}}};
 constexpr std::array<VkDescriptorPoolSize, 4> ChainPoolCreateSizes{{{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4096 + 2}, {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1024}, {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1024}, {VK_DESCRIPTOR_TYPE_SAMPLER, 512}}};
+// A transient pool: four chain pools' worth, so a frame's draw sets (a few thousand) fill few pools.
+constexpr std::uint32_t TransientPoolScale = 4;
+
+bool transientSetsEnabled() {
+    static const bool disabled = std::getenv("APS5_NO_TRANSIENT_SETS") != nullptr;
+    return !disabled;
+}
+}
+
+bool DescriptorCache::fitsChainPool(std::span<const VkDescriptorPoolSize> sizes) {
+    for (const auto& size : sizes) {
+        const auto capacity = std::find_if(ChainPoolSizes.begin(), ChainPoolSizes.end(), [&](const auto& item) { return item.type == size.type; });
+        if (capacity == ChainPoolSizes.end() || size.descriptorCount > capacity->descriptorCount) return false;
+    }
+    return true;
+}
+
+void DescriptorCache::retireTransient(std::size_t index) {
+    auto& entry = transientPools[index];
+    entry.full = true;
+    if (entry.live != 0) return;
+    // No set of it lives (every owner was kept until its batch completed): whole again.
+    static_cast<void>(resetPool(context.device, entry.pool, 0));
+    entry.full = false;
+    entry.sets = 0;
+    entry.descriptors = {};
+    ++stats.transientResets;
+    try {
+        resetTransient.push_back(index);
+    } catch (...) {
+        // Not reused then; it stays allocated until the cache goes.
+    }
+}
+
+DescriptorCache::SetAllocation DescriptorCache::AllocateTransient(VkDescriptorSetLayout layout, std::span<const VkDescriptorPoolSize> sizes) {
+    if (!transientSetsEnabled()) return Allocate(layout, sizes);
+    if (!fitsChainPool(sizes)) return {};
+    // The set's needs by chain pool type (fitsChainPool found every type there).
+    std::array<std::uint32_t, ChainPoolSizes.size()> needs{};
+    for (const auto& size : sizes) {
+        for (std::size_t type = 0; type < ChainPoolSizes.size(); ++type) {
+            if (ChainPoolSizes[type].type == size.type) needs[type] += size.descriptorCount;
+        }
+    }
+    std::lock_guard lock(mutex);
+    const auto allocate = context.Resolved(&DeviceFunctions::allocateDescriptorSets, "vkAllocateDescriptorSets");
+    VkDescriptorSetAllocateInfo allocation{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    allocation.descriptorSetCount = 1;
+    allocation.pSetLayouts = &layout;
+    // Two tries: the pool being filled, then (when it has no room) a reset or a new one, which
+    // holds any set the chain check above admitted.
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        if (fillingTransient == ~std::size_t{0}) {
+            if (!resetTransient.empty()) {
+                fillingTransient = resetTransient.back();
+                resetTransient.pop_back();
+            } else {
+                std::array<VkDescriptorPoolSize, ChainPoolCreateSizes.size()> poolSizes = ChainPoolCreateSizes;
+                for (auto& size : poolSizes) size.descriptorCount *= TransientPoolScale;
+                VkDescriptorPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+                poolInfo.maxSets = ChainPoolSets * TransientPoolScale;
+                poolInfo.poolSizeCount = static_cast<std::uint32_t>(poolSizes.size());
+                poolInfo.pPoolSizes = poolSizes.data();
+                VkDescriptorPool pool = VK_NULL_HANDLE;
+                Check(context.Function<PFN_vkCreateDescriptorPool>("vkCreateDescriptorPool")(context.device, &poolInfo, nullptr, &pool), "vkCreateDescriptorPool");
+                try {
+                    transientPools.push_back({pool});
+                } catch (...) {
+                    destroyPool(context.device, pool, nullptr);
+                    throw;
+                }
+                ++stats.transientPools;
+                fillingTransient = transientPools.size() - 1;
+            }
+        }
+        auto& entry = transientPools[fillingTransient];
+        bool room = entry.sets < ChainPoolSets * TransientPoolScale;
+        for (std::size_t type = 0; type < needs.size(); ++type) room = room && entry.descriptors[type] + needs[type] <= ChainPoolSizes[type].descriptorCount * TransientPoolScale;
+        if (room) {
+            allocation.descriptorPool = entry.pool;
+            VkDescriptorSet set = VK_NULL_HANDLE;
+            const auto result = allocate(context.device, &allocation, &set);
+            if (result == VK_SUCCESS) {
+                ++entry.live;
+                ++entry.sets;
+                for (std::size_t type = 0; type < needs.size(); ++type) entry.descriptors[type] += needs[type];
+                ++stats.transientSets;
+                return {set, entry.pool, true};
+            }
+            if (result != VK_ERROR_OUT_OF_POOL_MEMORY && result != VK_ERROR_FRAGMENTED_POOL) Check(result, "vkAllocateDescriptorSets");
+        }
+        // No room: no longer filled, and reset once its last set is released.
+        const auto full = fillingTransient;
+        fillingTransient = ~std::size_t{0};
+        retireTransient(full);
+    }
+    return {};
 }
 
 DescriptorCache::SetAllocation DescriptorCache::Allocate(VkDescriptorSetLayout layout, std::span<const VkDescriptorPoolSize> sizes) {
@@ -2216,7 +2314,19 @@ void DescriptorCache::Free(const SetAllocation& allocation) noexcept {
         destroyPool(context.device, allocation.pool, nullptr);
         return;
     }
-    static_cast<void>(freeSets(context.device, allocation.pool, 1, &allocation.set));
+    if (!allocation.transient) {
+        static_cast<void>(freeSets(context.device, allocation.pool, 1, &allocation.set));
+        return;
+    }
+    // A handful of pools: the scan is shorter than a map lookup.
+    for (std::size_t index = 0; index < transientPools.size(); ++index) {
+        auto& entry = transientPools[index];
+        if (entry.pool != allocation.pool) continue;
+        if (entry.live != 0) --entry.live;
+        // The pool being filled stays filled; a full one is whole again once its last set went.
+        if (entry.live == 0 && entry.full) retireTransient(index);
+        return;
+    }
 }
 
 DescriptorCache::Stats DescriptorCache::Counters() const {
@@ -2796,58 +2906,208 @@ std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::MovedR
     return moved;
 }
 
+namespace {
+
+// APS5_PROFILE_DRAW_PHASES: PrepareDrawBindings' parts per call, every 10 s.
+struct BindingParts {
+    enum Part { Moved, Snapshots, Checks, Collect, Lookup, Make, Allocate, Copy, Write, Count };
+    static constexpr const char* Names[Count] = {"moved copies", "setup", "checks", "collect", "lookup", "make", "set allocation", "set copy", "set writes+keep"};
+    std::array<double, Count> us{};
+    std::uint64_t calls = 0, sets = 0, moved = 0, reused = 0, made = 0, uploaded = 0;
+    // Snapshot ranges by size: <=256, <=1K, <=4K, <=16K, <=64K, larger (count and bytes).
+    std::array<std::uint64_t, 6> sizeCount{};
+    std::array<std::uint64_t, 6> sizeBytes{};
+    void noteSize(std::size_t bytes) {
+        const std::size_t bucket = bytes <= 256 ? 0 : bytes <= 1024 ? 1 : bytes <= 4096 ? 2 : bytes <= 16384 ? 3 : bytes <= 65536 ? 4 : 5;
+        ++sizeCount[bucket];
+        sizeBytes[bucket] += bytes;
+    }
+    std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
+    std::chrono::steady_clock::time_point lap{};
+    bool enabled = std::getenv("APS5_PROFILE_DRAW_PHASES") != nullptr;
+    void mark(Part part) {
+        if (!enabled) return;
+        const auto now = std::chrono::steady_clock::now();
+        us[part] += std::chrono::duration<double, std::micro>(now - lap).count();
+        lap = now;
+    }
+    void report() {
+        const auto now = std::chrono::steady_clock::now();
+        if (now - lastReport < std::chrono::seconds(10)) return;
+        lastReport = now;
+        std::string line;
+        for (std::size_t i = 0; i < Count; ++i) {
+            char text[64];
+            std::snprintf(text, sizeof(text), " %s %.2f", Names[i], calls != 0 ? us[i] / static_cast<double>(calls) : 0.0);
+            line += text;
+        }
+        std::string sizes;
+        static constexpr const char* SizeNames[6] = {"<=256", "<=1K", "<=4K", "<=16K", "<=64K", ">64K"};
+        for (std::size_t i = 0; i < sizeCount.size(); ++i) {
+            char text[64];
+            std::snprintf(text, sizeof(text), " %s %llu (%.1f MiB)", SizeNames[i], static_cast<unsigned long long>(sizeCount[i]), static_cast<double>(sizeBytes[i]) / 1048576.0);
+            sizes += text;
+        }
+        std::fprintf(stderr, "[draw-bindings] %llu calls (%llu made a set; %llu moved buffers, %llu copies uploaded, %llu snapshots reused, %llu made), us per call:%s; snapshot sizes:%s\n", static_cast<unsigned long long>(calls), static_cast<unsigned long long>(sets), static_cast<unsigned long long>(moved), static_cast<unsigned long long>(uploaded), static_cast<unsigned long long>(reused), static_cast<unsigned long long>(made), line.c_str(), sizes.c_str());
+        us = {};
+        calls = sets = moved = reused = made = uploaded = 0;
+        sizeCount = {};
+        sizeBytes = {};
+    }
+};
+
+BindingParts& bindingParts() {
+    static BindingParts parts;
+    return parts;
+}
+
+// A list whose first N elements live on the stack: the per-draw scratch lists of
+// PrepareDrawBindings hold a handful of entries, and a heap allocation each cost more than filling them.
+template <typename T, std::size_t N>
+class InlineList {
+public:
+    void push_back(const T& value) {
+        if (count < N) {
+            local[count] = value;
+        } else {
+            if (heap.empty()) heap.assign(local.begin(), local.end());
+            heap.push_back(value);
+        }
+        ++count;
+    }
+    T* data() { return count <= N ? local.data() : heap.data(); }
+    std::size_t size() const { return count; }
+    bool empty() const { return count == 0; }
+    T& operator[](std::size_t index) { return data()[index]; }
+    T* begin() { return data(); }
+    T* end() { return data() + count; }
+
+private:
+    std::array<T, N> local{};
+    std::vector<T> heap;
+    std::size_t count = 0;
+};
+
+}
+
+std::size_t ShaderResources::DrawUploadLimit() {
+    // APS5_DRAW_UPLOAD_MAX=<bytes>: the largest snapshot copied into the recorder's upload chunk on
+    // every draw (larger ones keep their own buffer, reused while the range is unchanged); 0 gives
+    // every snapshot and moved data buffer its own buffer as before.
+    static const std::size_t limit = [] {
+        const char* value = std::getenv("APS5_DRAW_UPLOAD_MAX");
+        return value != nullptr ? static_cast<std::size_t>(std::strtoull(value, nullptr, 10)) : std::size_t{4096};
+    }();
+    return limit;
+}
+
 std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved) const {
     if (_set == VK_NULL_HANDLE || usesBda) return {};
-    const auto reads = guestMemory.InPlaceReads();
+    auto& parts = bindingParts();
+    if (parts.enabled) {
+        parts.lap = std::chrono::steady_clock::now();
+        ++parts.calls;
+    }
+    struct Report {
+        BindingParts& parts;
+        ~Report() {
+            if (parts.enabled) parts.report();
+        }
+    } report{parts};
+    const auto uploadLimit = DrawUploadLimit();
     auto result = std::make_shared<DrawBindings>();
-    std::vector<std::size_t> selected;
+    InlineList<std::size_t, 16> selected;
+    // A copy the draw reads: a slice of the upload chunk when small enough, else a buffer of its own.
+    const auto ownCopy = [&](std::uint64_t address, std::size_t bytes) {
+        if (bytes <= uploadLimit) {
+            auto slice = recorder.DrawUpload(bytes);
+            if (parts.enabled) ++parts.uploaded;
+            return DrawBindings::Snapshot{address, std::move(slice.buffer), slice.offset, bytes};
+        }
+        return DrawBindings::Snapshot{address, std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT), 0, bytes};
+    };
     for (std::size_t index = 0; index < allocations.size(); ++index) {
         const auto& item = allocations[index];
         const auto override = std::find_if(moved.begin(), moved.end(), [&](const MovedBuffer& entry) { return entry.allocation == index; });
         if (override != moved.end() && !override->words.empty()) {
-            auto buffer = std::make_shared<Buffer>(context, override->size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-            std::memcpy(buffer->Bytes().data(), override->words.data(), override->size);
+            if (parts.enabled) parts.mark(BindingParts::Snapshots);
+            auto snapshot = ownCopy(0, override->size);
+            const auto bytes = snapshot.Bytes();
+            std::memcpy(bytes.data(), override->words.data(), override->size);
             for (const auto& patch : dataPatches) {
-                if (patch.allocation == index && patch.byte < override->size) buffer->Bytes()[patch.byte] = static_cast<std::byte>(patch.adjustment);
+                if (patch.allocation == index && patch.byte < override->size) bytes[patch.byte] = static_cast<std::byte>(patch.adjustment);
             }
             selected.push_back(index);
-            result->snapshots.push_back({0, std::move(buffer)});
+            result->snapshots.push_back(std::move(snapshot));
+            if (parts.enabled) {
+                ++parts.moved;
+                parts.mark(BindingParts::Moved);
+            }
             continue;
         }
         std::uint64_t address = item.address;
         std::size_t size = item.size;
+        if (parts.enabled) parts.mark(BindingParts::Snapshots);
         if (override != moved.end()) {
             address = override->address;
             size = override->size;
-        } else {
-            if (!item.guest || item.written || guestMemory.WritesOverlap(item.address, item.size)) continue;
-            const bool direct = std::any_of(reads.begin(), reads.end(), [&](const auto& range) { return item.address >= range.first && item.address < range.second && item.size <= range.second - item.address; });
-            if (!direct || recorder.PendingWriteOverlaps(item.address, item.size)) continue;
+        } else if (!item.guest || item.written || guestMemory.WritesOverlap(item.address, item.size) || !guestMemory.ReadInPlace(item.address, item.size) || recorder.PendingWriteOverlaps(item.address, item.size)) {
+            if (parts.enabled) parts.mark(BindingParts::Checks);
+            continue;
         }
+        if (parts.enabled) parts.mark(BindingParts::Checks);
         const auto begin = address - item.adjustment;
         const auto bytes = size + item.adjustment;
-        const auto registryGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
-        const auto generation = GuestMemory::CollectWrites(begin, bytes);
-        auto buffer = recorder.ReusableDrawSnapshot(begin, bytes);
-        if (buffer == nullptr) {
-            buffer = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
-            std::memcpy(buffer->Bytes().data(), reinterpret_cast<const void*>(begin), bytes);
-            recorder.KeepDrawSnapshot(begin, bytes, generation, registryGeneration, buffer);
+        if (parts.enabled) parts.noteSize(bytes);
+        if (bytes <= uploadLimit) {
+            // Copied on every draw: no collect, no lookup, nothing kept between draws.
+            auto snapshot = ownCopy(begin, bytes);
+            std::memcpy(snapshot.Bytes().data(), reinterpret_cast<const void*>(begin), bytes);
+            result->snapshots.push_back(std::move(snapshot));
+        } else {
+            const auto registryGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+            const auto generation = GuestMemory::CollectWrites(begin, bytes);
+            if (parts.enabled) parts.mark(BindingParts::Collect);
+            auto buffer = recorder.ReusableDrawSnapshot(begin, bytes);
+            if (parts.enabled) parts.mark(BindingParts::Lookup);
+            if (buffer == nullptr) {
+                buffer = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+                std::memcpy(buffer->Bytes().data(), reinterpret_cast<const void*>(begin), bytes);
+                recorder.KeepDrawSnapshot(begin, bytes, generation, registryGeneration, buffer);
+                if (parts.enabled) ++parts.made;
+            } else if (parts.enabled) {
+                ++parts.reused;
+            }
+            result->snapshots.push_back({begin, std::move(buffer), 0, bytes});
         }
         selected.push_back(index);
-        result->snapshots.push_back({begin, std::move(buffer)});
         CaptureTrace::Log("draw-snapshot batch=%llu address=%llx bytes=%zu", static_cast<unsigned long long>(recorder.Submissions() + 1), static_cast<unsigned long long>(begin), bytes);
+        if (parts.enabled) parts.mark(BindingParts::Make);
     }
+    if (parts.enabled) parts.mark(BindingParts::Snapshots);
     if (selected.empty()) return {};
     Require(context.descriptorCache != nullptr, "draw snapshots require a descriptor cache");
-    std::map<VkDescriptorType, std::uint32_t> counts;
-    for (const auto& binding : bindings) counts[binding.layout.descriptorType] += binding.layout.descriptorCount;
-    std::vector<VkDescriptorPoolSize> sizes;
-    for (const auto& [type, count] : counts) sizes.push_back({type, count});
+    // The set's descriptor counts by type (a handful of types; no map per draw).
+    std::array<VkDescriptorPoolSize, 16> sizes{};
+    std::size_t sizeCount = 0;
+    for (const auto& binding : bindings) {
+        auto* const last = sizes.data() + sizeCount;
+        auto* found = std::find_if(sizes.data(), last, [&](const VkDescriptorPoolSize& entry) { return entry.type == binding.layout.descriptorType; });
+        if (found == last) {
+            Require(sizeCount < sizes.size(), "a draw set uses more descriptor types than expected");
+            *found = {binding.layout.descriptorType, 0};
+            ++sizeCount;
+        }
+        found->descriptorCount += binding.layout.descriptorCount;
+    }
     result->cache = context.descriptorCache;
-    result->allocation = result->cache->Allocate(_layout, sizes);
+    result->allocation = result->cache->AllocateTransient(_layout, std::span<const VkDescriptorPoolSize>(sizes.data(), sizeCount));
     Require(result->allocation.set != VK_NULL_HANDLE, "draw snapshot descriptor allocation failed");
-    std::vector<VkCopyDescriptorSet> copies;
+    if (parts.enabled) {
+        ++parts.sets;
+        parts.mark(BindingParts::Allocate);
+    }
+    InlineList<VkCopyDescriptorSet, 16> copies;
     for (const auto& binding : bindings) {
         VkCopyDescriptorSet copy{VK_STRUCTURE_TYPE_COPY_DESCRIPTOR_SET};
         copy.srcSet = _set;
@@ -2859,10 +3119,10 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
     }
     const auto update = context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets");
     update(context.device, 0, nullptr, static_cast<std::uint32_t>(copies.size()), copies.data());
-    std::vector<VkDescriptorBufferInfo> infos;
-    infos.reserve(selected.size());
-    for (const auto& snapshot : result->snapshots) infos.push_back({snapshot.buffer->Handle(), 0, snapshot.buffer->Bytes().size()});
-    std::vector<VkWriteDescriptorSet> writes;
+    if (parts.enabled) parts.mark(BindingParts::Copy);
+    InlineList<VkDescriptorBufferInfo, 16> infos;
+    for (const auto& snapshot : result->snapshots) infos.push_back({snapshot.buffer->Handle(), snapshot.offset, snapshot.bytes});
+    InlineList<VkWriteDescriptorSet, 16> writes;
     for (const auto& binding : bindings) {
         for (std::size_t element = 0; element < binding.allocations.size(); ++element) {
             const auto found = std::find(selected.begin(), selected.end(), binding.allocations[element]);
@@ -2879,6 +3139,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
     }
     update(context.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
     recorder.Keep(result);
+    if (parts.enabled) parts.mark(BindingParts::Write);
     return result;
 }
 

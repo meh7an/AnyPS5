@@ -1028,8 +1028,9 @@ void resourceReadTests(const Device& device, Recorder& recorder) {
         const auto commands = snapshotRecorder.Commands();
         RecordMemoryBarrier(snapshotContext, commands, VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
         const auto copy = snapshotContext.Function<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer");
-        VkBufferCopy region{0, 0, elementBytes};
+        VkBufferCopy region{first->snapshots[0].offset, 0, elementBytes};
         copy(commands, first->snapshots[0].buffer->Handle(), downloaded->Handle(), 1, &region);
+        region.srcOffset = second->snapshots[0].offset;
         region.dstOffset = elementBytes;
         copy(commands, second->snapshots[0].buffer->Handle(), downloaded->Handle(), 1, &region);
         RecordMemoryBarrier(snapshotContext, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
@@ -1127,9 +1128,10 @@ void misalignedSnapshotTests(const Device& device, Recorder& recorder) {
         Require(push[0] == std::byte{0} && adjustment == offset % alignment, "the inner view's shader offset is not its distance from the binding");
         const auto bindings = resources.PrepareDrawBindings(snapshotRecorder);
         Require(bindings != nullptr && bindings->snapshots.size() == 2, "read-only draw inputs were not snapshotted");
-        const auto outerContents = bindings->snapshots[0].buffer->Bytes();
+        const auto outerContents = bindings->snapshots[0].Bytes();
         Require(outerContents.size() >= outerBytes && std::memcmp(outerContents.data(), guest + outer, outerBytes) == 0, "an aligned draw snapshot misses its view's bytes");
-        const auto contents = bindings->snapshots[1].buffer->Bytes();
+        const auto contents = bindings->snapshots[1].Bytes();
+        Require(bindings->snapshots[1].offset % alignment == 0, "a draw snapshot's descriptor offset breaks the storage buffer alignment");
         Require(contents.size() >= adjustment + elementBytes, "a draw snapshot ends before the bytes the shader reads");
         Require(std::memcmp(contents.data() + adjustment, guest + offset, elementBytes) == 0, "the shader's offset into a draw snapshot misses the view's bytes");
         snapshotRecorder.Sync();
@@ -1170,19 +1172,58 @@ void drawSnapshotReuseTests(const Device& device, Recorder& recorder) {
         std::cout << "host import of the watched block refused: draw snapshot reuse not tested\n";
         return;
     }
+    // One element past the upload limit (snapshots kept and reused while unchanged), one within it
+    // (copied into the recorder's upload chunk on every draw).
     const auto element = address + 4096;
-    constexpr std::size_t elementBytes = 1024;
-    ShaderRecompiler::RecompileResult program;
-    ShaderRecompiler::DescriptorBinding binding;
-    binding.kind = ShaderRecompiler::DescriptorKind::StorageBuffer;
-    binding.role = ShaderRecompiler::DescriptorRole::GuestBuffers;
-    binding.descriptorSet = 0;
-    binding.binding = 0;
-    binding.count = 1;
-    binding.guestDescriptor = {static_cast<std::uint32_t>(element), static_cast<std::uint32_t>(element >> 32u) & 0xffffu, elementBytes, 0x31000000u};
-    binding.bufferWritten = {false};
-    program.bindings.push_back(binding);
-    const CompiledShader compute{ShaderRecompiler::ShaderStage::Compute, &program, 0};
+    constexpr std::size_t elementBytes = 8192;
+    const auto small = address + 32768;
+    constexpr std::size_t smallBytes = 256;
+    const auto program = [](std::uint64_t at, std::size_t size) {
+        ShaderRecompiler::RecompileResult result;
+        ShaderRecompiler::DescriptorBinding binding;
+        binding.kind = ShaderRecompiler::DescriptorKind::StorageBuffer;
+        binding.role = ShaderRecompiler::DescriptorRole::GuestBuffers;
+        binding.descriptorSet = 0;
+        binding.binding = 0;
+        binding.count = 1;
+        binding.guestDescriptor = {static_cast<std::uint32_t>(at), static_cast<std::uint32_t>(at >> 32u) & 0xffffu, static_cast<std::uint32_t>(size), 0x31000000u};
+        binding.bufferWritten = {false};
+        result.bindings.push_back(binding);
+        return result;
+    };
+    const auto kept = program(element, elementBytes);
+    const auto uploaded = program(small, smallBytes);
+    const CompiledShader compute{ShaderRecompiler::ShaderStage::Compute, &kept, 0};
+    const CompiledShader smallCompute{ShaderRecompiler::ShaderStage::Compute, &uploaded, 0};
+    if (ShaderResources::DrawUploadLimit() >= smallBytes) {
+        auto snapshotContext = context;
+        DescriptorCache cache(snapshotContext);
+        snapshotContext.descriptorCache = &cache;
+        Recorder snapshotRecorder(snapshotContext);
+        snapshotRecorder.Activate();
+        ShaderResources resources(snapshotContext, smallCompute);
+        const auto holds = [](const ShaderResources::DrawBindings::Snapshot& snapshot, std::byte expected) {
+            const auto contents = snapshot.Bytes();
+            return contents.size() == smallBytes && std::all_of(contents.begin(), contents.end(), [&](std::byte value) { return value == expected; });
+        };
+        const auto before = cache.Counters();
+        const auto first = resources.PrepareDrawBindings(snapshotRecorder);
+        Require(first != nullptr && first->snapshots.size() == 1 && holds(first->snapshots[0], std::byte{0x11}), "a small draw input was not uploaded with its guest bytes");
+        Require(first->snapshots[0].offset % context.limits.minStorageBufferOffsetAlignment == 0, "a draw upload breaks the storage buffer offset alignment");
+        std::memset(reinterpret_cast<void*>(small), 0x44, smallBytes);
+        const auto second = resources.PrepareDrawBindings(snapshotRecorder);
+        Require(second != nullptr && second->snapshots.size() == 1 && holds(second->snapshots[0], std::byte{0x44}), "a draw upload missed a CPU store before its draw");
+        Require(holds(first->snapshots[0], std::byte{0x11}), "a later draw's upload overwrote an earlier draw's bytes");
+        Require(second->snapshots[0].buffer == first->snapshots[0].buffer && second->snapshots[0].offset >= first->snapshots[0].offset + smallBytes, "consecutive draw uploads do not share the chunk");
+        Require(first->allocation.transient && second->allocation.transient && cache.Counters().transientSets == before.transientSets + 2, "draw sets were not taken from the transient pools");
+        snapshotRecorder.Sync();
+    } else {
+        std::cout << "draw uploads disabled: not tested\n";
+    }
+    if (ShaderResources::DrawUploadLimit() >= elementBytes) {
+        std::cout << "draw upload limit " << ShaderResources::DrawUploadLimit() << ": draw snapshot reuse not tested\n";
+        return;
+    }
     {
         auto snapshotContext = context;
         DescriptorCache cache(snapshotContext);
@@ -1194,8 +1235,8 @@ void drawSnapshotReuseTests(const Device& device, Recorder& recorder) {
             const auto bindings = resources.PrepareDrawBindings(snapshotRecorder);
             Require(bindings != nullptr && bindings->snapshots.size() == 1, "read-only draw input was not snapshotted");
             const auto buffer = bindings->snapshots[0].buffer;
-            const auto contents = buffer->Bytes();
-            Require(contents.size() == elementBytes && std::all_of(contents.begin(), contents.end(), [&](std::byte value) { return value == expected; }), "a draw snapshot does not hold the guest bytes of its draw");
+            const auto contents = bindings->snapshots[0].Bytes();
+            Require(bindings->snapshots[0].offset == 0 && contents.size() == elementBytes && std::all_of(contents.begin(), contents.end(), [&](std::byte value) { return value == expected; }), "a draw snapshot does not hold the guest bytes of its draw");
             return buffer;
         };
         const auto first = snapshot(std::byte{0x11});
@@ -1215,6 +1256,48 @@ void drawSnapshotReuseTests(const Device& device, Recorder& recorder) {
         snapshotRecorder.Sync();
     }
     recorder.Activate();
+}
+
+void transientSetTests(const Device& device) {
+    if (std::getenv("APS5_NO_TRANSIENT_SETS") != nullptr) {
+        std::cout << "transient descriptor sets disabled: not tested\n";
+        return;
+    }
+    const auto& context = device.GetContext();
+    DescriptorCache cache(context);
+    const VkDescriptorSetLayoutBinding layoutBinding{0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+    const std::array<std::uint32_t, 4> key{0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT};
+    const auto layout = cache.Layout(key, std::span<const VkDescriptorSetLayoutBinding>(&layoutBinding, 1));
+    const std::array<VkDescriptorPoolSize, 1> sizes{{{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1}}};
+    const auto take = [&] {
+        const auto set = cache.AllocateTransient(layout, sizes);
+        Require(set.set != VK_NULL_HANDLE && set.transient, "a transient set was not allocated");
+        return set;
+    };
+    // Fill the first pool until the next set opens a second one.
+    std::vector<DescriptorCache::SetAllocation> first;
+    while (cache.Counters().transientPools < 2) {
+        first.push_back(take());
+        Require(first.size() < 100000, "a transient pool never filled");
+    }
+    const auto opener = first.back();
+    first.pop_back();
+    const auto pool = first.front().pool;
+    Require(opener.pool != pool && std::all_of(first.begin(), first.end(), [&](const auto& set) { return set.pool == pool; }), "a transient pool's sets came from several pools");
+    Require(cache.Counters().transientResets == 0, "a transient pool with live sets was reset");
+    for (std::size_t index = 1; index < first.size(); ++index) cache.Free(first[index]);
+    Require(cache.Counters().transientResets == 0, "a transient pool was reset before its last set was released");
+    cache.Free(first.front());
+    Require(cache.Counters().transientResets == 1, "a full transient pool was not reset when its last set was released");
+    // Filling the second pool moves on to the reset one, not a new pool.
+    std::vector<DescriptorCache::SetAllocation> second{opener};
+    while (second.back().pool == opener.pool) {
+        second.push_back(take());
+        Require(second.size() < 100000, "the second transient pool never filled");
+    }
+    Require(second.back().pool == pool && cache.Counters().transientPools == 2, "the reset transient pool was not filled again");
+    for (const auto& set : second) cache.Free(set);
+    Require(cache.Counters().transientResets == 2, "only the full pool is reset when its sets are released");
 }
 
 void drawSnapshotEvictionTests(const Device& device) {
@@ -2833,6 +2916,7 @@ int main() {
         resourceReadTests(device, recorder);
         misalignedSnapshotTests(device, recorder);
         drawSnapshotReuseTests(device, recorder);
+        transientSetTests(device);
         drawSnapshotEvictionTests(device);
         drawInputReuseTests(device, recorder);
         RunResidentPresentTests(device.GetContext());

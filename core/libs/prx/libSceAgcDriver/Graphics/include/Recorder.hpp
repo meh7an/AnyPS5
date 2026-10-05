@@ -97,6 +97,20 @@ public:
     static constexpr std::size_t DrawInputEntries = 16384;
     std::shared_ptr<Buffer> ReusableDrawSnapshot(std::uint64_t address, std::size_t bytes, SnapshotUse use = SnapshotUse::Storage, std::uint32_t* derived = nullptr);
     void KeepDrawSnapshot(std::uint64_t address, std::size_t bytes, std::uint64_t generation, std::uint64_t registryGeneration, std::shared_ptr<Buffer> buffer, SnapshotUse use = SnapshotUse::Storage, std::uint32_t derived = 0);
+    // Draw uploads: small per-draw copies (snapshots of small read-only guest buffers, the words of
+    // moved data buffers) are bump-allocated at the storage buffer offset alignment from one host
+    // buffer of DrawUploadChunk bytes, instead of a pooled buffer each that the snapshot cache then
+    // has to prove unchanged on every use (a collect and a stamp walk under the tracker mutex cost
+    // more than copying a few hundred bytes). A slice holds its chunk alive (the draw's bindings
+    // keep it until their batch completed); a full chunk is replaced by a fresh one from the
+    // buffer pool and lives on in the slices taken from it. Under the GPU mutex, as recording is.
+    static constexpr std::size_t DrawUploadChunk = std::size_t{1} << 20u;
+    struct UploadSlice {
+        std::shared_ptr<Buffer> buffer;
+        VkDeviceSize offset = 0;
+        std::byte* bytes = nullptr;
+    };
+    UploadSlice DrawUpload(std::size_t bytes);
     void OnComplete(std::function<void()> action);
     void NotePendingWrite(std::uint64_t address, std::size_t bytes);
     void NotePendingFill(std::uint64_t address, std::size_t bytes, std::uint8_t value);
@@ -762,6 +776,9 @@ private:
     };
     std::map<DrawSnapshotKey, DrawSnapshot> drawSnapshots;
     std::array<DrawSnapshotPool, 2> drawSnapshotPools;
+    // The draw upload chunk being filled and its bytes in use (see DrawUpload).
+    std::shared_ptr<Buffer> drawUpload;
+    VkDeviceSize drawUploadUsed = 0;
     void eraseDrawSnapshot(std::map<DrawSnapshotKey, DrawSnapshot>::iterator entry);
 };
 

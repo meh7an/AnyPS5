@@ -115,9 +115,14 @@ private:
     void attachDrawRecipe(std::uint64_t key, const std::vector<std::shared_ptr<DispatchVariant>>& stages, std::shared_ptr<const DrawRecipe> recipe);
     void reportDrawCache(DrawEntryCounters& counters);
     static std::uint64_t drawRegisterKey(const QueueState& queue, const ShaderRegistry& registry, std::uint64_t deviceSerial);
+    // The draw key without the user data words of the pixel, geometry and hull programs.
+    static std::uint64_t structuralDrawKey(const QueueState& queue, const ShaderRegistry& registry, std::uint64_t deviceSerial);
     // APS5_TRACE_DRAWKEY: how often a missed draw key differs from an earlier draw's only in the
     // user data words, and in which of them.
     static void traceDrawKey(const QueueState& queue, const ShaderRegistry& registry, std::uint64_t deviceSerial, bool hit);
+    // APS5_TRACE_DRAW_RELOC: for a draw repeating an earlier draw's structural key, how its stages'
+    // captured memory compares with the earlier draw's (moved, same words, differing words).
+    static void traceDrawRelocation(std::uint64_t structuralKey, const std::vector<DrawProgram>& programs, const std::vector<StageCapture>& captures);
     static bool sameVertexInfo(const ShaderRecompiler::ShaderVertexStageInfo& a, const ShaderRecompiler::ShaderVertexStageInfo& b);
     static bool sameDecode(const DrawDecode& a, const DrawDecode& b);
     std::shared_ptr<DrawDecode> decodeDraw(const QueueState& queue, const Submission& submission);

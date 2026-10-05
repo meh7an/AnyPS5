@@ -222,6 +222,8 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         pushCursorBytes += static_cast<std::uint32_t>(result.pushConstants.size());
     }
 
+    static const bool traceRelocation = std::getenv("APS5_TRACE_DRAW_RELOC") != nullptr;
+    if (traceRelocation && !drawHit) traceDrawRelocation(structuralDrawKey(queue, *submission.shaders, localDevice->Serial()), programs, stageCaptures);
     cacheDrawStages(useDrawEntries, drawHit, drawParameters, indirectCpu, programs, stageCaptures, vertexInfos, decodeReads, verifyHit, matched, fresh, drawKey, registerKey, decode, phaseTiming);
     timing.Mark("shader_compile_and_link");
 

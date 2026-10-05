@@ -1128,6 +1128,10 @@ VKAPI_ATTR void VKAPI_CALL mockDestroyDescriptorPool(VkDevice, VkDescriptorPool,
     --mock.live;
 }
 
+VKAPI_ATTR VkResult VKAPI_CALL mockResetDescriptorPool(VkDevice, VkDescriptorPool, VkDescriptorPoolResetFlags) {
+    return VK_SUCCESS;
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL mockAllocateDescriptorSets(VkDevice, const VkDescriptorSetAllocateInfo* info, VkDescriptorSet* sets) {
     Require(info->descriptorSetCount == 1, "exactly one descriptor set must be allocated");
     sets[0] = makeHandle<VkDescriptorSet>();
@@ -1235,6 +1239,7 @@ PFN_vkVoidFunction VKAPI_CALL mockProc(VkDevice, const char* name) {
         {"vkDestroyDescriptorSetLayout", reinterpret_cast<PFN_vkVoidFunction>(mockDestroyDescriptorSetLayout)},
         {"vkCreateDescriptorPool", reinterpret_cast<PFN_vkVoidFunction>(mockCreateDescriptorPool)},
         {"vkDestroyDescriptorPool", reinterpret_cast<PFN_vkVoidFunction>(mockDestroyDescriptorPool)},
+        {"vkResetDescriptorPool", reinterpret_cast<PFN_vkVoidFunction>(mockResetDescriptorPool)},
         {"vkAllocateDescriptorSets", reinterpret_cast<PFN_vkVoidFunction>(mockAllocateDescriptorSets)},
         {"vkFreeDescriptorSets", reinterpret_cast<PFN_vkVoidFunction>(mockFreeDescriptorSets)},
         {"vkUpdateDescriptorSets", reinterpret_cast<PFN_vkVoidFunction>(mockUpdateDescriptorSets)},

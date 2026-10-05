@@ -3,10 +3,41 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
+#include <array>
+#include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 
 namespace AgcDriver::DriverDetail {
+
+namespace {
+
+// APS5_PROFILE_DRAW_PHASES: compileDrawStage's own parts per stage, every 10 s.
+struct StageTimes {
+    enum Part { Handle, Capture, Regions, RecompileHit, RecompileMiss, Count };
+    std::array<double, Count> us{};
+    std::array<std::uint64_t, Count> calls{};
+    std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
+};
+
+StageTimes& stageTimes() {
+    static StageTimes times;
+    return times;
+}
+
+void reportStageTimes() {
+    auto& times = stageTimes();
+    const auto now = std::chrono::steady_clock::now();
+    if (now - times.lastReport < std::chrono::seconds(10)) return;
+    times.lastReport = now;
+    const auto avg = [&](StageTimes::Part part) { return times.calls[part] != 0 ? times.us[part] / static_cast<double>(times.calls[part]) : 0.0; };
+    std::fprintf(stderr, "[stage-compile] %llu stages (10 s), us per stage: source handle %.2f, capture %.2f, regions %.2f, recompile %.2f on %llu memo hits / %.2f on %llu misses\n", static_cast<unsigned long long>(times.calls[StageTimes::Handle]), avg(StageTimes::Handle), avg(StageTimes::Capture), avg(StageTimes::Regions), avg(StageTimes::RecompileHit), static_cast<unsigned long long>(times.calls[StageTimes::RecompileHit]), avg(StageTimes::RecompileMiss), static_cast<unsigned long long>(times.calls[StageTimes::RecompileMiss]));
+    times.us = {};
+    times.calls = {};
+}
+
+}
 
 ShaderRecompiler::RecompileResult Driver::compileDrawStage(std::size_t i, std::uint32_t pushOffset, const QueueState& queue, const Submission& submission, const std::vector<DrawProgram>& programs, const Graphics::State& graphics, const ShaderRecompiler::ShaderPixelStageInfo& pixel, const std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>>& vertexInfos, std::vector<ShaderRecompiler::MemoryRegion>& memory, const std::vector<ShaderRecompiler::LinkedProgram>& linked, const Pm4::DrawParameters& drawParameters, const std::shared_ptr<VulkanDevice>& localDevice, ShaderMemory& shaderMemory, std::vector<StageCapture>& stageCaptures, std::vector<bool>& recompiled, bool drawHit, const std::vector<std::shared_ptr<DispatchVariant>>& matched, const std::vector<std::vector<ShaderRecompiler::MemoryRegion>>& matchedRegions, bool profile, std::uint64_t dumpTarget, std::uint64_t dumpSlot1, std::uint64_t& captures, DrawPhaseTiming& phaseTiming, std::array<double, DrawDriverPhaseCount>& phaseMs, std::string& rejected) {
     using Stage = ShaderRecompiler::ShaderStage;
@@ -21,8 +52,18 @@ ShaderRecompiler::RecompileResult Driver::compileDrawStage(std::size_t i, std::u
         ShaderRecompiler::GraphicsCompileContext{program.firstUserSgpr, linked, graphics.stages.mesh, graphics.stages.tessellation, {drawParameters.indexAddress, drawParameters.indexCount, drawParameters.indexSize, drawParameters.instanceCount}}
     };
     const auto waitedBefore = traceCapSync() || profile ? Graphics::Recorder::ThreadWaitedMs() : 0.0;
+    static const bool subPhases = std::getenv("APS5_PROFILE_DRAW_PHASES") != nullptr;
+    auto lap = subPhases ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const auto part = [&](StageTimes::Part which) {
+        if (!subPhases) return;
+        const auto now = std::chrono::steady_clock::now();
+        stageTimes().us[which] += std::chrono::duration<double, std::micro>(now - lap).count();
+        ++stageTimes().calls[which];
+        lap = now;
+    };
     const std::string* poisoned = nullptr;
     const auto handle = SourceHandleFor(*program.snapshot, program.codeOffset, localDevice->Serial(), request, false, FailureMemo() ? &poisoned : nullptr);
+    part(StageTimes::Handle);
     if (handle == nullptr && poisoned != nullptr) {
         rejected = *poisoned;
         return {};
@@ -34,10 +75,12 @@ ShaderRecompiler::RecompileResult Driver::compileDrawStage(std::size_t i, std::u
         const SampledReadScope sampling(evidenceReads);
         return shaderMemory.Capture(request, handle.get());
     }();
+    part(StageTimes::Capture);
 
     stageCapture.regions = shaderMemory.TakeRecentRegions();
     recompiled[i] = true;
     memory = shaderMemory.Regions();
+    part(StageTimes::Regions);
 
     if (drawHit) {
         for (std::size_t j = 0; j < programs.size(); ++j) {
@@ -76,8 +119,14 @@ ShaderRecompiler::RecompileResult Driver::compileDrawStage(std::size_t i, std::u
     static const bool reuseCapture = std::getenv("APS5_NO_CAPTURE_REUSE") == nullptr;
     phaseTiming.Phase(DrawRowCapture);
 
-    stageCapture.compiled = reuseCapture ? ShaderRecompiler::Recompile(request, *capture) : std::make_shared<const ShaderRecompiler::RecompileResult>(ShaderRecompiler::Recompile(request));
+    if (subPhases) lap = std::chrono::steady_clock::now();
+    bool memoHit = false;
+    stageCapture.compiled = reuseCapture ? ShaderRecompiler::Recompile(request, *capture, &memoHit) : std::make_shared<const ShaderRecompiler::RecompileResult>(ShaderRecompiler::Recompile(request));
     ShaderRecompiler::RecompileResult result = *stageCapture.compiled;
+    if (subPhases) {
+        part(memoHit ? StageTimes::RecompileHit : StageTimes::RecompileMiss);
+        reportStageTimes();
+    }
     phaseTiming.Phase(DrawRowRecompile);
     return result;
 }

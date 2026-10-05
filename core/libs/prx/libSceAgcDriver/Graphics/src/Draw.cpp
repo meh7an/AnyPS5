@@ -1270,15 +1270,15 @@ void captureInputs(const Context& context, Recorder& recorder, VkCommandBuffer c
     };
     if (bindings != nullptr) {
         for (const auto& snapshot : bindings->snapshots) {
-            const auto bytes = snapshot.buffer->Bytes();
-            addSample(snapshot.address, bytes.size(), snapshot.buffer->Handle(), 0, bytes.data());
+            const auto bytes = snapshot.Bytes();
+            addSample(snapshot.address, bytes.size(), snapshot.buffer->Handle(), snapshot.offset, bytes.data());
         }
     }
     for (const auto& [begin, end] : resources.InPlaceReads()) {
         Require(end >= begin, "invalid capture input range");
         const auto bytes = static_cast<std::size_t>(end - begin);
         if (bytes == 0 || bytes > 512) continue;
-        if (bindings != nullptr && std::any_of(bindings->snapshots.begin(), bindings->snapshots.end(), [&](const auto& snapshot) { return snapshot.address < end && begin < snapshot.address + snapshot.buffer->Bytes().size(); })) continue;
+        if (bindings != nullptr && std::any_of(bindings->snapshots.begin(), bindings->snapshots.end(), [&](const auto& snapshot) { return snapshot.address < end && begin < snapshot.address + snapshot.bytes; })) continue;
         if (resources.WritesOverlap(begin, bytes) || recorder.PendingWriteOverlaps(begin, bytes)) {
             CaptureTrace::Log("input-skip draw=%llu batch=%llu address=%llx bytes=%zu reason=gpu-writer", draw, batch, static_cast<unsigned long long>(begin), bytes);
             continue;
@@ -1317,7 +1317,51 @@ void captureInputs(const Context& context, Recorder& recorder, VkCommandBuffer c
     });
 }
 
+// APS5_PROFILE_DRAW_PHASES: recordDraw's own parts, every 10 s.
+struct RecordParts {
+    enum Part { Stores, Bindings, Pass, Bind, Push, Command, Leave, Count };
+    static constexpr const char* Names[Count] = {"store flushes", "draw bindings", "pass continue/begin", "descriptor bind", "push constants", "draw command", "leave pass"};
+    std::array<double, Count> us{};
+    std::uint64_t draws = 0, continued = 0;
+    std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
+    std::chrono::steady_clock::time_point lap{};
+    bool enabled = std::getenv("APS5_PROFILE_DRAW_PHASES") != nullptr;
+    void start() {
+        if (enabled) lap = std::chrono::steady_clock::now();
+    }
+    void mark(Part part) {
+        if (!enabled) return;
+        const auto now = std::chrono::steady_clock::now();
+        us[part] += std::chrono::duration<double, std::micro>(now - lap).count();
+        lap = now;
+    }
+    void finish(bool passContinued) {
+        if (!enabled) return;
+        ++draws;
+        if (passContinued) ++continued;
+        const auto now = std::chrono::steady_clock::now();
+        if (now - lastReport < std::chrono::seconds(10)) return;
+        lastReport = now;
+        std::string line;
+        for (std::size_t i = 0; i < Count; ++i) {
+            char text[64];
+            std::snprintf(text, sizeof(text), " %s %.2f", Names[i], us[i] / static_cast<double>(draws));
+            line += text;
+        }
+        std::fprintf(stderr, "[record-parts] %llu draws (%llu continued a pass), us per draw:%s\n", static_cast<unsigned long long>(draws), static_cast<unsigned long long>(continued), line.c_str());
+        us = {};
+        draws = continued = 0;
+    }
+};
+
+RecordParts& recordParts() {
+    static RecordParts parts;
+    return parts;
+}
+
 void recordDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawInputs& inputs, RecordedDraw& record, DrawOutcome& outcome, DrawTimer& timer, double& ownWaitedMs) {
+    auto& parts = recordParts();
+    parts.start();
     auto* recorder = record.recorder;
     auto& resources = *record.resources;
     const auto* args = record.indirect != nullptr ? record.indirect->args : nullptr;
@@ -1353,7 +1397,9 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     if (recorder->HasQueuedKeyStores() && (resources.HoldsLease() || recorder->AnyQueuedKeyStore(touches))) recorder->FlushKeyStores();
     // A queued label store over such memory likewise (Recorder::RecordStore).
     if (recorder->HasQueuedStores() && (resources.HoldsLease() || recorder->AnyQueuedStore(touches))) recorder->FlushStores();
+    parts.mark(RecordParts::Stores);
     const auto drawBindings = resources.PrepareDrawBindings(*recorder, record.moved);
+    parts.mark(RecordParts::Bindings);
     const bool capture = CaptureInputsEnabled();
     const bool meshIndirect = state.stages.mesh && args != nullptr;
     const bool continued = !capture && !readsTarget && !gpuIndirect && !meshIndirect && recorder->ContinuesRenderPass(passKey);
@@ -1401,6 +1447,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         APS5_LOG_OUT_DEBUG("Beginning pipeline renderExtent=%ux%u", state.renderExtent.width, state.renderExtent.height);
         record.pipeline->Begin(commands, *record.framebuffer, state.renderExtent, state);
     }
+    parts.mark(RecordParts::Pass);
     APS5_LOG_CHARS_OUT_DEBUG("Pipeline Begin OK");
     if (drawBindings != nullptr) {
         const auto set = drawBindings->allocation.set;
@@ -1408,10 +1455,13 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     } else {
         resources.Bind(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, record.pipeline->Layout());
     }
+    parts.mark(RecordParts::Bind);
     APS5_LOG_CHARS_OUT_DEBUG("Resources bound");
     pushDrawConstants(*record.pipeline, commands, state, draw, shaders, resources, record.pushBytes, record.pushStages, meshArguments != nullptr ? meshArguments->DeviceAddress() : 0);
+    parts.mark(RecordParts::Push);
     APS5_LOG_CHARS_OUT_DEBUG("Push constants recorded");
     recordDrawCommands(context, commands, state, draw, inputs, record.indirect, argumentBuffer, argumentOffset);
+    parts.mark(RecordParts::Command);
     if (meshArguments != nullptr) recorder->Keep(meshArguments);
     if (args != nullptr) CountIndirectDraw(record.indirect->path, record.indirect->readMs, rewritten);
     auto checkRecords = indirectRecordCheck(record.indirect);
@@ -1429,6 +1479,8 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         };
     }
     recorder->LeaveRenderPassOpen(passKey, drawTiming, !resources.WritesMemory(), std::move(storeProxies));
+    parts.mark(RecordParts::Leave);
+    parts.finish(continued);
     timer.phase(PhaseRecord);
     keepRecordedDraw(*recorder, record.resources, std::move(record.pipeline), std::move(record.framebuffer), inputs, std::move(record.targets), std::move(scratch), std::move(checkRecords), record.listed, record.completion, outcome);
     timer.phase(PhaseKeep);
