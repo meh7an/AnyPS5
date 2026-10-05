@@ -11,6 +11,7 @@
 #include <array>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <vector>
 
 namespace ShaderRecompiler {
@@ -50,6 +51,13 @@ struct UniformFillPlan {
 
 inline constexpr std::uint32_t NativePushConstantSize = sizeof(PushData);
 
+// A plan's compiled runtime walk (Optimization's Detail::SrtTape), made on first use by the captures
+// sharing the plan and kept with it; type-erased here.
+struct SrtTapeSlot {
+    std::once_flag once;
+    std::shared_ptr<const void> tape;
+};
+
 struct IrResourcePlan {
     IrShaderStage stage = IrShaderStage::Unknown;
     std::uint64_t shaderHash = 0;
@@ -72,6 +80,7 @@ struct IrResourcePlan {
     bool resourceTrackingComplete = false;
     ShaderInfo info;
     UniformFillPlan uniformFill;
+    std::shared_ptr<SrtTapeSlot> tapeSlot = std::make_shared<SrtTapeSlot>();
 };
 
 }

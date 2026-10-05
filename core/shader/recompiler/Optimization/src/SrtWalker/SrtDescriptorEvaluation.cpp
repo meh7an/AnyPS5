@@ -1,10 +1,12 @@
 #include "Optimization/SrtWalker/SrtDescriptorEvaluation.hpp"
 #include "Optimization/SrtWalker/SrtEvaluator.hpp"
+#include "Optimization/SrtWalker/SrtTape.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 
 #include <cstdio>
 #include <cstdlib>
 #include <algorithm>
+#include <atomic>
 #include <string>
 
 namespace ShaderRecompiler::Detail {
@@ -44,7 +46,85 @@ const DescriptorSource* Source(const IrResourcePlan& program, std::uint32_t sour
 
 }
 
+namespace {
+
+bool interpretRuntimeSources(const IrResourcePlan& program, std::span<const std::uint32_t> sources, const SrtRuntime& runtime, std::vector<DescriptorValue>& results, std::vector<std::uint32_t>& flat, bool evaluateFlat, std::span<const std::uint8_t> cleanFlatSlots, std::vector<std::uint8_t>& activeSources);
+
+// APS5_VERIFY_SRT_TAPE: the Evaluator's walk beside the tape's, over a trace of its own; any
+// difference in the descriptors, the flat slots, the active sources or the reads traced is reported
+// (a few times) and the Evaluator's answer replaces the tape's.
+void verifyTape(const IrResourcePlan& program, const SrtRuntime& runtime, std::vector<DescriptorValue>& results, std::vector<std::uint32_t>& flat, std::vector<std::uint8_t>& activeSources, std::size_t leavesBefore, std::size_t readsBefore) {
+    SrtReadTrace expectedTrace;
+    SrtRuntime interpreted = runtime;
+    interpreted.readTrace = runtime.readTrace != nullptr ? &expectedTrace : nullptr;
+    std::vector<DescriptorValue> expectedResults;
+    std::vector<std::uint32_t> expectedFlat;
+    std::vector<std::uint8_t> expectedActive;
+    const bool ok = interpretRuntimeSources(program, program.materializationSources, interpreted, expectedResults, expectedFlat, true, program.cleanFlatSlots, expectedActive);
+    std::string difference;
+    if (!ok) difference = "the Evaluator failed: " + failureReason();
+    else if (expectedResults != results) difference = "descriptors";
+    else if (expectedFlat != flat) difference = "flat slots";
+    else if (expectedActive != activeSources) difference = "active sources";
+    else if (auto* trace = runtime.readTrace; trace != nullptr) {
+        auto leaves = std::vector(trace->leaves.begin() + static_cast<std::ptrdiff_t>(leavesBefore), trace->leaves.end());
+        auto reads = std::vector(trace->otherReads.begin() + static_cast<std::ptrdiff_t>(readsBefore), trace->otherReads.end());
+        auto expectedLeaves = expectedTrace.leaves;
+        auto expectedReads = expectedTrace.otherReads;
+        std::sort(leaves.begin(), leaves.end());
+        std::sort(expectedLeaves.begin(), expectedLeaves.end());
+        std::sort(reads.begin(), reads.end());
+        reads.erase(std::unique(reads.begin(), reads.end()), reads.end());
+        std::sort(expectedReads.begin(), expectedReads.end());
+        expectedReads.erase(std::unique(expectedReads.begin(), expectedReads.end()), expectedReads.end());
+        if (leaves != expectedLeaves) difference = "traced leaf reads";
+        else if (reads != expectedReads) difference = "traced reads";
+        if (!difference.empty()) {
+            trace->leaves.resize(leavesBefore);
+            trace->otherReads.resize(readsBefore);
+            trace->leaves.insert(trace->leaves.end(), expectedTrace.leaves.begin(), expectedTrace.leaves.end());
+            trace->otherReads.insert(trace->otherReads.end(), expectedTrace.otherReads.begin(), expectedTrace.otherReads.end());
+        }
+    }
+    static std::atomic<std::uint64_t> walks {0};
+    static std::atomic<std::uint64_t> differences {0};
+    const auto walked = walks.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (difference.empty()) {
+        bool decade = walked >= 10;
+        for (auto rest = walked; decade && rest >= 10; rest /= 10) decade = rest % 10 == 0;
+        if (decade) std::fprintf(stderr, "[srt-tape] verify: %llu walks, %llu differed\n", static_cast<unsigned long long>(walked), static_cast<unsigned long long>(differences.load(std::memory_order_relaxed)));
+        return;
+    }
+    if (differences.fetch_add(1, std::memory_order_relaxed) < 20) std::fprintf(stderr, "[srt-tape] verify: shader %016llx: the tape's walk differs from the Evaluator's in its %s\n", static_cast<unsigned long long>(program.shaderHash), difference.c_str());
+    if (!ok) return;
+    results = std::move(expectedResults);
+    flat = std::move(expectedFlat);
+    activeSources = std::move(expectedActive);
+}
+
+}
+
+// The plan's tape (SrtTape) answers the capture walk (the plan's own materialization sources and
+// clean flat slots, with the flat walk); anything else, or a walk the tape cannot finish, is the
+// Evaluator's.
 bool EvaluateRuntimeSourcesImpl(const IrResourcePlan& program, std::span<const std::uint32_t> sources, const SrtRuntime& runtime, std::vector<DescriptorValue>& results, std::vector<std::uint32_t>& flat, bool evaluateFlat, std::span<const std::uint8_t> cleanFlatSlots, std::vector<std::uint8_t>& activeSources) {
+    const bool planInputs = evaluateFlat && sources.data() == program.materializationSources.data() && sources.size() == program.materializationSources.size() && cleanFlatSlots.data() == program.cleanFlatSlots.data() && cleanFlatSlots.size() == program.cleanFlatSlots.size();
+    if (planInputs) {
+        if (const auto* tape = SrtTape::For(program); tape != nullptr) {
+            const auto leavesBefore = runtime.readTrace != nullptr ? runtime.readTrace->leaves.size() : 0;
+            const auto readsBefore = runtime.readTrace != nullptr ? runtime.readTrace->otherReads.size() : 0;
+            if (tape->Run(program, runtime, results, flat, activeSources)) {
+                if (SrtTape::Verified()) verifyTape(program, runtime, results, flat, activeSources, leavesBefore, readsBefore);
+                return true;
+            }
+        }
+    }
+    return interpretRuntimeSources(program, sources, runtime, results, flat, evaluateFlat, cleanFlatSlots, activeSources);
+}
+
+namespace {
+
+bool interpretRuntimeSources(const IrResourcePlan& program, std::span<const std::uint32_t> sources, const SrtRuntime& runtime, std::vector<DescriptorValue>& results, std::vector<std::uint32_t>& flat, bool evaluateFlat, std::span<const std::uint8_t> cleanFlatSlots, std::vector<std::uint8_t>& activeSources) {
     failureReason().clear();
     static const bool debug = std::getenv("APS5_SRT_DEBUG") != nullptr;
     if (debug) {
@@ -144,6 +224,8 @@ bool EvaluateRuntimeSourcesImpl(const IrResourcePlan& program, std::span<const s
         flat = std::move(flattened);
     }
     return true;
+}
+
 }
 
 const std::string& RuntimeSourceFailureReason() {
