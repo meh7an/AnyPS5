@@ -2,9 +2,32 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ThreadScratch.hpp"
 #include <cstdlib>
 
 namespace AgcDriver::DriverDetail {
+
+namespace {
+
+// The thread's last precheck that let a draw through, for a draw of the same kind under the same
+// decode generation: every check after the empty-draw one reads only registers the generation
+// covers. One that asked the device (primitive restart on lists) is not memoized.
+// APS5_NO_PRECHECK_MEMO=1 checks every draw.
+struct PrecheckMemo {
+    std::uint64_t generation = 0;
+    bool indexed = false;
+    std::uint32_t indexSize = 0;
+    bool indirect = false;
+};
+
+struct PrecheckMemoTag;
+
+bool PrecheckMemoEnabled() {
+    static const bool enabled = std::getenv("APS5_NO_PRECHECK_MEMO") == nullptr;
+    return enabled;
+}
+
+}
 
 bool Driver::drawPrecheck() {
     static const bool precheck = std::getenv("APS5_NO_DRAW_PRECHECK") == nullptr;
@@ -13,6 +36,17 @@ bool Driver::drawPrecheck() {
 
 std::optional<DrawVerdict> Driver::precheckDraw(const QueueState& queue, const Submission& submission, std::span<const std::uint32_t> packet, const Pm4::DrawParameters& drawParameters, std::string& rejected, bool& traceIndirect) {
     if (!drawParameters.indirect && !drawParameters.indexed && (drawParameters.indexCount == 0 || drawParameters.instanceCount == 0)) return DrawVerdict::Nothing;
+    static const bool traceIndirectEnabled = std::getenv("APS5_TRACE_INDIRECT_DRAWS") != nullptr;
+    const auto traceReached = [&] {
+        traceIndirect = traceIndirectEnabled;
+        if (traceIndirect && drawParameters.indirect) std::fprintf(stderr, "[draw] indirect packet %s args 0x%llx count %u reached\n", Pm4::Name(packet[0]).c_str(), static_cast<unsigned long long>(drawParameters.indirect->arguments), drawParameters.indirect->count);
+    };
+    auto& memo = ThreadScratch<PrecheckMemo, PrecheckMemoTag>();
+    const bool memoized = PrecheckMemoEnabled() && queue.decodeGeneration != 0;
+    if (memoized && memo.generation == queue.decodeGeneration && memo.indexed == drawParameters.indexed && memo.indexSize == drawParameters.indexSize && memo.indirect == drawParameters.indirect.has_value()) {
+        traceReached();
+        return std::nullopt;
+    }
     if (const auto pass = Graphics::DecodeColorMetadataPass(queue)) {
         require(!drawParameters.indirect, "indirect CB metadata passes are unsupported");
         GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
@@ -33,9 +67,8 @@ std::optional<DrawVerdict> Driver::precheckDraw(const QueueState& queue, const S
         localDevice->DepthClearPass(*clear);
         return DrawVerdict::Drawn;
     }
-    static const bool traceIndirectEnabled = std::getenv("APS5_TRACE_INDIRECT_DRAWS") != nullptr;
-    traceIndirect = traceIndirectEnabled;
-    if (traceIndirect && drawParameters.indirect) std::fprintf(stderr, "[draw] indirect packet %s args 0x%llx count %u reached\n", Pm4::Name(packet[0]).c_str(), static_cast<unsigned long long>(drawParameters.indirect->arguments), drawParameters.indirect->count);
+    traceReached();
+    bool askedDevice = false;
     {
         const auto targetMask = queue.context.find(0x8e);
         const auto shaderMask = queue.context.find(0x8f);
@@ -55,6 +88,7 @@ std::optional<DrawVerdict> Driver::precheckDraw(const QueueState& queue, const S
             const bool strip = type == 3 || type == 5 || type == 6;
             const bool list = type == 1 || type == 2 || type == 4;
             const auto restartDevice = device.Load();
+            askedDevice = !strip;
             if (!strip && !(list && restartDevice != nullptr && restartDevice->PrimitiveListRestart())) {
                 rejected = "AGC graphics: primitive restart is only supported for strips, and for lists with VK_EXT_primitive_topology_list_restart";
                 return DrawVerdict::Rejected;
@@ -69,6 +103,7 @@ std::optional<DrawVerdict> Driver::precheckDraw(const QueueState& queue, const S
         rejected = Graphics::DrawRejection(queue, drawParameters.indexed);
         if (!rejected.empty()) return DrawVerdict::Rejected;
     }
+    if (memoized && !askedDevice) memo = {queue.decodeGeneration, drawParameters.indexed, drawParameters.indexSize, drawParameters.indirect.has_value()};
     return std::nullopt;
 }
 
