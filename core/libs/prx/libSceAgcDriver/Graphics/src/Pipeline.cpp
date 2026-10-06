@@ -355,11 +355,32 @@ void Pipeline::PushConstants(VkCommandBuffer commands, VkShaderStageFlags stages
 
 namespace {
 
+// A pipeline key written into the caller's buffer a value at a time: the buffer is sized ahead, so
+// a value is a copy, not a vector insert. Finish sets the key's size.
+class KeyWriter {
+public:
+    explicit KeyWriter(std::vector<std::byte>& key) : key(key) {
+        if (key.size() < 1024) key.resize(1024);
+    }
+
+    template<typename TValue>
+    void Append(const TValue& value) {
+        static_assert(std::is_trivially_copyable_v<TValue>);
+        if (size + sizeof(TValue) > key.size()) key.resize(2 * key.size());
+        std::memcpy(key.data() + size, &value, sizeof(TValue));
+        size += sizeof(TValue);
+    }
+
+    void Finish() { key.resize(size); }
+
+private:
+    std::vector<std::byte>& key;
+    std::size_t size = 0;
+};
+
 template<typename TValue>
-void append(std::vector<std::byte>& key, const TValue& value) {
-    static_assert(std::is_trivially_copyable_v<TValue>);
-    const auto bytes = std::as_bytes(std::span(&value, 1));
-    key.insert(key.end(), bytes.begin(), bytes.end());
+void append(KeyWriter& key, const TValue& value) {
+    key.Append(value);
 }
 
 // Everything the Pipeline objects are built from, into `key` (CachedPipeline passes its thread's
@@ -369,12 +390,10 @@ void append(std::vector<std::byte>& key, const TValue& value) {
 // id of their own.
 void pipelineKey(std::vector<std::byte>& key, const Context& context, const State& state, const VertexInputLayout& input, const ShaderResources& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout) {
     using Stage = ShaderRecompiler::ShaderStage;
-    key.clear();
-    // Room for a usual key (a few hundred bytes): growing it value by value reallocated it often.
-    key.reserve(1024);
-    append(key, context.device);
-    append(key, attachmentLayout);
-    append(key, shaders.size());
+    KeyWriter writer(key);
+    append(writer, context.device);
+    append(writer, attachmentLayout);
+    append(writer, shaders.size());
     for (const auto& shader : shaders) {
         Require(shader.program != nullptr, "missing compiled shader");
         const bool generated = state.rectList && (shader.stage == Stage::TessellationControl || shader.stage == Stage::TessellationEvaluation);
@@ -382,76 +401,77 @@ void pipelineKey(std::vector<std::byte>& key, const Context& context, const Stat
             key.clear();
             return;
         }
-        append(key, shader.stage);
-        append(key, generated ? std::uint64_t{0} : shader.program->variantId);
+        append(writer, shader.stage);
+        append(writer, generated ? std::uint64_t{0} : shader.program->variantId);
         // Where the stage's push constants sit in the block (AssemblePushConstants).
-        append(key, shader.pushConstantOffset);
+        append(writer, shader.pushConstantOffset);
     }
-    append(key, PushConstantStages(shaders));
-    append(key, input.bindings.size());
+    append(writer, PushConstantStages(shaders));
+    append(writer, input.bindings.size());
     for (const auto& binding : input.bindings) {
-        append(key, binding.binding);
-        append(key, binding.stride);
-        append(key, binding.inputRate);
+        append(writer, binding.binding);
+        append(writer, binding.stride);
+        append(writer, binding.inputRate);
     }
-    append(key, input.attributes.size());
+    append(writer, input.attributes.size());
     for (const auto& attribute : input.attributes) {
-        append(key, attribute.location);
-        append(key, attribute.binding);
-        append(key, attribute.format);
-        append(key, attribute.offset);
+        append(writer, attribute.location);
+        append(writer, attribute.binding);
+        append(writer, attribute.format);
+        append(writer, attribute.offset);
     }
-    append(key, resources.LayoutKey().size());
-    for (const auto word : resources.LayoutKey()) append(key, word);
-    append(key, state.hasColorTarget);
-    append(key, state.rectList);
-    append(key, state.topology);
-    append(key, state.primitiveRestart);
-    append(key, state.cullMode);
-    append(key, state.frontFace);
-    append(key, state.negativeOneToOne);
-    append(key, state.depthClamp && context.depthClamp);
-    append(key, state.blends.size());
-    for (const auto& blend : state.blends) append(key, blend);
-    for (const auto value : state.blendConstants) append(key, value);
-    append(key, state.colors.size());
-    for (const auto& color : state.colors) append(key, color.format);
+    append(writer, resources.LayoutKey().size());
+    for (const auto word : resources.LayoutKey()) append(writer, word);
+    append(writer, state.hasColorTarget);
+    append(writer, state.rectList);
+    append(writer, state.topology);
+    append(writer, state.primitiveRestart);
+    append(writer, state.cullMode);
+    append(writer, state.frontFace);
+    append(writer, state.negativeOneToOne);
+    append(writer, state.depthClamp && context.depthClamp);
+    append(writer, state.blends.size());
+    for (const auto& blend : state.blends) append(writer, blend);
+    for (const auto value : state.blendConstants) append(writer, value);
+    append(writer, state.colors.size());
+    for (const auto& color : state.colors) append(writer, color.format);
     if (state.blends.size() != state.colors.size()) {
-        for (const auto& color : state.colors) append(key, color.exportIndex);
+        for (const auto& color : state.colors) append(writer, color.exportIndex);
     }
-    append(key, state.depth.has_value());
+    append(writer, state.depth.has_value());
     if (state.depth) {
-        append(key, state.depth->format);
-        append(key, state.depthTest);
-        append(key, state.depthWrite);
-        append(key, state.depthCompare);
-        append(key, state.depthBoundsTest);
-        append(key, state.depthBias);
-        append(key, state.stencilTest);
-        append(key, state.stencilFront);
-        append(key, state.stencilBack);
+        append(writer, state.depth->format);
+        append(writer, state.depthTest);
+        append(writer, state.depthWrite);
+        append(writer, state.depthCompare);
+        append(writer, state.depthBoundsTest);
+        append(writer, state.depthBias);
+        append(writer, state.stencilTest);
+        append(writer, state.stencilFront);
+        append(writer, state.stencilBack);
     }
-    append(key, state.stages.mesh.has_value());
+    append(writer, state.stages.mesh.has_value());
     if (state.stages.mesh) {
         const auto& mesh = *state.stages.mesh;
-        append(key, mesh.inputPrimitive);
-        append(key, mesh.primitivesPerGroup);
-        append(key, mesh.verticesPerGroup);
-        append(key, mesh.maxVertices);
-        append(key, mesh.maxPrimitives);
-        append(key, mesh.threadsPerGroup);
-        append(key, mesh.ldsSizeDwords);
-        append(key, mesh.provokingVertex);
+        append(writer, mesh.inputPrimitive);
+        append(writer, mesh.primitivesPerGroup);
+        append(writer, mesh.verticesPerGroup);
+        append(writer, mesh.maxVertices);
+        append(writer, mesh.maxPrimitives);
+        append(writer, mesh.threadsPerGroup);
+        append(writer, mesh.ldsSizeDwords);
+        append(writer, mesh.provokingVertex);
     }
-    append(key, state.stages.tessellation.has_value());
+    append(writer, state.stages.tessellation.has_value());
     if (state.stages.tessellation) {
         const auto& tessellation = *state.stages.tessellation;
-        append(key, tessellation.inputControlPoints);
-        append(key, tessellation.outputControlPoints);
-        append(key, tessellation.domain);
-        append(key, tessellation.partitioning);
-        append(key, tessellation.outputTopology);
+        append(writer, tessellation.inputControlPoints);
+        append(writer, tessellation.outputControlPoints);
+        append(writer, tessellation.domain);
+        append(writer, tessellation.partitioning);
+        append(writer, tessellation.outputTopology);
     }
+    writer.Finish();
 }
 
 // FNV-1a over eight bytes at a time (and the tail byte-wise): every draw hashes its key, and a byte
