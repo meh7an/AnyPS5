@@ -142,6 +142,7 @@ std::vector<std::uint32_t> GuestImagesDescriptor(const std::vector<std::uint32_t
         }
         if (i == 0u) {
             dwordCount = value.dwordCount;
+            result.reserve(resources.size() * dwordCount);
         } else if (value.dwordCount != dwordCount) {
             fail("DescriptorBindingBuilder::Populate guest image descriptors have inconsistent widths");
         }
@@ -166,6 +167,7 @@ std::vector<std::uint32_t> GuestSamplersDescriptor(const std::vector<std::uint32
         }
         if (i == 0u) {
             dwordCount = value.dwordCount;
+            result.reserve(resources.size() * dwordCount);
         } else if (value.dwordCount != dwordCount) {
             fail("DescriptorBindingBuilder::Populate guest sampler descriptors have inconsistent widths");
         }
@@ -303,7 +305,7 @@ void DescriptorBindingBuilder::Populate(BindingAllocationResult& allocation, con
 }
 
 void DescriptorBindingBuilder::Populate(const IrBindingLayout& layout, const ShaderInfo& info, IrShaderStage stage, std::uint32_t userDataBase, const ResourceSnapshot& snapshot, const std::array<std::uint32_t, 3>& partialThreads, std::vector<DescriptorBinding>& populated, std::vector<std::byte>& pushConstants) const {
-    const std::vector<std::uint32_t> shaderData = ShaderDataDwordsFor(layout, userDataBase, snapshot, partialThreads);
+    std::vector<std::uint32_t> shaderData = ShaderDataDwordsFor(layout, userDataBase, snapshot, partialThreads);
     const UnnormalizedProof unnormalized = ProveUnnormalized(info, snapshot);
     const std::vector<std::uint32_t> samplerElements = SamplerElements(layout, info);
 
@@ -369,7 +371,8 @@ void DescriptorBindingBuilder::Populate(const IrBindingLayout& layout, const Sha
             if (layout.UsesPushData()) {
                 fail("DescriptorBindingBuilder::Populate shader-data binding must not exist when push data is used");
             }
-            physical.guestDescriptor = shaderData;
+            // The layout's one shader-data binding, and push data is unused: the words are not read again.
+            physical.guestDescriptor = std::move(shaderData);
             break;
         case DescriptorRole::Gds:
         case DescriptorRole::BdaPagetable:
