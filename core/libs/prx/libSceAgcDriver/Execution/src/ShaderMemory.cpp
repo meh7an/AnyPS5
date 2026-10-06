@@ -219,7 +219,7 @@ std::shared_ptr<const ShaderRecompiler::ResourceCapture> ShaderMemory::Capture(c
     auto& totals = CaptureTotals();
     // The hook's GPU waits made anywhere inside the capture.
     const auto waitedBefore = profile ? WaitedMs() : 0.0;
-    const auto started = std::chrono::steady_clock::now();
+    const auto started = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     ShaderRecompiler::SrtRuntime runtime;
     runtime.userData = request.context.userData;
     runtime.shaderBase = request.shader.codeAddress;

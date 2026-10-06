@@ -491,7 +491,6 @@ public:
         double gpuStartNs = 0;
         double gpuEndNs = 0;
         std::chrono::steady_clock::time_point submittedAt{};
-        std::chrono::steady_clock::time_point fenceSeenAt{};
         std::uint64_t readGeneration = 0;
         std::vector<std::pair<std::uint64_t, std::uint64_t>> reads;
     };

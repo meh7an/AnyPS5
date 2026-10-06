@@ -73,7 +73,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     static double captureMs = 0, keyMs = 0, recompileMs = 0, deviceMs = 0;
     static std::uint64_t cacheHits = 0;
     static std::uint64_t dispatches = 0;
-    auto lap = std::chrono::steady_clock::now();
+    auto lap = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
 
     std::array<double, DriverPhaseCount> phaseMs{};
     auto phaseLap = lap;
@@ -209,13 +209,13 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
             captureMs += phaseTiming.Elapsed();
             phaseTiming.Phase(PhaseCapture);
             if (dumpShaders) static_cast<void>(dumpRequest(address, request));
-            const auto started = std::chrono::steady_clock::now();
+            const auto started = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
 
             static const bool reuseCapture = std::getenv("APS5_NO_CAPTURE_REUSE") == nullptr;
             bool memoHit = false;
             compiledResult = reuseCapture ? ShaderRecompiler::Recompile(request, *capture, &memoHit) : std::make_shared<const ShaderRecompiler::RecompileResult>(ShaderRecompiler::Recompile(request));
             if (compiledResult->cacheHit || memoHit) ++cacheHits;
-            const auto elapsed = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
+            const auto elapsed = profile ? std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count() : 0.0;
             static double totalMs = 0;
             totalMs += elapsed;
             if (profile && elapsed > 200) std::fprintf(stderr, "[gpu] compute shader 0x%llx recompile took %.0f ms (%zu SPIR-V words, %zu captured regions, total %.1f s)\n", static_cast<unsigned long long>(address), elapsed, compiledResult->spirv.size(), captured.size(), totalMs / 1000);

@@ -2848,7 +2848,7 @@ void Recorder::Submit() {
         submission.signalSemaphoreCount = 1;
         submission.pSignalSemaphores = &timeline;
     }
-    const auto submitStart = std::chrono::steady_clock::now();
+    const auto submitStart = DrawProfiled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     Check(function(queueSubmit, "vkQueueSubmit")(context.queue, 1, &submission, batch->fence), "vkQueueSubmit recorder");
     batch->submitted = true;
     batch->serial = ++submissions;
@@ -3263,7 +3263,7 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
         static double waitedMs = 0;
         static std::uint64_t waits = 0;
         static auto lastReport = std::chrono::steady_clock::now();
-        const auto waitStart = std::chrono::steady_clock::now();
+        const auto waitStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         // A fence still unsignaled here makes this a real GPU wait under the mutex (finish runs
         // under it): the [lock] line's 'locked GPU waits'.
         const bool signaledAtStart = !profile || context.Function<PFN_vkGetFenceStatus>("vkGetFenceStatus")(context.device, batch->fence) == VK_SUCCESS;
@@ -3319,7 +3319,6 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
         entry.gpuStartNs = batch->gpuStartNs;
         entry.gpuEndNs = batch->gpuEndNs;
         entry.submittedAt = batch->submittedAt;
-        entry.fenceSeenAt = std::chrono::steady_clock::now();
         entry.readGeneration = batch->readGeneration;
         entry.reads.clear();
         if (FlipReadCheck()) {

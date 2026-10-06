@@ -42,6 +42,7 @@ std::chrono::steady_clock::time_point& Driver::packetStartedAt() {
 }
 
 double DispatchPhaseTiming::Elapsed() {
+    if (!profile) return 0.0;
     const auto now = std::chrono::steady_clock::now();
     const auto ms = std::chrono::duration<double, std::milli>(now - lap).count();
     lap = now;
