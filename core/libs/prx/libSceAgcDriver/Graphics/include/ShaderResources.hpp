@@ -166,7 +166,9 @@ public:
     // recorder's upload chunk on every draw instead of keeping a buffer of its own (see
     // Recorder::DrawUpload); APS5_DRAW_UPLOAD_MAX, default 4096, 0 keeps every copy in its own buffer.
     static std::size_t DrawUploadLimit();
-    std::optional<std::vector<MovedBuffer>> MovedReadOnlyBuffers(std::span<const CompiledShader> shaders, Recorder& recorder) const;
+    // Whether this object can serve the stages with only read-only buffers moved; `moved` (emptied
+    // first) receives them, at most one entry per allocation.
+    bool MovedReadOnlyBuffers(std::span<const CompiledShader> shaders, Recorder& recorder, std::vector<MovedBuffer>& moved) const;
     void WriteBack();
     // Deferred completion: MarkGpuWrites registers the results the recorded work leaves on the GPU
     // (storage images stay there; buffer ranges are noted so CPU reads wait); WriteBackBuffers runs

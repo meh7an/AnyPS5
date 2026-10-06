@@ -1070,7 +1070,8 @@ std::shared_ptr<StorageTexture> refreshResidentTarget(const Context& context, co
 // stages repeat, or a fresh build.
 struct ResolvedResources {
     std::shared_ptr<ShaderResources> resources;
-    std::vector<ShaderResources::MovedBuffer> moved;
+    // A hit's moved buffers, in the list Draw lends resolveDrawResources.
+    std::span<const ShaderResources::MovedBuffer> moved;
     ResourceCache::Key contentKey;
     bool cacheable = false;
     const ShaderResources::BuildTiming* built = nullptr;
@@ -1119,7 +1120,7 @@ LookupParts& lookupParts() {
     return parts;
 }
 
-ResolvedResources resolveDrawResources(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::uint64_t indexBytes, bool recordable, bool keepKey, DrawOutcome& outcome, DrawTimer& timer) {
+ResolvedResources resolveDrawResources(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::uint64_t indexBytes, bool recordable, bool keepKey, std::vector<ShaderResources::MovedBuffer>& movedStorage, DrawOutcome& outcome, DrawTimer& timer) {
     ResolvedResources resolved;
     auto& parts = lookupParts();
     parts.start();
@@ -1149,14 +1150,13 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
             const bool valid = cached->Revalidate(shaders);
             parts.mark(LookupParts::Revalidate);
             auto* recorder = Recorder::Active();
-            std::optional<std::vector<ShaderResources::MovedBuffer>> moved;
-            if (valid && recorder != nullptr) moved = cached->MovedReadOnlyBuffers(shaders, *recorder);
+            const bool served = valid && recorder != nullptr && cached->MovedReadOnlyBuffers(shaders, *recorder, movedStorage);
             parts.mark(LookupParts::Moved);
-            if (moved.has_value()) {
+            if (served) {
                 if (trimKey) CheckBufferAliases(shaders, state.color, draw.indexAddress, indexBytes);
                 parts.mark(LookupParts::Aliases);
                 resolved.resources = std::move(cached);
-                resolved.moved = std::move(*moved);
+                resolved.moved = movedStorage;
                 outcome.kind = KindTemplateHit;
                 countCache(&DrawProfile::cacheHits);
             } else if (valid) {
@@ -1851,7 +1851,10 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     const bool recordDraws = RecordDraws();
     auto* recorder = Recorder::Active();
     const bool recordable = recordDraws && recorder != nullptr && dumpLimit == 0 && std::all_of(targets.begin(), targets.end(), [](const TargetBinding& binding) { return binding.resident != nullptr; });
-    auto resolved = resolveDrawResources(context, state, draw, shaders, snapshots, indexBytes, recordable, recipeOut != nullptr && DrawRecipes(), outcome, timer);
+    // A hit's moved buffers, in the thread's list: PrepareDrawBindings reads them within this draw.
+    struct MovedTag {};
+    ThreadScratchLease<std::vector<ShaderResources::MovedBuffer>, MovedTag> movedList;
+    auto resolved = resolveDrawResources(context, state, draw, shaders, snapshots, indexBytes, recordable, recipeOut != nullptr && DrawRecipes(), movedList.value, outcome, timer);
     auto& resources = resolved.resources;
     const auto& contentKey = resolved.contentKey;
     const bool cacheable = resolved.cacheable;
@@ -1963,7 +1966,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     const bool lean = recorded && !drawTransitions;
     if (!lean && !resolved.moved.empty()) {
         resolved.resources = std::make_shared<ShaderResources>(context, shaders, state.color, draw.indexAddress, static_cast<std::size_t>(indexBytes), snapshots);
-        resolved.moved.clear();
+        resolved.moved = {};
     }
     APS5_LOG_CHARS_OUT_DEBUG("Creating Pipeline");
     // The state is copied only when a mask must change.
