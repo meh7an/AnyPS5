@@ -1,7 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ShaderMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
-#include "Optimization/RequestMemoryView.hpp"
 #include "Optimization/ResourceMaterializer.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include <algorithm>
@@ -119,11 +118,17 @@ void ShaderMemory::WordFlags::forEachRun(TVisit&& visit) const {
 }
 
 ShaderMemory::ShaderMemory(std::span<const ShaderRecompiler::MemoryRegion> regions, PendingWriteQuery pendingWrite, PendingWriteObserver observe, HookWaitCounter hookWaits) : pendingWrite(pendingWrite), observe(observe), hookWaits(hookWaits) {
-    // Validated (no empty or overlapping region, so no two share an address), then sorted.
-    const ShaderRecompiler::RequestMemoryView validated(regions);
+    // Sorted, then validated: no empty or overlapping region, so no two share an address.
     initial.reserve(regions.size());
-    for (const auto& region : regions) initial.emplace_back(region.guestAddress, region.bytes);
+    for (const auto& region : regions) {
+        if (region.bytes.empty()) throw std::runtime_error("ShaderMemory: memory region is empty");
+        if (region.guestAddress > std::numeric_limits<std::uint64_t>::max() - region.bytes.size()) throw std::runtime_error("ShaderMemory: memory region address range overflows");
+        initial.emplace_back(region.guestAddress, region.bytes);
+    }
     std::sort(initial.begin(), initial.end(), [](const auto& left, const auto& right) { return left.first < right.first; });
+    for (std::size_t index = 1; index < initial.size(); ++index) {
+        if (initial[index].first < initial[index - 1].first + initial[index - 1].second.size()) throw std::runtime_error("ShaderMemory: memory regions overlap");
+    }
 }
 
 ShaderMemory::Page& ShaderMemory::page(std::uint64_t base) {
