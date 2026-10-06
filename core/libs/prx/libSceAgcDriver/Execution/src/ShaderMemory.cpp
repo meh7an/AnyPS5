@@ -6,6 +6,7 @@
 #include "Optimization/ResourceProgram.hpp"
 #include <algorithm>
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -85,6 +86,36 @@ double WaitedMs() {
 
 void ShaderMemory::SetWaitedMsProvider(WaitedMsProvider provider) {
     waitedMsProvider.store(provider, std::memory_order_release);
+}
+
+bool ShaderMemory::WordFlags::none() const {
+    return std::all_of(bits.begin(), bits.end(), [](std::uint64_t word) { return word == 0; });
+}
+
+template<typename TVisit>
+void ShaderMemory::WordFlags::forEachRun(TVisit&& visit) const {
+    constexpr std::size_t Words = PageWords / 64;
+    std::size_t word = 0;
+    std::size_t from = 0;
+    while (true) {
+        auto set = bits[word] & (~std::uint64_t{0} << from);
+        while (set == 0) {
+            if (++word == Words) return;
+            set = bits[word];
+        }
+        const auto first = word * 64 + static_cast<std::size_t>(std::countr_zero(set));
+        auto clear = ~bits[word] & (~std::uint64_t{0} << (first % 64));
+        while (clear == 0) {
+            if (++word == Words) {
+                visit(first, Words * 64);
+                return;
+            }
+            clear = ~bits[word];
+        }
+        const auto end = word * 64 + static_cast<std::size_t>(std::countr_zero(clear));
+        visit(first, end);
+        from = end % 64;
+    }
 }
 
 ShaderMemory::ShaderMemory(std::span<const ShaderRecompiler::MemoryRegion> regions, PendingWriteQuery pendingWrite, PendingWriteObserver observe, HookWaitCounter hookWaits) : pendingWrite(pendingWrite), observe(observe), hookWaits(hookWaits) {
@@ -264,15 +295,7 @@ void ShaderMemory::Regions(std::vector<ShaderRecompiler::MemoryRegion>& result) 
             result.push_back({next->first, next->second});
             ++next;
         }
-        for (std::size_t index = 0; index < PageWords;) {
-            if (!page.read.test(index)) {
-                ++index;
-                continue;
-            }
-            const auto first = index;
-            while (index < PageWords && page.read.test(index)) ++index;
-            result.push_back({base + first * sizeof(std::uint32_t), std::as_bytes(std::span(page.words).subspan(first, index - first))});
-        }
+        page.read.forEachRun([&](std::size_t first, std::size_t end) { result.push_back({base + first * sizeof(std::uint32_t), std::as_bytes(std::span(page.words).subspan(first, end - first))}); });
     }
     for (; next != initial.end(); ++next) result.push_back({next->first, next->second});
 }
@@ -281,15 +304,7 @@ std::vector<ShaderRecompiler::MemoryRegion> ShaderMemory::TakeRecentRegions() {
     std::vector<ShaderRecompiler::MemoryRegion> result;
     for (auto& [base, page] : pages) {
         if (page.recent.none()) continue;
-        for (std::size_t index = 0; index < PageWords;) {
-            if (!page.recent.test(index)) {
-                ++index;
-                continue;
-            }
-            const auto first = index;
-            while (index < PageWords && page.recent.test(index)) ++index;
-            result.push_back({base + first * sizeof(std::uint32_t), std::as_bytes(std::span(page.words).subspan(first, index - first))});
-        }
+        page.recent.forEachRun([&](std::size_t first, std::size_t end) { result.push_back({base + first * sizeof(std::uint32_t), std::as_bytes(std::span(page.words).subspan(first, end - first))}); });
         page.recent.reset();
     }
     return result;

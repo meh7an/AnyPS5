@@ -3,7 +3,6 @@
 
 #include "Recompiler.hpp"
 #include <array>
-#include <bitset>
 #include <cstddef>
 #include <cstdint>
 #include <map>
@@ -75,11 +74,25 @@ private:
     static constexpr std::size_t PageBytes = 4096;
     static constexpr std::size_t PageWords = PageBytes / sizeof(std::uint32_t);
 
+    // A flag per page word, kept in 64-bit words so a scan skips 64 clear flags at a time.
+    struct WordFlags {
+        std::array<std::uint64_t, PageWords / 64> bits{};
+
+        [[nodiscard]] bool test(std::size_t index) const { return (bits[index / 64] >> (index % 64) & 1u) != 0; }
+        void set(std::size_t index) { bits[index / 64] |= std::uint64_t{1} << (index % 64); }
+        void set() { bits.fill(~std::uint64_t{0}); }
+        void reset() { bits.fill(0); }
+        [[nodiscard]] bool none() const;
+        // Calls visit(first, end) for each run of set flags, in order.
+        template<typename TVisit>
+        void forEachRun(TVisit&& visit) const;
+    };
+
     struct Page {
         std::array<std::uint32_t, PageWords> words{};
-        std::bitset<PageWords> valid;
-        std::bitset<PageWords> read;
-        std::bitset<PageWords> recent;
+        WordFlags valid;
+        WordFlags read;
+        WordFlags recent;
         bool wordwise = false;
     };
 
