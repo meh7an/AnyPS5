@@ -19,10 +19,9 @@ std::shared_ptr<DrawDecode> Driver::decodeDraw(const QueueState& queue, const Su
     const auto prepare = [&](std::uint64_t address, std::uint8_t type, Stage stage, std::uint32_t rsrc2, std::uint32_t userDataBase) {
         const bool nullPixel = stage == Stage::Fragment && (address == 0 || pixelSkipped);
         if (nullPixel) address = NullPixelProgramAddress();
-        auto it = submission.shaders->upper_bound(address);
-        require(it != submission.shaders->begin(), "graphics program does not belong to a registered shader");
-        --it;
-        const auto& snapshot = *it->second;
+        const auto* registered = RegisteredShaderAt(submission.shaders, address);
+        require(registered != nullptr, "graphics program does not belong to a registered shader");
+        const auto& snapshot = **registered;
         require(address - snapshot.codeAddress < snapshot.code.size() * sizeof(std::uint32_t), "graphics program is outside registered shader code");
         require(snapshot.type == type, "graphics program refers to an incompatible shader binary type");
         Graphics::NoteRegisterRead(Graphics::RegisterBank::Shader, rsrc2);
@@ -36,7 +35,7 @@ std::shared_ptr<DrawDecode> Driver::decodeDraw(const QueueState& queue, const Su
             8,
             {},
             {{{snapshot.codeAddress, std::as_bytes(std::span(snapshot.code))}, {snapshot.headerAddress, snapshot.header}}},
-            it->second,
+            *registered,
             codeOffset
         };
         // One allocation: the words, and the 8 a merged stage puts in front (initializeMerged).
@@ -81,10 +80,9 @@ std::shared_ptr<DrawDecode> Driver::decodeDraw(const QueueState& queue, const Su
             append(0x0c8, 2, Stage::TessellationEvaluation, 0x08b, 0x08c, Role::Domain);
         } else if (graphics.stages.path == Graphics::ShaderPath::Geometry) {
             const auto frontAddress = programAddress(0xc8);
-            auto snapshot = submission.shaders->upper_bound(frontAddress);
-            require(snapshot != submission.shaders->begin(), "geometry front program is not registered");
-            --snapshot;
-            const auto type = snapshot->second->type;
+            const auto* front = RegisteredShaderAt(submission.shaders, frontAddress);
+            require(front != nullptr, "geometry front program is not registered");
+            const auto type = (*front)->type;
             require(type == 2 || type == 4, "invalid geometry front binary type");
             append(0xc8, type, Stage::Mesh, 0x8b, 0x8c, Role::Main);
             initializeMerged(programs.back(), 0x82, type == 4);

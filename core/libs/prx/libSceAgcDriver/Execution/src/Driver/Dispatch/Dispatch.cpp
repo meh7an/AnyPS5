@@ -12,12 +12,8 @@ namespace AgcDriver::DriverDetail {
 
 void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::uint64_t indirectArguments) {
     const auto address = (static_cast<std::uint64_t>(readRegister(queue.shader, 0x20c)) << 8u) | (static_cast<std::uint64_t>(readRegister(queue.shader, 0x20d) & 0xffu) << 40u);
-    auto it = submission.shaders->upper_bound(address);
     std::shared_ptr<const ShaderSnapshot> registeredShader;
-    if (it != submission.shaders->begin()) {
-        --it;
-        if (address - it->second->codeAddress < it->second->code.size() * sizeof(std::uint32_t)) registeredShader = it->second;
-    }
+    if (const auto* registered = RegisteredShaderAt(submission.shaders, address); registered != nullptr && address - (*registered)->codeAddress < (*registered)->code.size() * sizeof(std::uint32_t)) registeredShader = *registered;
     if (!registeredShader) registeredShader = ReadRawComputeShader(address);
     const auto& snapshot = *registeredShader;
     require(snapshot.type == 0, "compute program refers to a non-compute shader");

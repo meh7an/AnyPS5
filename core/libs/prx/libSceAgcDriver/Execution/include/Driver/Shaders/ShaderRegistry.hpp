@@ -38,6 +38,11 @@ struct ShaderSnapshot {
 
 using ShaderRegistry = std::map<std::uint64_t, std::shared_ptr<const ShaderSnapshot>>;
 
+// The registered shader starting last at or below `address` (whose code may hold it), or null.
+// Memoized per thread for the registry last asked about, which the memo holds: Driver::RegisterShader
+// then copies that registry instead of changing it in place, so a memoized entry stays valid.
+const std::shared_ptr<const ShaderSnapshot>* RegisteredShaderAt(const std::shared_ptr<const ShaderRegistry>& registry, std::uint64_t address);
+
 bool FailureMemo();
 std::shared_ptr<const ShaderSnapshot> ReadRawComputeShader(std::uint64_t address);
 

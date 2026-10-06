@@ -2,8 +2,10 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ThreadScratch.hpp"
 #include "CacheKey.hpp"
 #include "Optimization/ResourceProgram.hpp"
+#include <array>
 #include <cstdlib>
 #include <cstring>
 #include <list>
@@ -11,6 +13,39 @@
 #include "RdnaDecoder/RdnaInstructionDecoder.hpp"
 
 namespace AgcDriver::DriverDetail {
+
+namespace {
+
+// RegisteredShaderAt's memo: a direct-mapped table of lookups in one registry. decodeDraw looked up
+// each program of every draw in the registry's tree, a walk of cold nodes.
+struct RegisteredShaderMemo {
+    static constexpr std::size_t Entries = 16;
+    struct Entry {
+        std::uint64_t address = 0;
+        const std::shared_ptr<const ShaderSnapshot>* shader = nullptr;
+    };
+    std::shared_ptr<const ShaderRegistry> registry;
+    std::array<Entry, Entries> entries{};
+};
+
+struct RegisteredShaderMemoTag;
+
+}
+
+const std::shared_ptr<const ShaderSnapshot>* RegisteredShaderAt(const std::shared_ptr<const ShaderRegistry>& registry, std::uint64_t address) {
+    auto& memo = ThreadScratch<RegisteredShaderMemo, RegisteredShaderMemoTag>();
+    if (memo.registry != registry) {
+        memo.registry = registry;
+        memo.entries = {};
+    }
+    auto& entry = memo.entries[(address >> 8u) % RegisteredShaderMemo::Entries];
+    if (entry.shader != nullptr && entry.address == address) return entry.shader;
+    auto it = registry->upper_bound(address);
+    if (it == registry->begin()) return nullptr;
+    --it;
+    entry = {address, &it->second};
+    return entry.shader;
+}
 
 std::shared_ptr<const ShaderSnapshot> ReadRawComputeShader(std::uint64_t address) {
     GuestMemory::CheckRange(reinterpret_cast<const void*>(address), sizeof(std::uint32_t), 256);
