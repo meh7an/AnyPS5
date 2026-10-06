@@ -6,6 +6,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/InlineList.hpp"
 #include <algorithm>
 #include <atomic>
 #include <memory>
@@ -2970,33 +2971,6 @@ BindingParts& bindingParts() {
     static BindingParts parts;
     return parts;
 }
-
-// A list whose first N elements live on the stack: the per-draw scratch lists of
-// PrepareDrawBindings hold a handful of entries, and a heap allocation each cost more than filling them.
-template <typename T, std::size_t N>
-class InlineList {
-public:
-    void push_back(const T& value) {
-        if (count < N) {
-            local[count] = value;
-        } else {
-            if (heap.empty()) heap.assign(local.begin(), local.end());
-            heap.push_back(value);
-        }
-        ++count;
-    }
-    T* data() { return count <= N ? local.data() : heap.data(); }
-    std::size_t size() const { return count; }
-    bool empty() const { return count == 0; }
-    T& operator[](std::size_t index) { return data()[index]; }
-    T* begin() { return data(); }
-    T* end() { return data() + count; }
-
-private:
-    std::array<T, N> local{};
-    std::vector<T> heap;
-    std::size_t count = 0;
-};
 
 }
 

@@ -785,9 +785,9 @@ struct DrawInputs {
     VkDeviceSize indexOffset = 0;
     std::uint32_t maxIndex = 0;
     VertexInputLayout vertexInput;
-    std::vector<std::shared_ptr<Buffer>> vertexBuffers;
-    std::vector<VkBuffer> vertexHandles;
-    std::vector<VkDeviceSize> vertexOffsets;
+    InlineList<std::shared_ptr<Buffer>, 16> vertexBuffers;
+    InlineList<VkBuffer, 16> vertexHandles;
+    InlineList<VkDeviceSize, 16> vertexOffsets;
     // A bit per color target the pixel shader exports to (CachedFragmentOutputs).
     std::uint32_t fragmentOutputs = 0;
     VkPipelineStageFlags shaderStages = 0;
@@ -982,8 +982,7 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         Require(draw.firstVertex <= std::numeric_limits<std::uint32_t>::max() - inputs.maxIndex, "indexed draw vertex range overflow");
         inputs.maxIndex += draw.firstVertex;
     }
-    std::vector<VertexFetch> fetches;
-    fetches.reserve(attributes.size());
+    InlineList<VertexFetch, 16> fetches;
     for (const auto& attribute : attributes) {
         // An indirect draw's counts are unknown here: the descriptor's whole range is copied.
         const auto bytes = args != nullptr ? VertexBufferExtent(attribute) : VertexBufferReadSize(attribute, inputs.maxIndex, draw.instanceCount, draw.firstInstance);
@@ -992,7 +991,7 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         Require(!state.hasColorTarget || address + bytes <= state.color.address || state.color.address + state.color.bytes <= address, "vertex buffer aliases the render target");
         fetches.push_back({address, address + bytes, (fields[1] >> 16u) & 0x3fffu, attribute.fetchIndex, DecodeVertexFormat(attribute).alignment});
     }
-    const auto plan = PlanVertexCopies(fetches);
+    const auto plan = PlanVertexCopies(std::span<const VertexFetch>(fetches.data(), fetches.size()));
     parts.mark(VertexParts::Fetches);
     // Where each copy starts in its buffer (non-zero for upload chunk slices).
     std::array<VkDeviceSize, 16> localBases{};
@@ -1002,8 +1001,6 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         heapBases.assign(plan.copies.size(), 0);
         bases = heapBases.data();
     }
-    inputs.vertexBuffers.reserve(plan.copies.size());
-    inputs.vertexHandles.reserve(attributes.size());
     for (std::size_t copyIndex = 0; copyIndex < plan.copies.size(); ++copyIndex) {
         const auto [begin, end] = plan.copies[copyIndex];
         const auto bytes = static_cast<std::size_t>(end - begin);
@@ -1340,7 +1337,7 @@ struct Kept {
     std::shared_ptr<Pipeline> pipeline;
     std::shared_ptr<Framebuffer> framebuffer;
     std::shared_ptr<Buffer> indices;
-    std::vector<std::shared_ptr<Buffer>> vertexBuffers;
+    InlineList<std::shared_ptr<Buffer>, 16> vertexBuffers;
     std::vector<std::shared_ptr<StorageTexture>> targets;
     std::unique_ptr<DeviceBuffer> scratch;
 };

@@ -2,6 +2,7 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_VERTEXINPUT_HPP
 
 #include "prx/libSceAgcDriver/Graphics/include/Shaders.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/InlineList.hpp"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -91,9 +92,10 @@ inline std::string VertexAttributeSignature(const ShaderRecompiler::VertexAttrib
     return std::string(format.scalar) + (attribute.components == 1 ? "" : "x" + std::to_string(attribute.components));
 }
 
+// Built for every draw: inline lists, so a draw's handful of attributes allocates nothing.
 struct VertexInputLayout {
-    std::vector<VkVertexInputBindingDescription> bindings;
-    std::vector<VkVertexInputAttributeDescription> attributes;
+    InlineList<VkVertexInputBindingDescription, 16> bindings;
+    InlineList<VkVertexInputAttributeDescription, 16> attributes;
 };
 
 // Whether the device fetches `format` as a vertex attribute. Every draw's layout asks about each of
@@ -131,8 +133,6 @@ inline bool VertexFormatSupported(const Context& context, VkFormat format) {
 inline VertexInputLayout BuildVertexInputLayout(const Context& context, std::span<const ShaderRecompiler::VertexAttribute> attributes) {
     Require(attributes.size() <= context.limits.maxVertexInputBindings && attributes.size() <= context.limits.maxVertexInputAttributes, "vertex input count exceeds device limits");
     VertexInputLayout result;
-    result.bindings.reserve(attributes.size());
-    result.attributes.reserve(attributes.size());
     // Locations seen: a bit each below 64 (every device's attribute limit so far), a set above.
     std::uint64_t lowLocations = 0;
     std::set<std::uint32_t> highLocations;
@@ -200,16 +200,15 @@ struct VertexFetch {
 };
 
 struct VertexCopyPlan {
-    std::vector<std::pair<std::uint64_t, std::uint64_t>> copies;
-    std::vector<std::size_t> copyOf;
-    std::vector<std::uint64_t> offsets;
+    InlineList<std::pair<std::uint64_t, std::uint64_t>, 16> copies;
+    InlineList<std::size_t, 16> copyOf;
+    InlineList<std::uint64_t, 16> offsets;
 };
 
 inline VertexCopyPlan PlanVertexCopies(std::span<const VertexFetch> fetches) {
     VertexCopyPlan plan;
     plan.copyOf.assign(fetches.size(), 0);
     plan.offsets.assign(fetches.size(), 0);
-    plan.copies.reserve(fetches.size());
     // By stride, fetch index and address, stable: an insertion sort on the stack (a draw fetches a
     // handful of attributes; a stable_sort allocated a buffer every draw).
     std::array<std::size_t, 16> localOrder{};
@@ -241,7 +240,7 @@ inline VertexCopyPlan PlanVertexCopies(std::span<const VertexFetch> fetches) {
         const bool joins = lead != fetches.size() && fetch.stride != 0 && fetches[lead].stride == fetch.stride && fetches[lead].fetchIndex == fetch.fetchIndex && fetch.begin - fetches[lead].begin < fetch.stride && (fetch.begin - fetches[lead].begin) % fetch.alignment == 0;
         if (!joins) {
             lead = i;
-            plan.copies.emplace_back(fetch.begin, fetch.end);
+            plan.copies.push_back({fetch.begin, fetch.end});
         }
         auto& copy = plan.copies.back();
         copy.second = std::max(copy.second, fetch.end);

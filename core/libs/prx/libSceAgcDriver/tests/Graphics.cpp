@@ -2448,7 +2448,8 @@ void vertexCopyTests() {
         const std::array<VertexFetch, 3> fetches{{{0x1018, 0x1018 + 32 * 9 + 8, 32, 0, 4}, {0x1000, 0x1000 + 32 * 9 + 12, 32, 0, 4}, {0x100c, 0x100c + 32 * 9 + 12, 32, 0, 4}}};
         const auto plan = PlanVertexCopies(fetches);
         Require(plan.copies.size() == 1 && plan.copies[0].first == 0x1000 && plan.copies[0].second == 0x1018 + 32 * 9 + 8, "interleaved attributes were not copied as one union");
-        Require(plan.copyOf == std::vector<std::size_t>{0, 0, 0} && plan.offsets == std::vector<std::uint64_t>{0x18, 0, 0xc}, "interleaved attribute offsets are wrong");
+        const auto list = [](const auto& values) { return std::vector(values.begin(), values.end()); };
+        Require(list(plan.copyOf) == std::vector<std::size_t>{0, 0, 0} && list(plan.offsets) == std::vector<std::uint64_t>{0x18, 0, 0xc}, "interleaved attribute offsets are wrong");
     }
     {
         const std::array<VertexFetch, 6> fetches{{
