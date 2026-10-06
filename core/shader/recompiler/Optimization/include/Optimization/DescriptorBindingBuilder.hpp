@@ -14,6 +14,8 @@ class DescriptorBindingBuilder {
 public:
     void Populate(BindingAllocationResult& allocation, const IrProgram& program, const ResourceSnapshot& snapshot, const std::array<std::uint32_t, 3>& partialThreads) const;
     void Populate(BindingAllocationResult& allocation, const ShaderInfo& info, IrShaderStage stage, std::uint32_t userDataBase, const ResourceSnapshot& snapshot, const std::array<std::uint32_t, 3>& partialThreads) const;
+    // The layout's bindings and push constants for the snapshot, into `bindings` and `pushConstants`.
+    void Populate(const IrBindingLayout& layout, const ShaderInfo& info, IrShaderStage stage, std::uint32_t userDataBase, const ResourceSnapshot& snapshot, const std::array<std::uint32_t, 3>& partialThreads, std::vector<DescriptorBinding>& bindings, std::vector<std::byte>& pushConstants) const;
 };
 
 }

@@ -380,13 +380,7 @@ CompiledVariant compileVariant(const RecompileRequest& request, IrProgram progra
 
 RecompileResult materializeResult(const CompiledVariant& variant, const RecompileRequest& request, const ResourceSnapshot& snapshot) {
     auto result = variant.result;
-    BindingAllocationResult bindings;
-    bindings.layout = variant.bindings.layout;
-    bindings.pushConstantOffsetBytes = variant.bindings.pushConstantOffsetBytes;
-    bindings.pushConstantSizeBytes = variant.bindings.pushConstantSizeBytes;
-    DescriptorBindingBuilder{}.Populate(bindings, variant.info.info, variant.info.stage, variant.info.userDataBase, snapshot, partialThreads(request));
-    result.bindings = std::move(bindings.bindings);
-    result.pushConstants = std::move(bindings.pushConstants);
+    DescriptorBindingBuilder{}.Populate(variant.bindings.layout, variant.info.info, variant.info.stage, variant.info.userDataBase, snapshot, partialThreads(request), result.bindings, result.pushConstants);
     for (auto& attribute : result.vertexAttributes) {
         if (!request.context.vertex || attribute.location >= request.context.vertex->resourcesNum) throw std::runtime_error("Shader cache: invalid vertex attribute metadata");
         attribute.resource = request.context.vertex->resources[attribute.location];

@@ -299,7 +299,10 @@ void DescriptorBindingBuilder::Populate(BindingAllocationResult& allocation, con
 }
 
 void DescriptorBindingBuilder::Populate(BindingAllocationResult& allocation, const ShaderInfo& info, IrShaderStage stage, std::uint32_t userDataBase, const ResourceSnapshot& snapshot, const std::array<std::uint32_t, 3>& partialThreads) const {
-    const IrBindingLayout& layout = allocation.layout;
+    Populate(allocation.layout, info, stage, userDataBase, snapshot, partialThreads, allocation.bindings, allocation.pushConstants);
+}
+
+void DescriptorBindingBuilder::Populate(const IrBindingLayout& layout, const ShaderInfo& info, IrShaderStage stage, std::uint32_t userDataBase, const ResourceSnapshot& snapshot, const std::array<std::uint32_t, 3>& partialThreads, std::vector<DescriptorBinding>& populated, std::vector<std::byte>& pushConstants) const {
     const std::vector<std::uint32_t> shaderData = ShaderDataDwordsFor(layout, userDataBase, snapshot, partialThreads);
     const UnnormalizedProof unnormalized = ProveUnnormalized(info, snapshot);
     const std::vector<std::uint32_t> samplerElements = SamplerElements(layout, info);
@@ -390,11 +393,11 @@ void DescriptorBindingBuilder::Populate(BindingAllocationResult& allocation, con
         const auto readOnly = bufferWrittenCounts.readOnly.fetch_add(readOnlyHere) + readOnlyHere;
         std::fprintf(stderr, "[bindings] guest buffer elements: %zu written, %zu read-only (total so far: %llu / %llu)\n", writtenHere, readOnlyHere, written, readOnly);
     }
-    allocation.bindings = std::move(bindings);
-    allocation.pushConstants.clear();
+    populated = std::move(bindings);
+    pushConstants.clear();
     if (layout.UsesPushData()) {
-        allocation.pushConstants.resize(static_cast<std::size_t>(shaderData.size()) * sizeof(std::uint32_t));
-        std::memcpy(allocation.pushConstants.data(), shaderData.data(), allocation.pushConstants.size());
+        pushConstants.resize(static_cast<std::size_t>(shaderData.size()) * sizeof(std::uint32_t));
+        std::memcpy(pushConstants.data(), shaderData.data(), pushConstants.size());
     }
 }
 
