@@ -2,6 +2,7 @@
 #include <windows.h>
 #include <tlhelp32.h>
 #include "prx/libc/include/GuestArena.hpp"
+#include "prx/libc/include/exceptions/Unwind.hpp"
 #include <atomic>
 #include <chrono>
 #include <csignal>
@@ -440,6 +441,106 @@ unsigned long long EnvironmentSeconds(const char* name, unsigned long long fallb
     return end != nullptr && *end == 0 ? value : fallback;
 }
 
+// A module's DWARF unwind records as code ranges: those of its .eh_frame (renamed .ehfram), or of a
+// relinked guest's .ehmeta search table.
+struct UnwindRecord {
+    std::uint64_t begin;
+    std::uint64_t end;
+    const LibcUnwind::Byte* fde;
+};
+
+void IndexUnwindRecords(std::uint64_t base, const IMAGE_SECTION_HEADER& section, std::vector<UnwindRecord>& records) {
+    using LibcUnwind::Byte;
+    using LibcUnwind::Word;
+    const auto add = [&](const Byte* fde) {
+        Word start = 0;
+        Word length = 0;
+        if (LibcUnwind::FdeRange(fde, start, length) && length != 0) records.push_back({start, start + length, fde});
+    };
+    const auto* p = reinterpret_cast<const Byte*>(base + section.VirtualAddress);
+    if (std::memcmp(section.Name, ".ehfram", 8) == 0) {
+        const auto* end = p + section.Misc.VirtualSize;
+        while (end - p >= 8) {
+            const auto* record = p;
+            const auto length = LibcUnwind::Read<std::uint32_t>(p);
+            if (length == 0) continue;
+            if (length == 0xffffffff || length < 4 || static_cast<std::uint64_t>(end - p) < length) return;
+            if (LibcUnwind::Read<std::uint32_t>(p) != 0) add(record);
+            p = record + 4 + length;
+        }
+    } else if (std::memcmp(section.Name, ".ehmeta", 8) == 0) {
+        const auto* header = reinterpret_cast<const Byte*>(base + LibcUnwind::Read<std::uint32_t>(p));
+        if (header[0] != 1 || header[3] == 255) return;
+        p = header + 4;
+        LibcUnwind::Encoded(p, header[1], Word(header));
+        const Word count = LibcUnwind::Encoded(p, header[2]);
+        for (Word i = 0; i < count; ++i) {
+            LibcUnwind::Encoded(p, header[3], Word(header));
+            add(reinterpret_cast<const Byte*>(LibcUnwind::Encoded(p, header[3], Word(header))));
+        }
+    }
+}
+
+// A leaf is in an epilogue when only pops and stack releases lie between it and its return (or the
+// jump of a tail call); replaying them moves the context to the caller. Synchronous DWARF records
+// (-fno-asynchronous-unwind-tables) are exact only at calls, so they need not describe an epilogue.
+bool ReplayEpilogue(CONTEXT& context, std::uint64_t low, std::uint64_t high) {
+    static constexpr DWORD64 CONTEXT::* Registers[16] = {
+        &CONTEXT::Rax, &CONTEXT::Rcx, &CONTEXT::Rdx, &CONTEXT::Rbx, &CONTEXT::Rsp, &CONTEXT::Rbp, &CONTEXT::Rsi, &CONTEXT::Rdi,
+        &CONTEXT::R8, &CONTEXT::R9, &CONTEXT::R10, &CONTEXT::R11, &CONTEXT::R12, &CONTEXT::R13, &CONTEXT::R14, &CONTEXT::R15};
+    CONTEXT replay = context;
+    const auto* code = reinterpret_cast<const std::uint8_t*>(context.Rip);
+    bool released = false;
+    for (int step = 0; step < 16; ++step) {
+        if (replay.Rsp < low || replay.Rsp + 8 > high) return false;
+        const auto top = *reinterpret_cast<const DWORD64*>(replay.Rsp);
+        const bool extended = code[0] == 0x41;
+        const auto opcode = code[extended ? 1 : 0];
+        if (opcode >= 0x58 && opcode <= 0x5f && (extended || opcode != 0x5c)) {
+            replay.*Registers[opcode - 0x58 + (extended ? 8 : 0)] = top;
+            replay.Rsp += 8;
+            code += extended ? 2 : 1;
+            released = true;
+            continue;
+        }
+        if (code[0] == 0x48 && code[1] == 0x83 && code[2] == 0xc4) {
+            replay.Rsp += static_cast<std::int8_t>(code[3]);
+            code += 4;
+            released = true;
+            continue;
+        }
+        if (code[0] == 0x48 && code[1] == 0x81 && code[2] == 0xc4) {
+            std::int32_t amount;
+            std::memcpy(&amount, code + 3, sizeof(amount));
+            replay.Rsp += amount;
+            code += 7;
+            released = true;
+            continue;
+        }
+        const bool ret = code[0] == 0xc3 || (code[0] == 0xf3 && code[1] == 0xc3);
+        const bool tail = released && (code[0] == 0xe9 || code[0] == 0xeb || (code[0] == 0xff && code[1] == 0x25) || (code[0] == 0x48 && code[1] == 0xff && code[2] == 0x25));
+        if (!ret && !tail) return false;
+        replay.Rip = top;
+        replay.Rsp += 8;
+        context = replay;
+        return true;
+    }
+    return false;
+}
+
+// One frame through its DWARF record; saved registers are read only inside [low, high).
+bool StepDwarf(CONTEXT& context, const LibcUnwind::Byte* fde, bool leaf, std::uint64_t low, std::uint64_t high) {
+    static constexpr DWORD64 CONTEXT::* Registers[17] = {
+        &CONTEXT::Rax, &CONTEXT::Rdx, &CONTEXT::Rcx, &CONTEXT::Rbx, &CONTEXT::Rsi, &CONTEXT::Rdi, &CONTEXT::Rbp, &CONTEXT::Rsp,
+        &CONTEXT::R8, &CONTEXT::R9, &CONTEXT::R10, &CONTEXT::R11, &CONTEXT::R12, &CONTEXT::R13, &CONTEXT::R14, &CONTEXT::R15, &CONTEXT::Rip};
+    _Unwind_Context frame;
+    for (unsigned i = 0; i < 17; ++i) frame.registers[i] = context.*Registers[i];
+    frame.signalFrame = leaf;
+    if (!LibcUnwind::StepWithin(frame, fde, low, high)) return false;
+    for (unsigned i = 0; i < 17; ++i) context.*Registers[i] = frame.registers[i];
+    return true;
+}
+
 // APS5_SAMPLE_SECONDS: after APS5_SAMPLE_DELAY seconds (default 60), or once the file
 // APS5_SAMPLE_TRIGGER names exists, every thread's instruction pointer is sampled for that many
 // seconds; the busy threads and the hottest module offsets are reported. A thread is suspended only
@@ -471,6 +572,7 @@ DWORD WINAPI SampleProfiler(LPVOID param) {
         bool own;
     };
     std::vector<Range> code;
+    std::vector<UnwindRecord> unwindRecords;
     {
         HANDLE modules = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, pid);
         if (modules != INVALID_HANDLE_VALUE) {
@@ -487,6 +589,7 @@ DWORD WINAPI SampleProfiler(LPVOID param) {
                     if (nt->Signature != IMAGE_NT_SIGNATURE) continue;
                     const auto* section = IMAGE_FIRST_SECTION(nt);
                     for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++section) {
+                        if (own) IndexUnwindRecords(base, *section, unwindRecords);
                         if ((section->Characteristics & IMAGE_SCN_MEM_EXECUTE) == 0 || (section->Characteristics & IMAGE_SCN_MEM_READ) == 0) continue;
                         const auto size = std::max<std::uint64_t>(section->Misc.VirtualSize, section->SizeOfRawData);
                         code.push_back({base + section->VirtualAddress, base + section->VirtualAddress + size, own});
@@ -502,6 +605,13 @@ DWORD WINAPI SampleProfiler(LPVOID param) {
         if (it == code.begin()) return nullptr;
         --it;
         return address < it->end ? &*it : nullptr;
+    };
+    std::sort(unwindRecords.begin(), unwindRecords.end(), [](const UnwindRecord& a, const UnwindRecord& b) { return a.begin < b.begin; });
+    const auto recordAt = [&](std::uint64_t address) -> const LibcUnwind::Byte* {
+        auto it = std::upper_bound(unwindRecords.begin(), unwindRecords.end(), address, [](std::uint64_t value, const UnwindRecord& record) { return value < record.begin; });
+        if (it == unwindRecords.begin()) return nullptr;
+        --it;
+        return address < it->end ? it->fde : nullptr;
     };
     // Module+offset, or the nearest export for a system module (ntdll's Nt services).
     std::unordered_map<std::uint64_t, std::string> names;
@@ -608,9 +718,12 @@ DWORD WINAPI SampleProfiler(LPVOID param) {
             }
             ResumeThread(thread.handle);
             if (!read) continue;
-            // The frames, unwound through the modules' unwind tables over the copy (registers that
-            // point into the thread's stack are moved into the copy first; a frame leaving the copy
-            // ends the walk). A function without unwind data is a leaf: its return address is at RSP.
+            // The frames, unwound over the copy (registers that point into the thread's stack are
+            // moved into the copy first; a frame leaving the copy ends the walk): through a module's
+            // .pdata, an epilogue replay at the leaf, or the module's DWARF records. Our modules'
+            // compiled C++ has no .pdata, and no DWARF record where the compiler proved a function
+            // cannot throw: the walk ends there. Other code without unwind data is a leaf whose
+            // return address is at RSP.
             std::uint64_t frames[MaxFrames];
             std::size_t frameCount = 0;
             {
@@ -625,19 +738,25 @@ DWORD WINAPI SampleProfiler(LPVOID param) {
                     }
                 };
                 rebase();
-                while (frameCount < MaxFrames) {
-                    frames[frameCount++] = unwind.Rip;
-                    if (copied == 0 || unwind.Rsp < copyLow || unwind.Rsp + 8 > copyHigh || codeAt(unwind.Rip) == nullptr) break;
+                const auto step = [&](const Range& range, bool leaf) {
                     DWORD64 imageBase = 0;
-                    auto* function = RtlLookupFunctionEntry(unwind.Rip, &imageBase, nullptr);
-                    if (function == nullptr) {
-                        unwind.Rip = *reinterpret_cast<const DWORD64*>(unwind.Rsp);
-                        unwind.Rsp += 8;
-                    } else {
+                    if (auto* function = RtlLookupFunctionEntry(unwind.Rip, &imageBase, nullptr); function != nullptr) {
                         PVOID handlerData = nullptr;
                         DWORD64 establisher = 0;
                         RtlVirtualUnwind(UNW_FLAG_NHANDLER, imageBase, unwind.Rip, function, &unwind, &handlerData, &establisher, nullptr);
+                        return true;
                     }
+                    if (leaf && ReplayEpilogue(unwind, copyLow, copyHigh)) return true;
+                    if (const auto* fde = recordAt(leaf ? unwind.Rip : unwind.Rip - 1); fde != nullptr) return StepDwarf(unwind, fde, leaf, copyLow, copyHigh);
+                    if (range.own) return false;
+                    unwind.Rip = *reinterpret_cast<const DWORD64*>(unwind.Rsp);
+                    unwind.Rsp += 8;
+                    return true;
+                };
+                while (frameCount < MaxFrames) {
+                    frames[frameCount++] = unwind.Rip;
+                    const auto* range = codeAt(unwind.Rip);
+                    if (copied == 0 || unwind.Rsp < copyLow || unwind.Rsp + 8 > copyHigh || range == nullptr || !step(*range, frameCount == 1)) break;
                     rebase();
                     if (unwind.Rip == 0 || unwind.Rsp < copyLow || unwind.Rsp > copyHigh) break;
                 }
