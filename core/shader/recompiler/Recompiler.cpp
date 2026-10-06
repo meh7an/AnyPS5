@@ -1,5 +1,6 @@
 #include "Recompiler.hpp"
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
@@ -9,6 +10,7 @@
 #include "ShaderDiskCache.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include <list>
+#include <memory>
 #include <mutex>
 #include <new>
 #include <shared_mutex>
@@ -194,9 +196,11 @@ IrProgram PrepareResourceProgram(const RecompileRequest& request) {
 // shared immutable object every later capture that reproduces the snapshot receives, so Populate
 // and the per-request copy run once per distinct snapshot.
 struct ResultMemoEntry {
-    std::uint64_t variantId;
-    std::uint64_t hash;
+    std::uint64_t variantId = 0;
+    std::uint64_t hash = 0;
     std::shared_ptr<const RecompileResult> result;
+    // The source's memo clock at the entry's last use: a set replaces its least recently used.
+    std::uint64_t used = 0;
 };
 
 struct EmissionFailure {
@@ -205,6 +209,11 @@ struct EmissionFailure {
     ResourceSpecialization specialization;
     std::exception_ptr failure;
 };
+// The result memo of a source: a set of ResultMemoWays entries per index (its folded low bits),
+// so a lookup reads one or two cache lines instead of a hash node chain behind a division.
+constexpr std::size_t ResultMemoSets = 64;
+constexpr std::size_t ResultMemoWays = 4;
+using ResultMemoTable = std::array<ResultMemoEntry, ResultMemoSets * ResultMemoWays>;
 
 struct SourceEntry {
     AgcDriver::Mutex mutex;
@@ -219,10 +228,10 @@ struct SourceEntry {
     std::exception_ptr planFailure;
     std::unique_ptr<IrProgram> program;
     std::vector<std::shared_ptr<const CompiledVariant>> variants;
+    // The result memo (under mutex), allocated with its first insert.
+    std::unique_ptr<ResultMemoTable> memo;
+    std::uint64_t memoClock = 0;
     std::vector<EmissionFailure> emissionFailures;
-    // The result memo, most recently used first, at most ResultMemoEntries (under mutex).
-    std::list<ResultMemoEntry> memo;
-    std::unordered_map<std::uint64_t, std::list<ResultMemoEntry>::iterator> memoIndex;
     // Memo misses since the last hit (under mutex), for the insert bypass.
     std::uint32_t memoMissRun = 0;
 };
@@ -485,7 +494,11 @@ bool ResultMemo() {
     return resultMemo;
 }
 
-constexpr std::size_t ResultMemoEntries = 256;
+// The memo set an index falls in, or null while the source's memo is empty.
+ResultMemoEntry* memoSet(SourceEntry& source, std::uint64_t index) {
+    if (source.memo == nullptr) return nullptr;
+    return source.memo->data() + static_cast<std::size_t>((index ^ (index >> 32u)) % ResultMemoSets) * ResultMemoWays;
+}
 
 // A source whose memo missed MemoBypassMisses times in a row stops inserting its results (an insert
 // allocated two nodes and evicted a cold result, destroyed on the worker), but for every
@@ -587,14 +600,17 @@ std::shared_ptr<const RecompileResult> materializeMemoized(SourceEntry& source, 
         std::lock_guard lock(source.mutex);
         variant = findOrCompileVariant(source, request, snapshot, specialization, cacheHit);
         index = (variant->result.variantId * 0x9e3779b97f4a7c15ull) ^ hash;
-        const auto found = source.memoIndex.find(index);
-        if (found != source.memoIndex.end() && found->second->variantId == variant->result.variantId && found->second->hash == hash) {
-            source.memo.splice(source.memo.begin(), source.memo, found->second);
-            source.memoMissRun = 0;
-            counters.hits.fetch_add(1, std::memory_order_relaxed);
-            if (memoHit != nullptr) *memoHit = true;
-            reportResultMemo();
-            return found->second->result;
+        if (auto* set = memoSet(source, index)) {
+            for (std::size_t way = 0; way < ResultMemoWays; ++way) {
+                auto& entry = set[way];
+                if (entry.result == nullptr || entry.variantId != variant->result.variantId || entry.hash != hash) continue;
+                entry.used = ++source.memoClock;
+                source.memoMissRun = 0;
+                counters.hits.fetch_add(1, std::memory_order_relaxed);
+                if (memoHit != nullptr) *memoHit = true;
+                reportResultMemo();
+                return entry.result;
+            }
         }
         insert = !MemoBypass() || source.memoMissRun < MemoBypassMisses || source.memoMissRun % MemoProbeMisses == 0;
         ++source.memoMissRun;
@@ -612,25 +628,23 @@ std::shared_ptr<const RecompileResult> materializeMemoized(SourceEntry& source, 
     }
     {
         std::lock_guard lock(source.mutex);
-        const auto found = source.memoIndex.find(index);
-        if (found != source.memoIndex.end()) {
-            if (found->second->variantId == variant->result.variantId && found->second->hash == hash) {
-                source.memo.splice(source.memo.begin(), source.memo, found->second);
-                shared = found->second->result;
-            } else {
-                source.memo.erase(found->second);
-                source.memoIndex.erase(found);
+        if (source.memo == nullptr) source.memo = std::make_unique<ResultMemoTable>();
+        auto* set = memoSet(source, index);
+        auto* victim = set;
+        bool present = false;
+        for (std::size_t way = 0; way < ResultMemoWays && !present; ++way) {
+            auto& entry = set[way];
+            if (entry.result != nullptr && entry.variantId == variant->result.variantId && entry.hash == hash) {
+                entry.used = ++source.memoClock;
+                shared = entry.result;
+                present = true;
+            } else if (entry.used < victim->used) {
+                victim = &entry;
             }
         }
-        if (source.memoIndex.find(index) == source.memoIndex.end()) {
-            source.memo.push_front({variant->result.variantId, hash, shared});
-            source.memoIndex.emplace(index, source.memo.begin());
-            while (source.memo.size() > ResultMemoEntries) {
-                const auto& last = source.memo.back();
-                source.memoIndex.erase((last.variantId * 0x9e3779b97f4a7c15ull) ^ last.hash);
-                source.memo.pop_back();
-                counters.evictions.fetch_add(1, std::memory_order_relaxed);
-            }
+        if (!present) {
+            if (victim->result != nullptr) counters.evictions.fetch_add(1, std::memory_order_relaxed);
+            *victim = {variant->result.variantId, hash, shared, ++source.memoClock};
         }
     }
     reportResultMemo();
