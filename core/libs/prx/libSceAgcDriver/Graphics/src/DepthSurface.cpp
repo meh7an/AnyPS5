@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ThreadScratch.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
@@ -7,6 +8,7 @@
 #include "RdnaDecoder/include/RdnaDecoder/RdnaDescriptorFormat.hpp"
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdio>
 #include <map>
 #include <memory>
@@ -279,6 +281,15 @@ std::vector<std::unique_ptr<DepthSurface>>& surfaces() {
     return *list;
 }
 
+std::atomic<std::uint64_t> surfacesGeneration{1};
+
+struct LastDepthSurface {
+    VkDevice device = VK_NULL_HANDLE;
+    DepthTarget target{};
+    VkImageView view = VK_NULL_HANDLE;
+    std::uint64_t generation = 0;
+};
+
 }
 
 std::uint64_t DepthSliceBytes(VkExtent2D extent, std::uint32_t bytesPerTexel) {
@@ -290,12 +301,24 @@ std::uint64_t DepthSliceBytes(VkExtent2D extent, std::uint32_t bytesPerTexel) {
 }
 
 VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target) {
+    struct LastTag {};
+    auto& last = ThreadScratch<LastDepthSurface, LastTag>();
+    const auto generation = surfacesGeneration.load(std::memory_order_acquire);
+    if (last.view != VK_NULL_HANDLE && last.generation == generation && last.device == context.device && sameSurface(last.target, target)) return last.view;
     std::lock_guard lock(surfacesMutex());
+    VkImageView view = VK_NULL_HANDLE;
     for (const auto& surface : surfaces()) {
-        if (surface->context.device == context.device && sameSurface(surface->target, target)) return surface->view;
+        if (surface->context.device == context.device && sameSurface(surface->target, target)) {
+            view = surface->view;
+            break;
+        }
     }
-    surfaces().push_back(std::make_unique<DepthSurface>(context, target));
-    return surfaces().back()->view;
+    if (view == VK_NULL_HANDLE) {
+        surfaces().push_back(std::make_unique<DepthSurface>(context, target));
+        view = surfaces().back()->view;
+    }
+    last = {context.device, target, view, generation};
+    return view;
 }
 
 void ClearDepthSurface(const Context& context, const DepthTarget& target, bool depth, bool stencil) {
@@ -323,6 +346,7 @@ void TransferDepthSurface(const Context& context, std::uint64_t address, Storage
 
 void ClearDepthSurfaces(VkDevice device) {
     std::lock_guard lock(surfacesMutex());
+    surfacesGeneration.fetch_add(1, std::memory_order_release);
     std::erase_if(surfaces(), [&](const auto& surface) { return surface->context.device == device; });
 }
 
