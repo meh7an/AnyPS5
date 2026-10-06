@@ -1406,6 +1406,11 @@ VkCommandBuffer Recorder::CommandsInRenderPass() {
     return open->commands;
 }
 
+PassBinding& Recorder::PassBound() {
+    Require(open != nullptr, "no batch is open for the render pass");
+    return open->renderPass.bound;
+}
+
 void Recorder::LeaveRenderPassOpen(std::uint64_t key, std::uint32_t timing, bool continuable, std::function<void(VkCommandBuffer)> afterPass) {
     Require(open != nullptr, "no batch is open for the render pass");
     auto& pass = open->renderPass;

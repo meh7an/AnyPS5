@@ -25,6 +25,16 @@ namespace AgcDriver::Graphics {
 
 class Buffer;
 
+// The graphics state the open render pass's last draw bound (Pipeline::Continue), so a continued
+// draw skips the binds it repeats. Kept with the recorder's pass and reset when the pass ends.
+struct PassBinding {
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    VkViewport viewport{};
+    VkRect2D scissor{};
+    std::array<float, 3> depthBias{};
+    std::array<float, 2> depthBounds{};
+};
+
 // Accumulates GPU work across guest commands so the CPU does not wait for each one. Dispatches and the
 // copies that feed them record into one open batch; Submit sends it to the queue without waiting and
 // Sync waits for every batch, then runs its completion actions (write-backs) in order. Objects handed
@@ -70,6 +80,8 @@ public:
     bool ContinuesRenderPass(std::uint64_t key) const;
     VkCommandBuffer CommandsInRenderPass();
     void LeaveRenderPassOpen(std::uint64_t key, std::uint32_t timing, bool continuable, std::function<void(VkCommandBuffer)> afterPass = {});
+    // What the draws of the pass being recorded bound so far (empty until a draw begins a pass).
+    PassBinding& PassBound();
     // DCC "uncompressed" key stores (DccMetadata.cpp StoreUncompressedOnGpu): queued on the open
     // batch and recorded as one run (one barrier pair for every queued fill) at Submit, before a
     // label store (RecordStore), or before a command that writes or reads a queued range (the
@@ -613,6 +625,7 @@ private:
             bool continuable = false;
             std::uint64_t key = 0;
             std::uint32_t timing = NoTiming;
+            PassBinding bound;
             std::function<void(VkCommandBuffer)> afterPass;
         } renderPass;
         // A pass ended in this batch: Submit records the host-read barrier its draws left out.
