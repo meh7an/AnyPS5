@@ -1079,7 +1079,7 @@ bool walkWrites(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop, 
         if (count < tracker.pages.size()) break;
         cursor = reinterpret_cast<std::uintptr_t>(tracker.pages[count - 1]) + (granularity != 0 ? granularity : page);
     }
-    if (dirty) collectDirty.fetch_add(1, std::memory_order_relaxed);
+    if (dirty && MemoryProfiled()) collectDirty.fetch_add(1, std::memory_order_relaxed);
     if (dirty && !singlePass) {
         // The resetting pass reports pages again, so a write racing the first pass is stamped too.
         cursor = first;
@@ -1125,7 +1125,7 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
                 // The current generation, not the memoized one: blocks stamped since (MarkWritten, an
                 // overlapping collect) were written before this caller reads, and an older value would
                 // make every later UnchangedSince fail until the epoch ends.
-                collectMemoHits.fetch_add(1, std::memory_order_relaxed);
+                if (MemoryProfiled()) collectMemoHits.fetch_add(1, std::memory_order_relaxed);
                 return tracker.generation.load(std::memory_order_relaxed);
             }
         }
@@ -1137,7 +1137,7 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
     if (useMemo && sharedCollectMemo()) {
         for (const auto& entry : tracker.memo) {
             if (entry.epoch == epoch && entry.unwatched == unwatchSerial.load(std::memory_order_relaxed) && entry.begin <= cursor && stop <= entry.end) {
-                collectMemoHits.fetch_add(1, std::memory_order_relaxed);
+                if (MemoryProfiled()) collectMemoHits.fetch_add(1, std::memory_order_relaxed);
                 return tracker.generation;
             }
         }
@@ -1168,7 +1168,7 @@ std::uint64_t CollectWritesUncached(std::uint64_t address, std::size_t bytes) {
 
 void BumpCollectEpoch() {
     HostThreadSlot<std::uint64_t, CollectEpochSlot>::Set(nextCollectEpoch.fetch_add(1, std::memory_order_relaxed) + 1);
-    collectEpochBumps.fetch_add(1, std::memory_order_relaxed);
+    if (MemoryProfiled()) collectEpochBumps.fetch_add(1, std::memory_order_relaxed);
 }
 
 std::uint64_t CollectEpochBumps() {
@@ -1743,7 +1743,7 @@ void Read(std::uint64_t address, std::span<std::byte> destination, std::size_t a
     if (destination.empty()) return;
     FlushGpuWrites(address, destination.size());
     const TimedAccess timed(CounterRead, destination.size());
-    CountReadCaller(__builtin_return_address(0));
+    if (MemoryProfiled()) CountReadCaller(__builtin_return_address(0));
     const auto* source = reinterpret_cast<const void*>(address);
     try {
         CheckRange(source, destination.size(), alignment);
@@ -1759,7 +1759,7 @@ void ReadCommitted(std::uint64_t address, std::span<std::byte> destination) {
     if (destination.empty()) return;
     FlushGpuWrites(address, destination.size());
     const TimedAccess timed(CounterRead, destination.size());
-    CountReadCaller(__builtin_return_address(0));
+    if (MemoryProfiled()) CountReadCaller(__builtin_return_address(0));
     if (Accessible(reinterpret_cast<const void*>(address), destination.size())) {
         std::memcpy(destination.data(), reinterpret_cast<const void*>(address), destination.size());
         return;
@@ -1865,7 +1865,7 @@ void Write(std::uint64_t address, std::span<const std::byte> source, std::size_t
     const ReadSiteScope site(ReadSite::Store);
     FlushGpuWrites(address, source.size());
     const TimedAccess timed(CounterWrite, source.size());
-    CountWriteCaller(__builtin_return_address(0));
+    if (MemoryProfiled()) CountWriteCaller(__builtin_return_address(0));
     auto* destination = reinterpret_cast<void*>(address);
     CheckRange(destination, source.size(), alignment, true);
     // Stamped like a GPU write: a collect memoized for this packet would not see the page fault.
