@@ -211,6 +211,8 @@ struct SourceEntry {
     // The result memo, most recently used first, at most ResultMemoEntries (under mutex).
     std::list<ResultMemoEntry> memo;
     std::unordered_map<std::uint64_t, std::list<ResultMemoEntry>::iterator> memoIndex;
+    // Memo misses since the last hit (under mutex), for the insert bypass.
+    std::uint32_t memoMissRun = 0;
 };
 
 namespace {
@@ -473,8 +475,20 @@ bool ResultMemo() {
 
 constexpr std::size_t ResultMemoEntries = 256;
 
+// A source whose memo missed MemoBypassMisses times in a row stops inserting its results (an insert
+// allocated two nodes and evicted a cold result, destroyed on the worker), but for every
+// MemoProbeMisses-th miss, so a snapshot that starts repeating is memoized again. Lookups go on.
+// APS5_NO_MEMO_BYPASS=1 inserts every miss.
+constexpr std::uint32_t MemoBypassMisses = 64;
+constexpr std::uint32_t MemoProbeMisses = 16;
+
+bool MemoBypass() {
+    static const bool bypass = std::getenv("APS5_NO_MEMO_BYPASS") == nullptr;
+    return bypass;
+}
+
 struct ResultMemoCounters {
-    std::atomic<std::uint64_t> hits{0}, misses{0}, evictions{0}, populateNanoseconds{0};
+    std::atomic<std::uint64_t> hits{0}, misses{0}, evictions{0}, bypassed{0}, populateNanoseconds{0};
     std::atomic<std::int64_t> lastReport{0};
 };
 
@@ -497,8 +511,9 @@ void reportResultMemo() {
     const auto hits = counters.hits.exchange(0, std::memory_order_relaxed);
     const auto misses = counters.misses.exchange(0, std::memory_order_relaxed);
     const auto evictions = counters.evictions.exchange(0, std::memory_order_relaxed);
+    const auto bypassed = counters.bypassed.exchange(0, std::memory_order_relaxed);
     const auto populate = counters.populateNanoseconds.exchange(0, std::memory_order_relaxed);
-    std::fprintf(stderr, "[recompile] result memo (10 s): %llu hits, %llu misses (%.1f%% hits), Populate %.1f us per miss / %.1f ms in total, %llu evictions\n", static_cast<unsigned long long>(hits), static_cast<unsigned long long>(misses), hits + misses != 0 ? 100.0 * static_cast<double>(hits) / static_cast<double>(hits + misses) : 0.0, misses != 0 ? static_cast<double>(populate) / 1000.0 / static_cast<double>(misses) : 0.0, static_cast<double>(populate) / 1e6, static_cast<unsigned long long>(evictions));
+    std::fprintf(stderr, "[recompile] result memo (10 s): %llu hits, %llu misses (%.1f%% hits, %llu not inserted), Populate %.1f us per miss / %.1f ms in total, %llu evictions\n", static_cast<unsigned long long>(hits), static_cast<unsigned long long>(misses), hits + misses != 0 ? 100.0 * static_cast<double>(hits) / static_cast<double>(hits + misses) : 0.0, static_cast<unsigned long long>(bypassed), misses != 0 ? static_cast<double>(populate) / 1000.0 / static_cast<double>(misses) : 0.0, static_cast<double>(populate) / 1e6, static_cast<unsigned long long>(evictions));
 }
 
 // Everything materializeResult reads besides the variant: the snapshot (the descriptor words, the
@@ -554,6 +569,7 @@ std::shared_ptr<const RecompileResult> materializeMemoized(SourceEntry& source, 
     bool cacheHit = false;
     const auto hash = snapshotHash(request, snapshot);
     std::uint64_t index = 0;
+    bool insert = true;
     auto& counters = resultMemoCounters();
     {
         std::lock_guard lock(source.mutex);
@@ -562,11 +578,14 @@ std::shared_ptr<const RecompileResult> materializeMemoized(SourceEntry& source, 
         const auto found = source.memoIndex.find(index);
         if (found != source.memoIndex.end() && found->second->variantId == variant->result.variantId && found->second->hash == hash) {
             source.memo.splice(source.memo.begin(), source.memo, found->second);
+            source.memoMissRun = 0;
             counters.hits.fetch_add(1, std::memory_order_relaxed);
             if (memoHit != nullptr) *memoHit = true;
             reportResultMemo();
             return found->second->result;
         }
+        insert = !MemoBypass() || source.memoMissRun < MemoBypassMisses || source.memoMissRun % MemoProbeMisses == 0;
+        ++source.memoMissRun;
     }
     const auto started = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     auto result = std::make_shared<RecompileResult>(materializeResult(*variant, request, snapshot));
@@ -574,6 +593,11 @@ std::shared_ptr<const RecompileResult> materializeMemoized(SourceEntry& source, 
     if (profile) counters.populateNanoseconds.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()), std::memory_order_relaxed);
     counters.misses.fetch_add(1, std::memory_order_relaxed);
     std::shared_ptr<const RecompileResult> shared = std::move(result);
+    if (!insert) {
+        counters.bypassed.fetch_add(1, std::memory_order_relaxed);
+        reportResultMemo();
+        return shared;
+    }
     {
         std::lock_guard lock(source.mutex);
         const auto found = source.memoIndex.find(index);
