@@ -1,5 +1,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/ColorTargetLayout.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureSwizzleEquations.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
+#include <atomic>
 #include <bit>
 #include <cstring>
 #include <limits>
@@ -57,10 +59,13 @@ struct SwizzleTables {
 };
 
 const SwizzleTables& renderTargetTables(std::uint32_t bytesPerElement, std::uint32_t blockWidth, std::uint32_t blockHeight) {
-    static std::once_flag once[5];
     static SwizzleTables tables[5];
+    static std::atomic<bool> built[5];
+    static AgcDriver::Mutex mutex;
     const auto index = static_cast<std::size_t>(std::countr_zero(bytesPerElement));
-    std::call_once(once[index], [&] {
+    if (built[index].load(std::memory_order_acquire)) return tables[index];
+    std::lock_guard lock(mutex);
+    if (!built[index].load(std::memory_order_relaxed)) {
         const auto* equation = FindTextureSwizzleEquation(27u, bytesPerElement);
         require(equation != nullptr, "AGC graphics: no SW_64KB_R_X equation for the color element size");
         auto& table = tables[index];
@@ -76,21 +81,26 @@ const SwizzleTables& renderTargetTables(std::uint32_t bytesPerElement, std::uint
             for (std::uint32_t bit = 0; bit < 16u; ++bit) offset |= parity((y << 12u) & equation->bits[bit] & 0xfff000u) << bit;
             table.y[y] = offset;
         }
-    });
+        built[index].store(true, std::memory_order_release);
+    }
     return tables[index];
 }
 
 const SwizzleTables& standardTables(std::uint32_t bytesPerElement, std::uint32_t blockWidth, std::uint32_t blockHeight, bool block64KB) {
-    static std::once_flag once[2][5];
     static SwizzleTables tables[2][5];
+    static std::atomic<bool> built[2][5];
+    static AgcDriver::Mutex mutex;
     const auto index = static_cast<std::size_t>(std::countr_zero(bytesPerElement));
-    std::call_once(once[block64KB][index], [&] {
+    if (built[block64KB][index].load(std::memory_order_acquire)) return tables[block64KB][index];
+    std::lock_guard lock(mutex);
+    if (!built[block64KB][index].load(std::memory_order_relaxed)) {
         auto& table = tables[block64KB][index];
         table.x.resize(blockWidth);
         table.y.resize(blockHeight);
         for (std::uint32_t x = 0; x < blockWidth; ++x) table.x[x] = standardOffset(x, 0, bytesPerElement) ^ (block64KB ? standard64Extra(x, 0, bytesPerElement) : 0u);
         for (std::uint32_t y = 0; y < blockHeight; ++y) table.y[y] = standardOffset(0, y, bytesPerElement) ^ (block64KB ? standard64Extra(0, y, bytesPerElement) : 0u);
-    });
+        built[block64KB][index].store(true, std::memory_order_release);
+    }
     return tables[block64KB][index];
 }
 
