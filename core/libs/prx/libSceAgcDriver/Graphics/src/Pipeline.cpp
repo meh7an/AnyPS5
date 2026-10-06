@@ -5,6 +5,7 @@
 #include "prx/libSceAgcDriver/Execution/include/ThreadScratch.hpp"
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -510,7 +511,21 @@ struct PipelineStore {
     std::uint64_t misses = 0;
     std::uint64_t uncached = 0;
     std::uint64_t evicted = 0;
+    // Draws served by their thread's last pipeline (LastPipeline), without the lock.
+    std::atomic<std::uint64_t> lastHits{0};
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
+};
+
+// A thread's last pipeline and its key: consecutive draws often share one, which then skips the
+// hash, the store's lock and its lookup. Held weakly, as the store owns its pipelines (an evicted
+// or abandoned one is gone here too), and for the device instance it was built on. Every 64th use
+// goes through the store, so its LRU order still sees the pipeline.
+struct LastPipeline {
+    std::vector<std::byte> key;
+    std::weak_ptr<Pipeline> pipeline;
+    std::weak_ptr<BufferPool> pool;
+    VkDevice device = VK_NULL_HANDLE;
+    std::uint32_t uses = 0;
 };
 
 // Never destroyed: the pipelines belong to a device that may already be gone when statics die, and
@@ -542,7 +557,7 @@ void reportPipelines(PipelineStore& store) {
     if (now - store.lastReport < std::chrono::seconds(10)) return;
     store.lastReport = now;
     const auto lookups = store.hits + store.misses + store.uncached;
-    AgcDriver::ProfilePrint_nid_no_patch( "[pipecache] %llu lookups over 10 s: %llu hits (%.0f%%), %llu misses, %llu private (no variant id), %llu evicted, %zu cached\n", static_cast<unsigned long long>(lookups), static_cast<unsigned long long>(store.hits), lookups != 0 ? 100.0 * static_cast<double>(store.hits) / static_cast<double>(lookups) : 0.0, static_cast<unsigned long long>(store.misses), static_cast<unsigned long long>(store.uncached), static_cast<unsigned long long>(store.evicted), store.entries.size());
+    AgcDriver::ProfilePrint_nid_no_patch( "[pipecache] %llu lookups over 10 s: %llu hits (%.0f%%), %llu misses, %llu private (no variant id), %llu evicted, %zu cached; %llu draws reused their thread's last pipeline\n", static_cast<unsigned long long>(lookups), static_cast<unsigned long long>(store.hits), lookups != 0 ? 100.0 * static_cast<double>(store.hits) / static_cast<double>(lookups) : 0.0, static_cast<unsigned long long>(store.misses), static_cast<unsigned long long>(store.uncached), static_cast<unsigned long long>(store.evicted), store.entries.size(), static_cast<unsigned long long>(store.lastHits.exchange(0, std::memory_order_relaxed)));
     store.hits = store.misses = store.uncached = store.evicted = 0;
 }
 
@@ -557,6 +572,22 @@ std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& st
     struct KeyTag {};
     auto& key = ThreadScratch<std::vector<std::byte>, KeyTag>();
     pipelineKey(key, context, state, vertexInput, resources, shaders, attachmentLayout);
+    struct LastTag {};
+    auto& last = ThreadScratch<LastPipeline, LastTag>();
+    if (!key.empty() && last.uses < 64 && last.device == context.device && last.key == key) {
+        if (auto pipeline = last.pipeline.lock(); pipeline != nullptr && (context.bufferPool == nullptr || last.pool.lock() == context.bufferPool)) {
+            ++last.uses;
+            store.lastHits.fetch_add(1, std::memory_order_relaxed);
+            return pipeline;
+        }
+    }
+    const auto remember = [&](const std::shared_ptr<Pipeline>& pipeline) {
+        last.key = key;
+        last.pipeline = pipeline;
+        last.pool = context.bufferPool;
+        last.device = context.device;
+        last.uses = 0;
+    };
     const auto hash = key.empty() ? 0 : hashKey(key);
     std::lock_guard lock(store.mutex);
     reportPipelines(store);
@@ -572,6 +603,7 @@ std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& st
             if (alive(*it, context)) {
                 ++store.hits;
                 store.entries.splice(store.entries.end(), store.entries, it);
+                remember(it->pipeline);
                 return it->pipeline;
             }
             abandon(store, it);
@@ -599,6 +631,7 @@ std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& st
         store.entries.erase(victim);
         ++store.evicted;
     }
+    remember(pipeline);
     return pipeline;
 }
 
