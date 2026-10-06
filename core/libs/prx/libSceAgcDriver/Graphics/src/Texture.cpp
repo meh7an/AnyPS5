@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libc/include/General.hpp"
+#include "prx/libc/include/HostThreadSlot.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
@@ -1000,7 +1001,8 @@ bool FillClearColor(VkFormat format, std::uint32_t elementBytes, std::span<const
 
 // The image being validated by Refresh: its own pending results are what the next dispatch wants,
 // so the comparison with guest memory must not flush them.
-thread_local const StorageTexture* refreshing = nullptr;
+struct RefreshingTag;
+using Refreshing = HostThreadSlot<const StorageTexture*, RefreshingTag>;
 
 void FlushHook(std::uint64_t address, std::size_t bytes) {
     StorageTexture::FlushPending(address, bytes);
@@ -1243,11 +1245,11 @@ bool StorageTexture::Refresh() {
     auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     struct Exempt {
         const StorageTexture* previous;
-        ~Exempt() { refreshing = previous; }
-    } exempt{refreshing};
+        ~Exempt() { Refreshing::Set(previous); }
+    } exempt{Refreshing::Get()};
     // This image's own pending results stay on the GPU, where the next dispatch wants them (the
     // flush below and the compare through the hook skip it).
-    refreshing = this;
+    Refreshing::Set(this);
     NoteProved();
     // The last pass's answer (current, no alias) holds while the pending registry is as that pass
     // left it (no other image's results to store first; an image becoming pending over the surface
@@ -2408,7 +2410,7 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
     {
         auto& pending = Pending();
         std::lock_guard lock(pending.mutex);
-        const auto* exempt = refreshing;
+        const auto* exempt = Refreshing::Get();
         for (auto it = pending.textures.MayOverlap(address, bytes) ? pending.textures.begin() : pending.textures.end(); it != pending.textures.end();) {
             auto* texture = *it;
             if (texture != except && texture != exempt && texture->overlaps(address, bytes)) {
@@ -2543,7 +2545,7 @@ std::vector<std::shared_ptr<StorageTexture>> StorageTexture::overlappingPending(
     auto& pending = Pending();
     std::lock_guard lock(pending.mutex);
     if (!pending.textures.MayOverlap(address, bytes)) return overlapping;
-    const auto* exempt = refreshing;
+    const auto* exempt = Refreshing::Get();
     for (auto* texture : pending.textures) {
         if (texture == exempt || !texture->overlaps(address, bytes) || !texture->pendingUnitInside(address, bytes)) continue;
         if (auto alive = texture->weak_from_this().lock()) overlapping.push_back(std::move(alive));
@@ -2720,7 +2722,7 @@ std::size_t StorageTexture::DiscardPendingInside(std::uint64_t address, std::siz
     std::lock_guard lock(pending.mutex);
     std::size_t discarded = 0;
     const auto end = address + bytes;
-    const auto* exempt = refreshing;
+    const auto* exempt = Refreshing::Get();
     for (auto it = pending.textures.begin(); it != pending.textures.end();) {
         auto* texture = *it;
         const auto begin = texture->descriptor.baseAddress;

@@ -166,7 +166,8 @@ private:
     void traceCopyPending(const char* what, std::uint64_t address, std::size_t bytes, std::uint64_t source, std::uint64_t destination, std::size_t copyBytes, const std::shared_ptr<VulkanDevice>& localDevice);
     static void countIndirect(int path, double readMs);
     void dispatchIndirect(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission);
-    static bool& sampledRead();
+    static bool sampledRead();
+    static void setSampledRead(bool sampled);
     static bool writeEvidenceEnabled();
     static bool writerKeyedEvidence();
     static bool foreignWriters();
