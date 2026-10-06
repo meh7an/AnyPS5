@@ -7,6 +7,7 @@
 #include "CacheKey.hpp"
 #include "CompiledVariant.hpp"
 #include "ShaderDiskCache.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include <list>
 #include <mutex>
 #include <new>
@@ -194,7 +195,7 @@ struct EmissionFailure {
 };
 
 struct SourceEntry {
-    std::mutex mutex;
+    AgcDriver::Mutex mutex;
     // The code the entry was built for: the key carries only a hash of it, so a candidate entry is
     // accepted only when its code matches word for word. Owned here because the request's span
     // points into a registration the driver may replace while the entry lives on.
