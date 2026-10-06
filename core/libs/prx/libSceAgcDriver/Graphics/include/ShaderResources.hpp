@@ -545,11 +545,16 @@ public:
 private:
     void erase(const Key& key);
     void noteMiss(const Key& key);
+    // FNV-1a over two words at a time (a draw key is about a hundred words, hashed on every lookup).
+    // Not noexcept on purpose: libstdc++ then keeps each node's hash, so a bucket walk compares
+    // stored hashes instead of hashing every key it passes.
     struct KeyHash {
-        std::size_t operator()(const Key& key) const noexcept {
+        std::size_t operator()(const Key& key) const {
             std::uint64_t hash = 14695981039346656037ull;
-            for (const auto word : key) hash = (hash ^ word) * 1099511628211ull;
-            return static_cast<std::size_t>(hash);
+            std::size_t at = 0;
+            for (; at + 2 <= key.size(); at += 2) hash = (hash ^ (key[at] | static_cast<std::uint64_t>(key[at + 1]) << 32u)) * 1099511628211ull;
+            if (at < key.size()) hash = (hash ^ key[at]) * 1099511628211ull;
+            return static_cast<std::size_t>(hash ^ (hash >> 32u));
         }
     };
     mutable AgcDriver::Mutex mutex;
