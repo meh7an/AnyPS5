@@ -209,23 +209,62 @@ ShaderRecompiler::ShaderVertexStageInfo DecodeVertexStageInfo(std::span<const st
         read.size = static_cast<std::uint32_t>(bytes.size());
     };
     if (reads != nullptr) reads->reserve(reads->size() + 2u * shader.num_input_semantics);
+    // Each table is read once over the span its words take (one flush and one range check instead
+    // of one per word); a span that is not readable whole is read word by word as before.
+    constexpr std::size_t SpanBytes = 512;
+    std::array<std::byte, SpanBytes> span{};
+    std::uint64_t spanBegin = 0;
+    std::uint64_t spanEnd = 0;
+    const auto readSpan = [&](std::uint64_t begin, std::uint64_t end) {
+        spanBegin = spanEnd = 0;
+        if (end <= begin || end - begin > SpanBytes) return;
+        try {
+            AgcDriver::GuestMemory::Read(begin, std::span(span).first(static_cast<std::size_t>(end - begin)), 4);
+        } catch (const std::runtime_error&) {
+            return;
+        }
+        spanBegin = begin;
+        spanEnd = end;
+    };
+    const auto read = [&](std::uint64_t address, std::span<std::byte> bytes) {
+        if (address >= spanBegin && address + bytes.size() <= spanEnd) std::memcpy(bytes.data(), span.data() + (address - spanBegin), bytes.size());
+        else AgcDriver::GuestMemory::Read(address, bytes, 4);
+    };
+    std::uint32_t firstSemantic = ~0u;
+    std::uint32_t lastSemantic = 0;
+    for (std::uint32_t i = 0; i < shader.num_input_semantics; ++i) {
+        firstSemantic = std::min<std::uint32_t>(firstSemantic, semantics[i].semantic);
+        lastSemantic = std::max<std::uint32_t>(lastSemantic, semantics[i].semantic);
+    }
+    readSpan(attribTableAddr + static_cast<std::uint64_t>(firstSemantic) * 4u, attribTableAddr + (static_cast<std::uint64_t>(lastSemantic) + 1u) * 4u);
+    std::array<std::array<std::byte, 4>, ShaderRecompiler::ShaderVertexStageInfo::MaxResources> attribWords{};
+    std::uint32_t firstIndex = ~0u;
+    std::uint32_t lastIndex = 0;
     for (std::uint32_t i = 0; i < shader.num_input_semantics; ++i) {
         const auto& semantic = semantics[i];
         if (semantic.static_vb_index == 1 || semantic.static_attribute == 1) throw std::runtime_error("AGC graphics: statically bound vertex attributes are not implemented");
-        std::array<std::byte, 4> attribWordBytes{};
-        const auto attribWordAddress = attribTableAddr + static_cast<std::uint64_t>(semantic.semantic) * 4u;
-        AgcDriver::GuestMemory::Read(attribWordAddress, attribWordBytes, 4);
-        record(attribWordAddress, attribWordBytes);
+        read(attribTableAddr + static_cast<std::uint64_t>(semantic.semantic) * 4u, attribWords[i]);
         std::uint32_t attribWord;
-        std::memcpy(&attribWord, attribWordBytes.data(), 4);
+        std::memcpy(&attribWord, attribWords[i].data(), 4);
+        const auto index = attribWord & 0x1fu;
+        if (index >= ShaderRecompiler::ShaderVertexStageInfo::MaxResources) throw std::runtime_error("AGC graphics: vertex buffer index exceeds the supported domain");
+        firstIndex = std::min(firstIndex, index);
+        lastIndex = std::max(lastIndex, index);
+    }
+    readSpan(bufferTableAddr + static_cast<std::uint64_t>(firstIndex) * 16u, bufferTableAddr + (static_cast<std::uint64_t>(lastIndex) + 1u) * 16u);
+    for (std::uint32_t i = 0; i < shader.num_input_semantics; ++i) {
+        const auto& semantic = semantics[i];
+        const auto attribWordAddress = attribTableAddr + static_cast<std::uint64_t>(semantic.semantic) * 4u;
+        record(attribWordAddress, attribWords[i]);
+        std::uint32_t attribWord;
+        std::memcpy(&attribWord, attribWords[i].data(), 4);
         const auto index = attribWord & 0x1fu;
         const auto format = (attribWord >> 5u) & 0x1ffu;
         const auto offset = (attribWord >> 14u) & 0xfffu;
         const auto fetchIndex = (attribWord >> 26u) & 0x1u;
-        if (index >= ShaderRecompiler::ShaderVertexStageInfo::MaxResources) throw std::runtime_error("AGC graphics: vertex buffer index exceeds the supported domain");
         std::array<std::byte, 16> sharpBytes{};
         const auto sharpAddress = bufferTableAddr + static_cast<std::uint64_t>(index) * 16u;
-        AgcDriver::GuestMemory::Read(sharpAddress, sharpBytes, 4);
+        read(sharpAddress, sharpBytes);
         record(sharpAddress, sharpBytes);
         std::array<std::uint32_t, 4> sharp{};
         std::memcpy(sharp.data(), sharpBytes.data(), 16);
