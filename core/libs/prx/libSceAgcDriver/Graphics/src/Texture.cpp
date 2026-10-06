@@ -836,7 +836,8 @@ private:
 
 // Storage images whose results have not reached guest memory yet.
 struct PendingWrites {
-    AgcDriver::Mutex mutex;
+    // A cache line of its own, apart from pendingSerial, which every pending query reads.
+    alignas(64) AgcDriver::Mutex mutex;
     PendingList textures;
     // Images taken out of `textures` by a FlushPending still storing them (see adjacentPendingUnchanged).
     std::vector<StorageTexture*> flushing;
@@ -3826,10 +3827,10 @@ void StorageTexture::release() noexcept {
     firstLayerViews.clear();
     for (const auto& [key, atomic] : atomicViews) context.Function<PFN_vkDestroyImageView>("vkDestroyImageView")(context.device, atomic, nullptr);
     atomicViews.clear();
-    for (const auto& [key, uint] : uintViews) context.Function<PFN_vkDestroyImageView>("vkDestroyImageView")(context.device, uint, nullptr);
-    uintViews.clear();
     for (const auto& [mip, extra] : arrayViews) context.Function<PFN_vkDestroyImageView>("vkDestroyImageView")(context.device, extra, nullptr);
     arrayViews.clear();
+    for (const auto& [key, uint] : uintViews) context.Function<PFN_vkDestroyImageView>("vkDestroyImageView")(context.device, uint, nullptr);
+    uintViews.clear();
     for (const auto& [format, attachment] : attachmentViews) context.Function<PFN_vkDestroyImageView>("vkDestroyImageView")(context.device, attachment, nullptr);
     attachmentViews.clear();
     if (proxyView) context.Function<PFN_vkDestroyImageView>("vkDestroyImageView")(context.device, proxyView, nullptr);

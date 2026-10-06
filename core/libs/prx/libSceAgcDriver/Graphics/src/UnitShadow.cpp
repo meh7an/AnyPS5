@@ -98,7 +98,8 @@ struct UnitShadow {
 };
 
 struct Shadows {
-    AgcDriver::Mutex mutex;
+    // A cache line of its own: every draw locks it, and counters other threads write sat beside it.
+    alignas(64) AgcDriver::Mutex mutex;
     std::map<std::uint64_t, std::shared_ptr<UnitShadow>> byBase;
     std::uint64_t liveBytes = 0;
     std::uint64_t peakBytes = 0;
