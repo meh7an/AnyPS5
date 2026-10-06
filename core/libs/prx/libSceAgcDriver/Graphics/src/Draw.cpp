@@ -773,6 +773,9 @@ void KeepDrawInput(Recorder* recorder, std::uint64_t address, const DrawInputCop
 
 namespace {
 
+// A draw's vertex buffer copies (one or two for most draws): four inline, more spill to the heap.
+using VertexBufferList = InlineList<std::shared_ptr<Buffer>, 4>;
+
 // The draw's inputs before its resources (prepareDrawInputs): the validated parameters, the index
 // buffer copy with its highest index, the vertex buffer copies and their layout, the fragment
 // outputs and the pipeline stages.
@@ -785,7 +788,7 @@ struct DrawInputs {
     VkDeviceSize indexOffset = 0;
     std::uint32_t maxIndex = 0;
     VertexInputLayout vertexInput;
-    InlineList<std::shared_ptr<Buffer>, 16> vertexBuffers;
+    VertexBufferList vertexBuffers;
     InlineList<VkBuffer, 16> vertexHandles;
     InlineList<VkDeviceSize, 16> vertexOffsets;
     // A bit per color target the pixel shader exports to (CachedFragmentOutputs).
@@ -1331,21 +1334,26 @@ std::function<void()> indirectRecordCheck(const IndirectRecord* indirect) {
     };
 }
 
-// Everything a recorded draw uses lives until its batch completes.
+// A draw's resident targets, one per color attachment (one for most draws): four inline, more spill
+// to the heap. Handed from the draw to its record and kept objects without an allocation.
+using TargetList = InlineList<std::shared_ptr<StorageTexture>, 4>;
+
+// Everything a recorded draw uses lives until its batch completes. One is built and torn down for
+// every draw, so its lists stay small.
 struct Kept {
     std::shared_ptr<ShaderResources> resources;
     std::shared_ptr<Pipeline> pipeline;
     std::shared_ptr<Framebuffer> framebuffer;
     std::shared_ptr<Buffer> indices;
-    InlineList<std::shared_ptr<Buffer>, 16> vertexBuffers;
-    std::vector<std::shared_ptr<StorageTexture>> targets;
+    VertexBufferList vertexBuffers;
+    TargetList targets;
     std::unique_ptr<DeviceBuffer> scratch;
 };
 
 // The completion side of a recorded draw: the kept objects, the record check, the lease outcome,
 // the GPU write notes, the copied-buffer write-back (listed in DrawCopiedWriters or run as a
 // completion action) and the targets marked dirty.
-void keepRecordedDraw(Recorder& recorder, const std::shared_ptr<ShaderResources>& resources, std::shared_ptr<Pipeline> pipeline, std::shared_ptr<Framebuffer> framebuffer, DrawInputs& inputs, std::vector<std::shared_ptr<StorageTexture>> targets, std::unique_ptr<DeviceBuffer> scratch, std::function<void()> checkRecords, bool listed, bool completion, const DrawOutcome& outcome) {
+void keepRecordedDraw(Recorder& recorder, const std::shared_ptr<ShaderResources>& resources, std::shared_ptr<Pipeline> pipeline, std::shared_ptr<Framebuffer> framebuffer, DrawInputs& inputs, TargetList targets, std::unique_ptr<DeviceBuffer> scratch, std::function<void()> checkRecords, bool listed, bool completion, const DrawOutcome& outcome) {
     auto kept = std::make_shared<Kept>();
     kept->resources = resources;
     kept->pipeline = std::move(pipeline);
@@ -1393,7 +1401,7 @@ struct RecordedDraw {
     std::shared_ptr<Pipeline> pipeline;
     std::shared_ptr<Framebuffer> framebuffer;
     std::span<const VkImageView> targetViews;
-    std::vector<std::shared_ptr<StorageTexture>> targets;
+    TargetList targets;
     std::vector<std::shared_ptr<StorageTexture>> proxies;
     const IndirectRecord* indirect = nullptr;
     std::span<const ShaderResources::MovedBuffer> moved;
@@ -1776,7 +1784,8 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     static AgcDriver::Mutex dumpMutex;
     static std::map<std::uint64_t, int> dumped;
     std::vector<TargetBinding> targets(state.colors.size());
-    std::vector<VkImageView> targetViews;
+    // A view per color target and one for the depth surface.
+    InlineList<VkImageView, 9> targetViews;
     for (std::size_t index = 0; index < state.colors.size(); ++index) {
         auto& binding = targets[index];
         binding.color = state.colors[index];
@@ -1979,8 +1988,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     auto pipeline = CachedPipeline(context, pipelineState, inputs.vertexInput, *resources, shaders, lean ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
     // Resident targets' views are stable while their storage image lives, so the framebuffer is
     // reused with the pipeline; a per-draw RenderTarget gets a framebuffer of its own.
-    std::vector<std::shared_ptr<StorageTexture>> owners;
-    owners.reserve(targets.size());
+    TargetList owners;
     for (const auto& binding : targets) owners.push_back(binding.resident);
     auto framebuffer = pipeline->AcquireFramebuffer(targetViews, owners, state.renderExtent);
     timer.phase(PhasePipeline);
@@ -1993,7 +2001,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         record.pipeline = pipeline;
         record.framebuffer = framebuffer;
         record.targetViews = targetViews;
-        record.targets = owners;
+        record.targets = std::move(owners);
         for (const auto& binding : targets) {
             if (binding.proxied) record.proxies.push_back(binding.resident);
         }
@@ -2013,8 +2021,8 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
             recipe->key = contentKey;
             recipe->pipeline = pipeline;
             recipe->framebuffer = framebuffer;
-            for (const auto& owner : owners) recipe->targets.emplace_back(owner);
-            recipe->targetViews = targetViews;
+            for (const auto& binding : targets) recipe->targets.emplace_back(binding.resident);
+            recipe->targetViews.assign(targetViews.begin(), targetViews.end());
             std::uint64_t passKey = 14695981039346656037ull;
             for (const auto view : targetViews) passKey = (passKey ^ reinterpret_cast<std::uint64_t>(view)) * 1099511628211ull;
             passKey = (passKey ^ state.renderExtent.width) * 1099511628211ull;
@@ -2184,7 +2192,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     APS5_LOG_CHARS_OUT_DEBUG("SubmitAndWait");
     timer.phase(PhaseRecord);
     if (recorded) {
-        keepRecordedDraw(*recorder, resources, pipeline, framebuffer, inputs, owners, std::move(scratch), std::move(checkRecords), listed, completion, outcome);
+        keepRecordedDraw(*recorder, resources, pipeline, framebuffer, inputs, std::move(owners), std::move(scratch), std::move(checkRecords), listed, completion, outcome);
         timer.phase(PhaseKeep);
         if (outcome.waited) {
             // The wait the dispatch path makes for such work (source 3, "address-based"): the
@@ -2303,8 +2311,7 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
     // what the lookup would return, and Refresh brings it up to date exactly as the lookup's does
     // (FlushPending, the whole-surface collect and UnchangedSince, the key scan). An image gone
     // from the cache is a miss: the ordinary path looks up anew.
-    std::vector<std::shared_ptr<StorageTexture>> targets;
-    targets.reserve(recipe.targets.size());
+    TargetList targets;
     for (std::size_t index = 0; index < recipe.targets.size(); ++index) {
         timer.phase(PhaseSetup);
         auto stored = recipe.targets[index].lock();

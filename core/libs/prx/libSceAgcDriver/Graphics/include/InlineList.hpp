@@ -42,6 +42,8 @@ public:
     bool empty() const { return count == 0; }
     T& operator[](std::size_t index) { return data()[index]; }
     const T& operator[](std::size_t index) const { return data()[index]; }
+    T& front() { return data()[0]; }
+    const T& front() const { return data()[0]; }
     T& back() { return data()[count - 1]; }
     T* begin() { return data(); }
     T* end() { return data() + count; }
