@@ -1,6 +1,7 @@
 #ifndef CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_QUEUESTATE_HPP
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_QUEUESTATE_HPP
 
+#include <atomic>
 #include <bit>
 #include <cstddef>
 #include <cstdint>
@@ -173,6 +174,12 @@ struct Predication {
     bool executeWhenSet = false;
 };
 
+// A decode generation no queue has had before (QueueState::decodeGeneration).
+inline std::uint64_t NextDecodeGeneration() {
+    static std::atomic<std::uint64_t> next{0};
+    return next.fetch_add(1, std::memory_order_relaxed) + 1;
+}
+
 struct QueueState {
     Registers shader;
     Registers context = InitialContextRegisters();
@@ -187,9 +194,15 @@ struct QueueState {
     std::uint32_t instanceCount = 1;
     std::vector<std::string> markers;
     Predication predication;
+    // Moves to a value no queue has had whenever a register a draw's decode or precheck reads may
+    // have changed: any changed context or user-config value, a changed shader register outside the
+    // user words and the merged stages' user pointers (read again for every draw), a context clear
+    // or restore. Zero until the first such change: nothing is memoized under it.
+    std::uint64_t decodeGeneration = 0;
 
     void ClearContext() {
         context = InitialContextRegisters();
+        decodeGeneration = NextDecodeGeneration();
     }
 };
 

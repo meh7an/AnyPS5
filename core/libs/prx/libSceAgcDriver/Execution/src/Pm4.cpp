@@ -81,10 +81,18 @@ Registers& registersFor(QueueState& queue, std::uint32_t opcode) {
     return queue.userConfig;
 }
 
+// The shader registers a draw reads again every time (QueueState::decodeGeneration): the user
+// words of the pixel, vertex/geometry and hull stages and the merged stages' user pointers.
+bool perDrawShaderRegister(std::uint32_t offset) {
+    return offset - 0x0cu < 32u || offset - 0x8cu < 32u || offset - 0x10cu < 32u || offset - 0x82u < 2u || offset - 0x102u < 2u;
+}
+
 void writeRegister(QueueState& queue, std::uint32_t opcode, std::uint32_t offset, std::uint32_t value) {
     if ((opcode == 0x69 || opcode == 0x9f) && (offset == 0x8e || offset == 0x8f || offset == 0x318 || offset == 0x31b || offset == 0x31c || offset == 0x31d || offset == 0x390 || offset == 0x3b0 || offset == 0x3b8))
         APS5_LOG_OUT_DEBUG("CONTEXT WRITE opcode=0x%x offset=0x%x value=0x%x", opcode, offset, value);
-    registersFor(queue, opcode).insert_or_assign(offset, value);
+    auto& registers = registersFor(queue, opcode);
+    if ((&registers != &queue.shader || !perDrawShaderRegister(offset)) && (!registers.contains(offset) || std::as_const(registers).at(offset) != value)) queue.decodeGeneration = NextDecodeGeneration();
+    registers.insert_or_assign(offset, value);
     if (TraceContextState() && (opcode == 0x69 || opcode == 0x9f) && ((offset >= 0x318 && offset < 0x318 + 8 * 0xf && (offset - 0x318) % 0xf == 0) || offset == 0x8e)) std::fprintf(stderr, "[context]   write %x = %08x (0x%x)\n", offset, value, opcode);
     if ((opcode == 0x64 || opcode == 0x79 || opcode == 0x7a) && offset == 0x243) queue.indexType = value & 3u;
 }
@@ -781,6 +789,7 @@ void Execute(std::span<const std::uint32_t> packet, QueueState& queue) {
                             require(queue.savedContext.has_value(), "context state has not been pushed");
                             queue.context = std::move(*queue.savedContext);
                             queue.savedContext.reset();
+                            queue.decodeGeneration = NextDecodeGeneration();
                             break;
                     }
                     APS5_LOG_OUT_DEBUG("CONTEXT_STATE done operation=%u targetMaskAfter=0x%x shaderMaskAfter=0x%x", packet[1], queue.context.contains(0x8e) ? queue.context.at(0x8e) : 0u, queue.context.contains(0x8f) ? queue.context.at(0x8f) : 0u);

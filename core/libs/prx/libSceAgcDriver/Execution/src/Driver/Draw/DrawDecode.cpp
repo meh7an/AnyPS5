@@ -2,8 +2,81 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ThreadScratch.hpp"
+#include <cstdio>
+#include <cstdlib>
 
 namespace AgcDriver::DriverDetail {
+
+namespace {
+
+// A merged stage's user pointer words into the front of its userData (left zero when unset).
+void readMergedPointer(const QueueState& queue, DrawProgram& program) {
+    const auto pointerBase = program.mergedPointer;
+    if (!program.mergedPointerRequired && !queue.shader.contains(pointerBase) && !queue.shader.contains(pointerBase + 1)) return;
+    const auto low = readRegister(queue.shader, pointerBase);
+    const auto high = readRegister(queue.shader, pointerBase + 1);
+    const auto address = static_cast<std::uint64_t>(low) | (static_cast<std::uint64_t>(high) << 32u);
+    require(address != 0 || !program.mergedPointerRequired, "merged shader user-data address is null");
+    if (address == 0) return;
+    GuestMemory::CheckRange(reinterpret_cast<const void*>(address), 8, 4);
+    program.userData[0] = low;
+    program.userData[1] = high;
+}
+
+// A decoded program's user words read again, as decodeDraw read them: everything else in the
+// decode depends on registers QueueState::decodeGeneration covers.
+void rereadUserData(const QueueState& queue, DrawProgram& program) {
+    const std::size_t front = program.mergedPointer != 0 ? 8 : 0;
+    for (std::size_t i = front; i < program.userData.size(); ++i) program.userData[i] = readRegister(queue.shader, program.userDataBase + static_cast<std::uint32_t>(i - front));
+    if (front == 0) return;
+    program.userData[0] = 0;
+    program.userData[1] = 0;
+    readMergedPointer(queue, program);
+}
+
+// The thread's last decode, reused for a draw with the same decode generation, shader registry
+// and guest mappings (an even ForgetSerial: the decode's CheckRange answers hold), its user words
+// read again. Only while nothing else holds it: a draw cache entry may keep a decode.
+// APS5_NO_DECODE_MEMO=1 decodes every draw; APS5_VERIFY_DECODE_MEMO=1 also decodes every hit and
+// compares the decodes and the registers they came from.
+struct DecodeMemo {
+    std::uint64_t generation = 0;
+    std::shared_ptr<const ShaderRegistry> registry;
+    std::uint64_t forgetSerial = 1;
+    std::shared_ptr<DrawDecode> decode;
+    Registers context, shader, userConfig;
+    std::uint64_t hits = 0, misses = 0, verified = 0, registerMismatches = 0, decodeMismatches = 0;
+};
+
+struct DecodeMemoTag;
+
+bool DecodeMemoEnabled() {
+    static const bool enabled = std::getenv("APS5_NO_DECODE_MEMO") == nullptr;
+    return enabled;
+}
+
+bool VerifyDecodeMemo() {
+    static const bool verify = std::getenv("APS5_VERIFY_DECODE_MEMO") != nullptr;
+    return verify;
+}
+
+// The banks equal outside the shader registers a draw reads again (decodeGeneration's exclusions).
+bool sameDecodeRegisters(const Registers& a, const Registers& b, bool shader) {
+    const auto skip = [&](std::uint32_t offset) { return shader && (offset - 0x0cu < 32u || offset - 0x8cu < 32u || offset - 0x10cu < 32u || offset - 0x82u < 2u || offset - 0x102u < 2u); };
+    auto x = a.begin();
+    auto y = b.begin();
+    while (true) {
+        while (x != a.end() && skip((*x).first)) ++x;
+        while (y != b.end() && skip((*y).first)) ++y;
+        if (x == a.end() || y == b.end()) return x == a.end() && y == b.end();
+        if ((*x).first != (*y).first || (*x).second != (*y).second) return false;
+        ++x;
+        ++y;
+    }
+}
+
+}
 
 std::shared_ptr<DrawDecode> Driver::decodeDraw(const QueueState& queue, const Submission& submission) {
     using Stage = ShaderRecompiler::ShaderStage;
@@ -60,17 +133,11 @@ std::shared_ptr<DrawDecode> Driver::decodeDraw(const QueueState& queue, const Su
         const auto initializeMerged = [&](DrawProgram& program, std::uint32_t pointerBase, bool pointerRequired) {
             program.firstUserSgpr = 0;
             program.userData.insert(program.userData.begin(), 8, 0);
+            program.mergedPointer = pointerBase;
+            program.mergedPointerRequired = pointerRequired;
             Graphics::NoteRegisterRead(Graphics::RegisterBank::Shader, pointerBase);
             Graphics::NoteRegisterRead(Graphics::RegisterBank::Shader, pointerBase + 1);
-            if (!pointerRequired && !queue.shader.contains(pointerBase) && !queue.shader.contains(pointerBase + 1)) return;
-            const auto low = readRegister(queue.shader, pointerBase);
-            const auto high = readRegister(queue.shader, pointerBase + 1);
-            const auto address = static_cast<std::uint64_t>(low) | (static_cast<std::uint64_t>(high) << 32u);
-            require(address != 0 || !pointerRequired, "merged shader user-data address is null");
-            if (address == 0) return;
-            GuestMemory::CheckRange(reinterpret_cast<const void*>(address), 8, 4);
-            program.userData[0] = low;
-            program.userData[1] = high;
+            readMergedPointer(queue, program);
         };
         const auto& graphics = product->state;
         if (graphics.stages.path == Graphics::ShaderPath::Tessellation) {
@@ -108,6 +175,45 @@ std::shared_ptr<DrawDecode> Driver::decodeDraw(const QueueState& queue, const Su
 }
 
 void Driver::resolveDrawDecode(const QueueState& queue, const Submission& submission, std::shared_ptr<const DrawDecode>& decode, bool registerKey, std::uint64_t drawKey, bool profile) {
+    if (decode == nullptr && !verifyDrawRecipe() && DecodeMemoEnabled() && queue.decodeGeneration != 0) {
+        auto& memo = ThreadScratch<DecodeMemo, DecodeMemoTag>();
+        const auto report = [&] {
+            if (!profile && !VerifyDecodeMemo()) return;
+            if ((memo.hits + memo.misses) % 500000 != 0) return;
+            std::fprintf(stderr, "[decode-memo] %llu hits, %llu misses; verified %llu hits: %llu register mismatches, %llu decode mismatches\n", static_cast<unsigned long long>(memo.hits), static_cast<unsigned long long>(memo.misses), static_cast<unsigned long long>(memo.verified), static_cast<unsigned long long>(memo.registerMismatches), static_cast<unsigned long long>(memo.decodeMismatches));
+        };
+        const auto serial = GuestMemory::ForgetSerial();
+        const bool settled = (serial & 1u) == 0;
+        if (settled && memo.decode != nullptr && memo.generation == queue.decodeGeneration && memo.forgetSerial == serial && memo.registry == submission.shaders && memo.decode.use_count() == 1) {
+            for (auto& program : memo.decode->programs) rereadUserData(queue, program);
+            ++memo.hits;
+            if (VerifyDecodeMemo()) {
+                ++memo.verified;
+                const bool registersSame = sameDecodeRegisters(memo.context, queue.context, false) && sameDecodeRegisters(memo.shader, queue.shader, true) && sameDecodeRegisters(memo.userConfig, queue.userConfig, false);
+                const bool decodeSame = sameDecode(*decodeDraw(queue, submission), *memo.decode);
+                if (!registersSame) ++memo.registerMismatches;
+                if (!decodeSame) ++memo.decodeMismatches;
+                if ((!registersSame || !decodeSame) && memo.registerMismatches + memo.decodeMismatches <= 20) std::fprintf(stderr, "[decode-memo] verify: a hit at generation %llu %s\n", static_cast<unsigned long long>(memo.generation), !registersSame ? "came from other registers" : "decodes differently");
+            }
+            report();
+            decode = memo.decode;
+            return;
+        }
+        auto fresh = decodeDraw(queue, submission);
+        ++memo.misses;
+        memo.generation = queue.decodeGeneration;
+        memo.registry = submission.shaders;
+        memo.forgetSerial = settled ? serial : 1;
+        memo.decode = fresh;
+        if (VerifyDecodeMemo()) {
+            memo.context = queue.context;
+            memo.shader = queue.shader;
+            memo.userConfig = queue.userConfig;
+        }
+        report();
+        decode = std::move(fresh);
+        return;
+    }
     if (decode == nullptr || verifyDrawRecipe()) {
         std::vector<Graphics::RegisterRead> readLog;
         const Graphics::RegisterReadLogScope logScope(verifyDrawRecipe() && registerKey ? &readLog : nullptr);

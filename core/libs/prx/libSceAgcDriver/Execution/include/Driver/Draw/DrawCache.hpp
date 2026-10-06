@@ -23,6 +23,10 @@ struct DrawProgram {
 
     std::shared_ptr<const ShaderSnapshot> snapshot;
     std::size_t codeOffset = 0;
+    // A merged stage's user pointer register, or 0: userData then starts with eight words, the
+    // pointer's two (zero when it is unset) and six zeros, before the user words.
+    std::uint32_t mergedPointer = 0;
+    bool mergedPointerRequired = false;
 };
 
 struct DrawDecode {
