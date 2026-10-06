@@ -62,6 +62,8 @@ public:
     // resolution.
     std::shared_ptr<const ShaderRecompiler::ResourceCapture> Capture(const ShaderRecompiler::RecompileRequest& request, const ShaderRecompiler::SourceHandle* handle = nullptr);
     [[nodiscard]] std::vector<ShaderRecompiler::MemoryRegion> Regions() const;
+    // Regions() in place of `regions`' contents, in its capacity.
+    void Regions(std::vector<ShaderRecompiler::MemoryRegion>& regions) const;
     // The page regions read since the previous call (or construction), a word read again
     // included, the initial regions excluded: one stage's own reads on the draw path's shared
     // ShaderMemory (Regions() stays the union). The spans point into the pages, as Regions()'s do.

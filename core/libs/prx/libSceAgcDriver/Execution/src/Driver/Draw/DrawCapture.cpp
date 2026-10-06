@@ -79,7 +79,7 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::compileDrawStag
 
     if (wantRegions) stageCapture.regions = shaderMemory.TakeRecentRegions();
     recompiled[i] = true;
-    memory = shaderMemory.Regions();
+    shaderMemory.Regions(memory);
     part(StageTimes::Regions);
 
     if (drawHit) {

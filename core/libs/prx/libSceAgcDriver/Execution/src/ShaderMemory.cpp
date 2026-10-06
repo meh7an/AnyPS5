@@ -250,6 +250,12 @@ std::shared_ptr<const ShaderRecompiler::ResourceCapture> ShaderMemory::Capture(c
 
 std::vector<ShaderRecompiler::MemoryRegion> ShaderMemory::Regions() const {
     std::vector<ShaderRecompiler::MemoryRegion> result;
+    Regions(result);
+    return result;
+}
+
+void ShaderMemory::Regions(std::vector<ShaderRecompiler::MemoryRegion>& result) const {
+    result.clear();
     result.reserve(initial.size() + pages.size());
     auto next = initial.begin();
     // Both maps are ordered by address and never overlap, so a merge keeps the result sorted.
@@ -269,7 +275,6 @@ std::vector<ShaderRecompiler::MemoryRegion> ShaderMemory::Regions() const {
         }
     }
     for (; next != initial.end(); ++next) result.push_back({next->first, next->second});
-    return result;
 }
 
 std::vector<ShaderRecompiler::MemoryRegion> ShaderMemory::TakeRecentRegions() {
