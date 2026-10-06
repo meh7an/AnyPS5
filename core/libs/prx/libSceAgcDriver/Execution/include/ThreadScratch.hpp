@@ -21,6 +21,30 @@ T& ThreadScratch() {
     return *object;
 }
 
+// A container's ThreadScratch lent to one user for a scope: swapped out empty and swapped back
+// cleared, so a nested user on the thread finds it empty instead of the outer user's contents.
+template<typename T, typename Tag>
+class ThreadScratchLease {
+public:
+    ThreadScratchLease() : slot(ThreadScratch<T, Tag>()) {
+        value.swap(slot);
+        value.clear();
+    }
+
+    ~ThreadScratchLease() {
+        value.clear();
+        value.swap(slot);
+    }
+
+    ThreadScratchLease(const ThreadScratchLease&) = delete;
+    ThreadScratchLease& operator=(const ThreadScratchLease&) = delete;
+
+    T value;
+
+private:
+    T& slot;
+};
+
 }
 
 #endif

@@ -1199,9 +1199,15 @@ void ShaderResources::reportDescriptorCaches() const {
 
 std::vector<std::uint32_t> ShaderResources::ContentKey(const CompiledShader& shader, bool dataWords, bool movableBuffers) {
     Require(shader.program != nullptr, "missing compiled shader");
-    const auto& program = *shader.program;
     std::vector<std::uint32_t> key;
-    key.reserve(8 + program.bindings.size() * 12);
+    key.reserve(8 + shader.program->bindings.size() * 12);
+    AppendContentKey(key, shader, dataWords, movableBuffers);
+    return key;
+}
+
+void ShaderResources::AppendContentKey(std::vector<std::uint32_t>& key, const CompiledShader& shader, bool dataWords, bool movableBuffers) {
+    Require(shader.program != nullptr, "missing compiled shader");
+    const auto& program = *shader.program;
     key.push_back(dataWords ? 1u : 0u);
     key.push_back(static_cast<std::uint32_t>(shader.stage));
     key.push_back(static_cast<std::uint32_t>(program.variantId));
@@ -1243,7 +1249,6 @@ std::vector<std::uint32_t> ShaderResources::ContentKey(const CompiledShader& sha
         key.push_back(static_cast<std::uint32_t>(binding.imageSamplers.size()));
         key.insert(key.end(), binding.imageSamplers.begin(), binding.imageSamplers.end());
     }
-    return key;
 }
 
 namespace {

@@ -208,6 +208,8 @@ public:
     // (their count and size remain): a compute template then serves dispatches whose constants
     // differ, and the hit refreshes its data buffers with the dispatch's words (RefreshData).
     static std::vector<std::uint32_t> ContentKey(const CompiledShader& shader, bool dataWords = true, bool movableBuffers = false);
+    // ContentKey's words appended to `key`.
+    static void AppendContentKey(std::vector<std::uint32_t>& key, const CompiledShader& shader, bool dataWords = true, bool movableBuffers = false);
     // Records the shader's ShaderData and FlattenedSrt words into this object's data buffers
     // (vkCmdUpdateBuffer, a transfer write the caller's pre-dispatch barrier makes visible; a
     // buffer already holding the words is left alone). Returns whether anything was recorded. With
