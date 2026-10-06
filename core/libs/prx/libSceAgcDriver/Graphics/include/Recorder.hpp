@@ -17,6 +17,7 @@
 #include <optional>
 #include <span>
 #include <tuple>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -768,6 +769,12 @@ private:
     std::uint64_t newestSubmitted = 0;
     std::chrono::steady_clock::time_point newestSubmittedAt{};
     using DrawSnapshotKey = std::tuple<std::uint64_t, SnapshotUse, std::size_t>;
+    struct DrawSnapshotKeyHash {
+        std::size_t operator()(const DrawSnapshotKey& key) const {
+            const auto hash = (std::get<0>(key) ^ (static_cast<std::uint64_t>(std::get<2>(key)) << 20u) ^ (static_cast<std::uint64_t>(std::get<1>(key)) << 60u)) * 0x9e3779b97f4a7c15ull;
+            return static_cast<std::size_t>(hash ^ (hash >> 32u));
+        }
+    };
     struct DrawSnapshot {
         std::uint64_t generation;
         std::uint64_t registryGeneration;
@@ -779,12 +786,16 @@ private:
         std::list<DrawSnapshotKey> recency;
         std::size_t bytes = 0;
     };
-    std::map<DrawSnapshotKey, DrawSnapshot> drawSnapshots;
+    // Storage and index snapshots are found by their exact key (a hash lookup); a vertex snapshot by
+    // the smallest one at the address covering the draw's bytes (an ordered map of vertex keys only).
+    std::unordered_map<DrawSnapshotKey, DrawSnapshot, DrawSnapshotKeyHash> exactSnapshots;
+    std::map<DrawSnapshotKey, DrawSnapshot> vertexSnapshots;
     std::array<DrawSnapshotPool, 2> drawSnapshotPools;
     // The draw upload chunk being filled and its bytes in use (see DrawUpload).
     std::shared_ptr<Buffer> drawUpload;
     VkDeviceSize drawUploadUsed = 0;
-    void eraseDrawSnapshot(std::map<DrawSnapshotKey, DrawSnapshot>::iterator entry);
+    template <typename Entries>
+    void eraseDrawSnapshot(Entries& entries, typename Entries::iterator entry);
 };
 
 }
