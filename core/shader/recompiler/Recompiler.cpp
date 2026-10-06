@@ -90,6 +90,18 @@ ShaderStageInputInfo RequestInputInfo(const RecompileRequest& request) {
     return BuildShaderStageInputInfo(toShaderStageKind(request.shader.stage), request.context, HostSubgroupSize(request), mesh);
 }
 
+// RequestInputInfo's errors without its input info: a vertex-family capture only validates.
+void ValidateRequestInputs(const RecompileRequest& request) {
+    const auto stage = toShaderStageKind(request.shader.stage);
+    const bool vertexFamily = stage == ShaderStageKind::Vertex || stage == ShaderStageKind::Local || stage == ShaderStageKind::TessellationControl || stage == ShaderStageKind::TessellationEvaluation || stage == ShaderStageKind::Mesh;
+    if (!vertexFamily) {
+        static_cast<void>(RequestInputInfo(request));
+        return;
+    }
+    const auto* mesh = request.graphics && request.graphics->mesh ? &*request.graphics->mesh : nullptr;
+    ValidateVertexStageInputs(stage, request.context, mesh);
+}
+
 }
 
 IrProgram PrepareResourceProgram(const RecompileRequest& request) {
@@ -705,7 +717,7 @@ std::shared_ptr<const ResourceCapture> CaptureResources(const RecompileRequest& 
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     const auto started = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     // The whole vertex family (Vertex, Local, TC, TE, Mesh) validates V# fields the memo key does not cover.
-    if (request.shader.stage != ShaderStage::Compute && request.shader.stage != ShaderStage::Fragment) static_cast<void>(RequestInputInfo(request));
+    if (request.shader.stage != ShaderStage::Compute && request.shader.stage != ShaderStage::Fragment) ValidateRequestInputs(request);
     auto capture = std::make_shared<ResourceCapture>();
     capture->source = handle.source;
     capture->plan = handle.source->plan;
