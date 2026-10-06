@@ -97,8 +97,18 @@ public:
     static constexpr std::size_t DrawSnapshotEntries = 1024;
     static constexpr std::size_t DrawInputBudget = std::size_t{1024} << 20u;
     static constexpr std::size_t DrawInputEntries = 16384;
-    std::shared_ptr<Buffer> ReusableDrawSnapshot(std::uint64_t address, std::size_t bytes, SnapshotUse use = SnapshotUse::Storage, std::uint32_t* derived = nullptr);
+    // The kept snapshot of the range while it is current. `rewritten` (when given) is set when a kept
+    // snapshot or sighting of the range was found stale: the range was written since its last copy.
+    // `sighted` (when given) is set when the range's sighting is current: unchanged since a copy the
+    // cache did not keep (see KeepDrawSnapshot).
+    std::shared_ptr<Buffer> ReusableDrawSnapshot(std::uint64_t address, std::size_t bytes, SnapshotUse use = SnapshotUse::Storage, std::uint32_t* derived = nullptr, bool* rewritten = nullptr, bool* sighted = nullptr);
+    // Keeps `buffer` as the range's snapshot. A null `buffer` notes a sighting instead: the range was
+    // copied at `generation` into a buffer that dies with its batch. A sighting takes an entry but
+    // none of the pool's bytes.
     void KeepDrawSnapshot(std::uint64_t address, std::size_t bytes, std::uint64_t generation, std::uint64_t registryGeneration, std::shared_ptr<Buffer> buffer, SnapshotUse use = SnapshotUse::Storage, std::uint32_t derived = 0);
+    // The kept snapshots of `use`'s pool (storage, or vertex and index inputs): entries (sightings
+    // included) and bytes.
+    std::pair<std::size_t, std::size_t> DrawSnapshotPoolUse(SnapshotUse use) const;
     // Draw uploads: small per-draw copies (snapshots of small read-only guest buffers, the words of
     // moved data buffers, small index and vertex ranges) are bump-allocated at the storage buffer
     // offset alignment (at least 16, which covers index and vertex offsets) from one host

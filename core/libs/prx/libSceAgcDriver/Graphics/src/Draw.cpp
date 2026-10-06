@@ -748,27 +748,45 @@ void reportDrawEnd(const State& state, const DrawTimer& timer, const ShaderResou
 
 }
 
-DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uint64_t address, std::size_t bytes, std::size_t alignment, Recorder::SnapshotUse use) {
+DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uint64_t address, std::size_t bytes, std::size_t alignment, Recorder::SnapshotUse use, bool sighting) {
     Require(use != Recorder::SnapshotUse::Storage, "a draw input is a vertex or index buffer");
+    // The largest unproven range copied into the upload chunk (a quarter of a chunk).
+    constexpr std::size_t sightingUploadMax = Recorder::DrawUploadChunk / 4;
     DrawInputCopy copy;
+    copy.bytes = bytes;
     if (recorder != nullptr && bytes != 0) {
         GuestMemory::FlushGpuWrites(address, bytes);
         copy.registryGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
         copy.generation = GuestMemory::CollectWrites(address, bytes);
-        if (copy.generation != 0) copy.buffer = recorder->ReusableDrawSnapshot(address, bytes, use, &copy.derived);
+        bool sighted = false;
+        if (copy.generation != 0) copy.buffer = recorder->ReusableDrawSnapshot(address, bytes, use, &copy.derived, &copy.rewritten, &sighted);
         if (copy.buffer != nullptr) {
             copy.reused = true;
             return copy;
         }
+        // Not yet found unchanged since a copy: a buffer of its own would likely sit in the snapshot
+        // cache unused (a ring slot is rewritten before its next draw) while the pool allocates
+        // the next one.
+        if (sighting && !sighted && bytes <= sightingUploadMax && ShaderResources::DrawUploadLimit() != 0) {
+            auto slice = recorder->DrawUpload(bytes);
+            GuestMemory::Read(address, std::span<std::byte>(slice.bytes, bytes), alignment);
+            copy.buffer = std::move(slice.buffer);
+            copy.offset = slice.offset;
+            copy.data = slice.bytes;
+            copy.uploaded = true;
+            return copy;
+        }
     }
     copy.buffer = std::make_shared<Buffer>(context, bytes, use == Recorder::SnapshotUse::Vertex ? VK_BUFFER_USAGE_VERTEX_BUFFER_BIT : VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
+    copy.data = copy.buffer->Bytes().data();
     GuestMemory::Read(address, copy.buffer->Bytes(), alignment);
     return copy;
 }
 
 void KeepDrawInput(Recorder* recorder, std::uint64_t address, const DrawInputCopy& copy, Recorder::SnapshotUse use, std::uint32_t derived) {
     if (recorder == nullptr || copy.reused || copy.generation == 0 || copy.buffer == nullptr) return;
-    recorder->KeepDrawSnapshot(address, copy.buffer->Bytes().size(), copy.generation, copy.registryGeneration, copy.buffer, use, derived);
+    // An uploaded copy dies with its batch: the cache notes the sighting instead.
+    recorder->KeepDrawSnapshot(address, copy.bytes, copy.generation, copy.registryGeneration, copy.uploaded ? nullptr : copy.buffer, use, derived);
 }
 
 namespace {
@@ -806,7 +824,13 @@ struct VertexParts {
     enum Part { Index, Layout, Fetches, Copies, Handles, Count };
     static constexpr const char* Names[Count] = {"index", "layout", "fetches", "copies", "handles"};
     std::array<double, Count> us{};
-    std::uint64_t draws = 0, indexed = 0, indexUploaded = 0, copies = 0, uploaded = 0, reused = 0, made = 0;
+    // Vertex copies by path: uploaded (small, on every draw), reused (a kept copy), made (a kept
+    // buffer of its own) and unproven (copied into the upload chunk, see CopyDrawInput's `sighting`);
+    // `rewritten`: made or unproven after a kept copy or sighting went stale.
+    std::uint64_t draws = 0, indexed = 0, indexUploaded = 0, copies = 0, uploaded = 0, reused = 0, made = 0, madeBytes = 0, unproven = 0, unprovenBytes = 0, rewritten = 0;
+    // Index copies above the upload limit (CopyDrawInput): reused, and made fresh (after a kept copy
+    // went stale: rewritten).
+    std::uint64_t indexReused = 0, indexMade = 0, indexRewritten = 0;
     std::array<std::uint64_t, 6> sizeCount{};
     std::array<std::uint64_t, 6> sizeBytes{};
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
@@ -823,19 +847,32 @@ struct VertexParts {
         us[part] += std::chrono::duration<double, std::micro>(now - lap).count();
         lap = now;
     }
-    void noteCopy(std::size_t bytes, int path) {
+    void noteCopy(std::size_t bytes, int path, bool rewrite = false) {
         if (!enabled) return;
         ++copies;
-        ++(path == 0 ? uploaded : path == 1 ? reused : made);
+        ++(path == 0 ? uploaded : path == 1 ? reused : path == 2 ? made : unproven);
+        if (path == 2) madeBytes += bytes;
+        if (path == 3) unprovenBytes += bytes;
+        if (rewrite) ++rewritten;
         const std::size_t bucket = bytes <= 256 ? 0 : bytes <= 1024 ? 1 : bytes <= 4096 ? 2 : bytes <= 16384 ? 3 : bytes <= 65536 ? 4 : 5;
         ++sizeCount[bucket];
         sizeBytes[bucket] += bytes;
     }
-    void report() {
+    void noteIndexCopy(bool reuse, bool rewrite) {
+        if (!enabled) return;
+        ++(reuse ? indexReused : indexMade);
+        if (rewrite) ++indexRewritten;
+    }
+    void report(const Recorder* recorder) {
         if (!enabled) return;
         const auto now = std::chrono::steady_clock::now();
         if (now - lastReport < std::chrono::seconds(10) || draws == 0) return;
         lastReport = now;
+        if (recorder != nullptr) {
+            const auto [inputs, inputBytes] = recorder->DrawSnapshotPoolUse(Recorder::SnapshotUse::Vertex);
+            const auto [storage, storageBytes] = recorder->DrawSnapshotPoolUse(Recorder::SnapshotUse::Storage);
+            std::fprintf(stderr, "[vertex-parts] kept snapshots: inputs %zu (%.1f MiB), storage %zu (%.1f MiB)\n", inputs, static_cast<double>(inputBytes) / 1048576.0, storage, static_cast<double>(storageBytes) / 1048576.0);
+        }
         std::string line;
         for (std::size_t i = 0; i < Count; ++i) {
             char text[64];
@@ -849,9 +886,10 @@ struct VertexParts {
             std::snprintf(text, sizeof(text), " %s %llu (%.1f MiB)", SizeNames[i], static_cast<unsigned long long>(sizeCount[i]), static_cast<double>(sizeBytes[i]) / 1048576.0);
             sizes += text;
         }
-        std::fprintf(stderr, "[vertex-parts] %llu draws (%llu indexed, %llu index copies uploaded; %llu vertex copies: %llu uploaded, %llu reused, %llu made), us per draw:%s; vertex copy sizes:%s\n", static_cast<unsigned long long>(draws), static_cast<unsigned long long>(indexed), static_cast<unsigned long long>(indexUploaded), static_cast<unsigned long long>(copies), static_cast<unsigned long long>(uploaded), static_cast<unsigned long long>(reused), static_cast<unsigned long long>(made), line.c_str(), sizes.c_str());
+        std::fprintf(stderr, "[vertex-parts] %llu draws (%llu indexed, %llu index copies uploaded, %llu kept copies reused, %llu made (%llu rewritten); %llu vertex copies: %llu uploaded, %llu reused, %llu made (%.1f MiB), %llu unproven (%.1f MiB), %llu rewritten), us per draw:%s; vertex copy sizes:%s\n", static_cast<unsigned long long>(draws), static_cast<unsigned long long>(indexed), static_cast<unsigned long long>(indexUploaded), static_cast<unsigned long long>(indexReused), static_cast<unsigned long long>(indexMade), static_cast<unsigned long long>(indexRewritten), static_cast<unsigned long long>(copies), static_cast<unsigned long long>(uploaded), static_cast<unsigned long long>(reused), static_cast<unsigned long long>(made), static_cast<double>(madeBytes) / 1048576.0, static_cast<unsigned long long>(unproven), static_cast<double>(unprovenBytes) / 1048576.0, static_cast<unsigned long long>(rewritten), line.c_str(), sizes.c_str());
         us = {};
-        draws = indexed = indexUploaded = copies = uploaded = reused = made = 0;
+        draws = indexed = indexUploaded = copies = uploaded = reused = made = madeBytes = unproven = unprovenBytes = rewritten = 0;
+        indexReused = indexMade = indexRewritten = 0;
         sizeCount = {};
         sizeBytes = {};
     }
@@ -930,7 +968,8 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
     inputs.maxIndex = draw.indexed ? 0u : draw.firstVertex + draw.indexCount - 1u;
     // Small index and vertex ranges are copied into the recorder's upload chunk on every draw
     // (Recorder::DrawUpload): cheaper than proving a kept copy unchanged. Larger ones keep their
-    // own copy, reused while the range is unchanged (CopyDrawInput).
+    // own copy, reused while the range is unchanged (CopyDrawInput); a larger vertex range goes into
+    // the chunk too until it is found unchanged since a copy (CopyDrawInput's `sighting`).
     auto* const uploads = ShaderResources::DrawUploadLimit() != 0 ? context.recorder : nullptr;
     const auto uploaded = [&](std::size_t bytes) { return uploads != nullptr && bytes != 0 && bytes <= ShaderResources::DrawUploadLimit(); };
     const auto highestIndex = [&](const std::byte* bytes) {
@@ -961,6 +1000,7 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         } else {
             const auto use = draw.indexSize == 2 ? Recorder::SnapshotUse::Index16 : Recorder::SnapshotUse::Index32;
             auto copy = CopyDrawInput(context, context.recorder, draw.indexAddress, static_cast<std::size_t>(indexBytes), draw.indexSize, use);
+            parts.noteIndexCopy(copy.reused, copy.rewritten);
             highest = copy.derived;
             if (!copy.reused) {
                 highest = highestIndex(copy.buffer->Bytes().data());
@@ -1016,9 +1056,10 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
             parts.noteCopy(bytes, 0);
             continue;
         }
-        auto copy = CopyDrawInput(context, context.recorder, begin, bytes, 1, Recorder::SnapshotUse::Vertex);
+        auto copy = CopyDrawInput(context, context.recorder, begin, bytes, 1, Recorder::SnapshotUse::Vertex, true);
         KeepDrawInput(context.recorder, begin, copy, Recorder::SnapshotUse::Vertex, 0);
-        parts.noteCopy(bytes, copy.reused ? 1 : 2);
+        parts.noteCopy(bytes, copy.reused ? 1 : copy.uploaded ? 3 : 2, copy.rewritten);
+        bases[copyIndex] = copy.offset;
         inputs.vertexBuffers.push_back(std::move(copy.buffer));
     }
     parts.mark(VertexParts::Copies);
@@ -1027,7 +1068,7 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         inputs.vertexOffsets[i] = bases[plan.copyOf[i]] + plan.offsets[i];
     }
     parts.mark(VertexParts::Handles);
-    parts.report();
+    parts.report(context.recorder);
     timer.phase(PhaseVertex);
     return inputs;
 }

@@ -1411,6 +1411,26 @@ void drawInputReuseTests(const Device& device, Recorder& recorder) {
     KeepDrawInput(&recorder, pool, after, Use::Vertex, 0);
     const auto small = CopyDrawInput(context, &recorder, pool, 4096, 1, Use::Vertex);
     Require(small.reused && small.buffer == after.buffer, "the new vertex snapshot does not serve shorter reads");
+    // With `sighting`: an unproven range is copied into the upload chunk and only noted; the copy
+    // that finds it unchanged since is kept and then reused; a store sends it back to the chunk.
+    const auto ring = address + 32768;
+    constexpr std::size_t ringBytes = 8192;
+    const auto equalsRing = [&](const DrawInputCopy& copy) { return copy.data != nullptr && std::memcmp(copy.data, reinterpret_cast<const void*>(ring), ringBytes) == 0; };
+    const auto seen = CopyDrawInput(context, &recorder, ring, ringBytes, 1, Use::Vertex, true);
+    Require(seen.uploaded && !seen.reused && equalsRing(seen), "an unproven vertex range was not copied into the upload chunk");
+    KeepDrawInput(&recorder, ring, seen, Use::Vertex, 0);
+    const auto proven = CopyDrawInput(context, &recorder, ring, ringBytes, 1, Use::Vertex, true);
+    Require(!proven.uploaded && !proven.reused && proven.offset == 0 && equalsRing(proven), "a range unchanged since its sighting got no copy of its own");
+    KeepDrawInput(&recorder, ring, proven, Use::Vertex, 0);
+    const auto again = CopyDrawInput(context, &recorder, ring, ringBytes, 1, Use::Vertex, true);
+    Require(again.reused && again.buffer == proven.buffer, "the copy made after the sighting was not kept");
+    words[(32768 + 64) / 4] = 0x5157;
+    const auto changed = CopyDrawInput(context, &recorder, ring, ringBytes, 1, Use::Vertex, true);
+    Require(changed.uploaded && changed.rewritten && equalsRing(changed), "a rewritten range did not go back to the upload chunk");
+    KeepDrawInput(&recorder, ring, changed, Use::Vertex, 0);
+    words[(32768 + 64) / 4] = 0x5158;
+    const auto changedAgain = CopyDrawInput(context, &recorder, ring, ringBytes, 1, Use::Vertex, true);
+    Require(changedAgain.uploaded && changedAgain.rewritten && equalsRing(changedAgain), "a range rewritten since its sighting was not copied into the chunk again");
     recorder.Sync();
 }
 

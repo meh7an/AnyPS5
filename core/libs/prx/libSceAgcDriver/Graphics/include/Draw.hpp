@@ -18,14 +18,28 @@ namespace AgcDriver::Graphics {
 void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots = {}, std::shared_ptr<const DrawRecipe>* recipe = nullptr);
 std::optional<std::string> KnownValidationFailure(const Context& context, std::span<const CompiledShader> shaders, const State& state);
 
+// A vertex or index range's copy for one draw: its buffer and where the range starts in it (non-zero
+// for an upload chunk slice), the copied bytes (null when reused), and the range's size.
 struct DrawInputCopy {
     std::shared_ptr<Buffer> buffer;
+    VkDeviceSize offset = 0;
+    std::byte* data = nullptr;
+    std::size_t bytes = 0;
     bool reused = false;
+    // Copied into the recorder's upload chunk (see CopyDrawInput's `sighting`).
+    bool uploaded = false;
+    // A kept copy of the range was stale (see Recorder::ReusableDrawSnapshot).
+    bool rewritten = false;
     std::uint32_t derived = 0;
     std::uint64_t generation = 0;
     std::uint64_t registryGeneration = 0;
 };
-DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uint64_t address, std::size_t bytes, std::size_t alignment, Recorder::SnapshotUse use);
+// A kept copy of the range when one is current, else a new copy. With `sighting`, a range not yet
+// found unchanged since a copy (seen for the first time, or rewritten since its last copy: a guest
+// ring's slots are rewritten before their next draw) is copied into the recorder's upload chunk,
+// and KeepDrawInput only notes a sighting; a range found unchanged since its sighting gets a buffer
+// of its own, kept and reused as before. Without it every miss makes and keeps a buffer.
+DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uint64_t address, std::size_t bytes, std::size_t alignment, Recorder::SnapshotUse use, bool sighting = false);
 void KeepDrawInput(Recorder* recorder, std::uint64_t address, const DrawInputCopy& copy, Recorder::SnapshotUse use, std::uint32_t derived);
 
 std::array<std::uint32_t, 4> MeshIndexBufferDescriptor(const Pm4::DrawParameters& draw);
