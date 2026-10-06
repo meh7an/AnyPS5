@@ -122,8 +122,6 @@ struct Module {
         } else if (vertex && storage == spv::StorageClassOutput) {
             Require(value == spv::BuiltInPosition && signature == "f32x4" && !position, "unsupported or duplicate vertex built-in output");
             position = true;
-        } else if (storage == spv::StorageClassOutput) {
-            Require(value == spv::BuiltInFragDepth && signature == "f32", "unsupported fragment built-in output");
         } else {
             Require((storage == spv::StorageClassInput && ((value == spv::BuiltInFragCoord && signature == "f32x4") || ((value == spv::BuiltInFrontFacing || value == spv::BuiltInHelperInvocation) && signature == "bool") || ((value == spv::BuiltInSampleId || value == spv::BuiltInLayer) && signature == "i32"))) || (storage == spv::StorageClassOutput && ((value == spv::BuiltInFragDepth && signature == "f32") || (value == spv::BuiltInSampleMask && (signature == "i32[1]" || signature == "u32[1]")))), "unsupported fragment built-in");
         }
@@ -387,7 +385,7 @@ Module Inspect(const CompiledShader& compiled, const State& state, const VkPhysi
         mode(spv::ExecutionModeVertexOrderCw, {});
         Require(module.modes.size() == 3, "unsupported tessellation-evaluation execution mode");
     } else if (fragment) {
-        for (const auto& [name, operands] : module.modes) Require(operands.empty() && (name == spv::ExecutionModeOriginUpperLeft || name == spv::ExecutionModeEarlyFragmentTests || name == spv::ExecutionModeDepthReplacing || name == spv::ExecutionModeDepthLess || name == spv::ExecutionModeDepthGreater || name == spv::ExecutionModePixelInterlockOrderedEXT || name == spv::ExecutionModeDepthUnchanged), "unsupported fragment execution mode");
+        for (const auto& [name, operands] : module.modes) Require(operands.empty() && (name == spv::ExecutionModeOriginUpperLeft || name == spv::ExecutionModeEarlyFragmentTests || name == spv::ExecutionModeDepthReplacing || name == spv::ExecutionModeDepthLess || name == spv::ExecutionModeDepthGreater || name == spv::ExecutionModePixelInterlockOrderedEXT), "unsupported fragment execution mode");
     } else Require(module.modes.empty(), "unsupported vertex execution mode");
     std::set<std::pair<std::uint32_t, std::uint32_t>> descriptors;
     bool push = false;
