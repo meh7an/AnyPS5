@@ -4,6 +4,7 @@
 #include <array>
 #include <cstddef>
 #include <iterator>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -32,7 +33,9 @@ public:
         for (std::size_t i = 0; i < size; ++i) push_back(value);
     }
     void clear() {
-        for (std::size_t i = 0; i < count && i < N; ++i) local[i] = T{};
+        if constexpr (!std::is_trivially_destructible_v<T>) {
+            for (std::size_t i = 0; i < count && i < N; ++i) local[i] = T{};
+        }
         heap.clear();
         count = 0;
     }
@@ -62,7 +65,9 @@ private:
         ++count;
     }
 
-    std::array<T, N> local{};
+    // Default-initialized: nothing past `count` is read, so trivial elements are left unwritten (a
+    // draw builds kilobytes of these lists) while a class type such as shared_ptr starts empty.
+    std::array<T, N> local;
     std::vector<T> heap;
     std::size_t count = 0;
 };
