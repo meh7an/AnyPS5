@@ -525,6 +525,8 @@ std::map<std::vector<std::uint64_t>, std::string>& validationFailures() {
     return failures;
 }
 
+std::atomic<bool> validationFailureRecorded{false};
+
 // The validation key of a draw, built twice per draw (KnownValidationFailure, CachedFragmentOutputs)
 // into the calling thread's buffer: a fresh vector each time was an allocation.
 std::vector<std::uint64_t>& validationKeyScratch() {
@@ -562,6 +564,7 @@ std::uint32_t CachedFragmentOutputs(const Context& context, std::span<const Comp
             auto& failures = validationFailures();
             if (failures.size() >= 1024) failures.clear();
             failures.emplace(key, error.what());
+            validationFailureRecorded.store(true, std::memory_order_release);
         }
         throw;
     }
@@ -1710,6 +1713,7 @@ bool RecordDraws() {
 }
 
 std::optional<std::string> KnownValidationFailure(const Context& context, std::span<const CompiledShader> shaders, const State& state) {
+    if (!validationFailureRecorded.load(std::memory_order_acquire)) return std::nullopt;
     auto& key = validationKeyScratch();
     if (!ValidationKey(context, shaders, state, key)) return std::nullopt;
     std::lock_guard lock(validationMutex());
