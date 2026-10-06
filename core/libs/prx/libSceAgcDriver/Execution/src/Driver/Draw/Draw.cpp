@@ -3,10 +3,89 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ThreadScratch.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include <cstdlib>
 
 namespace AgcDriver::DriverDetail {
+
+namespace {
+
+// Driver::draw's per-draw lists, kept per thread so a draw reuses the capacity of the one before.
+struct DrawScratch {
+    std::vector<ShaderRecompiler::MemoryRegion> memory;
+    std::vector<ShaderRecompiler::LinkedProgram> linked;
+    std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>> vertexInfos;
+    std::vector<std::vector<Graphics::DecodeRead>> decodeReads;
+    std::vector<std::shared_ptr<const ShaderRecompiler::RecompileResult>> results;
+    std::vector<Graphics::CompiledShader> stages;
+    std::vector<const ShaderRecompiler::RecompileResult*> programResults;
+    std::vector<StageCapture> stageCaptures;
+    std::vector<std::shared_ptr<DispatchVariant>> matched;
+    std::vector<std::vector<ShaderRecompiler::MemoryRegion>> matchedRegions;
+    std::vector<std::shared_ptr<DispatchVariant>> fresh;
+    std::vector<bool> recompiled;
+    std::vector<std::uint32_t> pushOffsets;
+    std::vector<std::size_t> resultIndex;
+    std::vector<Graphics::GuestMemorySnapshot> snapshots;
+    std::vector<std::shared_ptr<DispatchVariant>> recipeStages;
+    bool busy = false;
+
+    // Empties the lists, the inner ones of decodeReads and matchedRegions too, keeping every capacity.
+    void Clear() {
+        memory.clear();
+        linked.clear();
+        vertexInfos.clear();
+        for (auto& reads : decodeReads) reads.clear();
+        results.clear();
+        stages.clear();
+        programResults.clear();
+        stageCaptures.clear();
+        matched.clear();
+        for (auto& regions : matchedRegions) regions.clear();
+        fresh.clear();
+        recompiled.clear();
+        pushOffsets.clear();
+        resultIndex.clear();
+        snapshots.clear();
+        recipeStages.clear();
+    }
+};
+
+struct DrawScratchTag;
+
+// The thread's DrawScratch for one draw, emptied when the draw returns: the compiled stages and
+// variants in it must not outlive the draw. A draw entered again on the thread while one runs (a
+// capture retry) gets a scratch of its own.
+class DrawScratchLease {
+public:
+    DrawScratchLease() {
+        auto& shared = ThreadScratch<DrawScratch, DrawScratchTag>();
+        if (shared.busy) {
+            owned = std::make_unique<DrawScratch>();
+            scratch = owned.get();
+        } else {
+            scratch = &shared;
+        }
+        scratch->busy = true;
+    }
+
+    ~DrawScratchLease() {
+        scratch->Clear();
+        scratch->busy = false;
+    }
+
+    DrawScratchLease(const DrawScratchLease&) = delete;
+    DrawScratchLease& operator=(const DrawScratchLease&) = delete;
+
+    DrawScratch* operator->() const { return scratch; }
+
+private:
+    std::unique_ptr<DrawScratch> owned;
+    DrawScratch* scratch = nullptr;
+};
+
+}
 
 DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::string& rejected) {
     PerformanceTimer timing("Driver.Draw");
@@ -131,9 +210,10 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     }
     // The regions the stages read: two per program here, then the captures' and the decode reads.
     // Reserved once: grown a push at a time, the list was reallocated several times per draw.
-    std::vector<ShaderRecompiler::MemoryRegion> memory;
+    const DrawScratchLease scratch;
+    auto& memory = scratch->memory;
     memory.reserve(2 * programs.size() + 32);
-    std::vector<ShaderRecompiler::LinkedProgram> linked;
+    auto& linked = scratch->linked;
     linked.reserve(programs.size());
     for (std::size_t i = 0; i < programs.size(); ++i) {
         const auto& program = programs[i];
@@ -143,8 +223,10 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     timing.Mark("prepare");
     phaseTiming.Phase(DrawRowProgramPrepare);
 
-    std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>> vertexInfos(programs.size());
-    std::vector<std::vector<Graphics::DecodeRead>> decodeReads(programs.size());
+    auto& vertexInfos = scratch->vertexInfos;
+    vertexInfos.resize(programs.size());
+    auto& decodeReads = scratch->decodeReads;
+    decodeReads.resize(programs.size());
     const auto decodeVertexInfo = [&](std::size_t i) {
         const auto& program = programs[i];
         if (program.binary.stage == Stage::Fragment || roles[i] == Role::GeometryBack) return;
@@ -158,22 +240,28 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     ShaderMemory shaderMemory(memory, &queryPendingWrite, &observePendingWrite, hookWaitCounter());
     // The compiled stages of a miss (shared with the capture, never copied) and the rect-list's
     // generated stages; `stages` points into both.
-    std::vector<std::shared_ptr<const ShaderRecompiler::RecompileResult>> results;
+    auto& results = scratch->results;
     std::array<ShaderRecompiler::RecompileResult, 2> rectStages;
-    std::vector<Graphics::CompiledShader> stages;
+    auto& stages = scratch->stages;
     results.reserve(programs.size());
     stages.reserve(programs.size() + (graphics.rectList ? 2u : 0u));
     std::uint32_t pushCursorBytes = 0;
 
-    std::vector<const ShaderRecompiler::RecompileResult*> programResults(programs.size(), nullptr);
+    auto& programResults = scratch->programResults;
+    programResults.assign(programs.size(), nullptr);
 
-    std::vector<StageCapture> stageCaptures(programs.size());
-    std::vector<std::shared_ptr<DispatchVariant>> matched(programs.size());
-    std::vector<std::vector<ShaderRecompiler::MemoryRegion>> matchedRegions(programs.size());
+    auto& stageCaptures = scratch->stageCaptures;
+    stageCaptures.resize(programs.size());
+    auto& matched = scratch->matched;
+    matched.resize(programs.size());
+    auto& matchedRegions = scratch->matchedRegions;
+    matchedRegions.resize(programs.size());
 
-    std::vector<std::shared_ptr<DispatchVariant>> fresh(programs.size());
+    auto& fresh = scratch->fresh;
+    fresh.resize(programs.size());
 
-    std::vector<bool> recompiled(programs.size(), false);
+    auto& recompiled = scratch->recompiled;
+    recompiled.assign(programs.size(), false);
     bool drawHit = false;
     bool verifyHit = false;
     lookupDraw(submission, localDevice, graphics, pixel, programs, roles, vertexInfos, useDrawEntries, registerKey, profile, drawKey, entry, matched, matchedRegions, drawHit, verifyHit, phaseTiming, phaseMs);
@@ -210,8 +298,10 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     };
 
     std::optional<Graphics::IndirectDrawPath> indirectCpu;
-    std::vector<std::uint32_t> pushOffsets(programs.size(), 0);
-    std::vector<std::size_t> resultIndex(programs.size(), 0);
+    auto& pushOffsets = scratch->pushOffsets;
+    pushOffsets.assign(programs.size(), 0);
+    auto& resultIndex = scratch->resultIndex;
+    resultIndex.assign(programs.size(), 0);
     for (std::size_t i = 0; i < programs.size(); ++i) {
         if (roles[i] == Role::GeometryBack) continue;
         const auto& program = programs[i];
@@ -265,7 +355,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         phaseTiming.Phase(DrawRowRectList);
     };
     if (graphics.rectList) buildRectList();
-    std::vector<Graphics::GuestMemorySnapshot> snapshots;
+    auto& snapshots = scratch->snapshots;
     const auto snapshot = [&] {
         snapshots.clear();
         snapshots.reserve(memory.size());
@@ -369,7 +459,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         return drawn();
     }
 
-    std::vector<std::shared_ptr<DispatchVariant>> recipeStages;
+    auto& recipeStages = scratch->recipeStages;
     if (registerKey && !drawParameters.indirect && Graphics::DrawRecipes()) {
         recipeStages.reserve(programs.size());
         for (std::size_t i = 0; i < programs.size(); ++i) recipeStages.push_back(drawHit ? matched[i] : fresh[i]);
