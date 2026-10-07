@@ -210,6 +210,7 @@ function(add_shader_recompiler target runtimeTarget)
             DebugProbeActive
             DepthBitsTextureWidth
             HashBytes
+            PatchOverUserData
             PixelInput
             PixelInputBit
             ReadWholeFile
@@ -223,6 +224,8 @@ function(add_shader_recompiler target runtimeTarget)
             SrgbDecodeBit
             SrgbUnormFormat
             ThreadOwned
+            UserDataKeyFor
+            UserDataPatchesFor
             WriteFileAtomically
     )
     set(shaderCacheManifest)

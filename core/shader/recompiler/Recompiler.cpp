@@ -14,7 +14,9 @@
 #include <mutex>
 #include <new>
 #include <shared_mutex>
+#include <span>
 #include <unordered_map>
+#include <unordered_set>
 #include "ControlFlow/include/ControlFlow/GraphBuilder.hpp"
 #include "ControlFlow/include/ControlFlow/Structurizer.hpp"
 #include "RdnaDecoder/include/RdnaDecoder/RdnaInstructionDecoder.hpp"
@@ -203,20 +205,33 @@ struct ResultMemoEntry {
     std::uint64_t used = 0;
 };
 
-struct EmissionFailure {
-    std::uint64_t codeAddress;
-    BindingLayout layout;
-    ResourceSpecialization specialization;
-    std::exception_ptr failure;
-};
 // The result memo of a source: a set of ResultMemoWays entries per index (its folded low bits),
 // so a lookup reads one or two cache lines instead of a hash node chain behind a division.
 constexpr std::size_t ResultMemoSets = 64;
 constexpr std::size_t ResultMemoWays = 4;
 using ResultMemoTable = std::array<ResultMemoEntry, ResultMemoSets * ResultMemoWays>;
 
+// The stage memo's view of a source's plan (UserDataKeyFor): the key, and per buffer and direct image
+// the user word each descriptor dword copies (-1 for none).
+struct UserDataAnalysis {
+    std::shared_ptr<const UserDataKey> key;
+    std::vector<std::array<std::int32_t, 4>> bufferCopies;
+    std::vector<std::array<std::int32_t, 8>> imageCopies;
+};
+
+struct EmissionFailure {
+    std::uint64_t codeAddress;
+    BindingLayout layout;
+    ResourceSpecialization specialization;
+    std::exception_ptr failure;
+};
+
 struct SourceEntry {
     AgcDriver::Mutex mutex;
+    // The plan's user data analysis (UserDataKeyFor) and the user data copies of each variant's
+    // results by variant id (UserDataPatchesFor), made on first use (under mutex).
+    std::shared_ptr<const UserDataAnalysis> userData;
+    std::vector<std::pair<std::uint64_t, std::shared_ptr<const std::vector<UserDataPatch>>>> patches;
     // The code the entry was built for: the key carries only a hash of it, so a candidate entry is
     // accepted only when its code matches word for word. Owned here because the request's span
     // points into a registration the driver may replace while the entry lives on.
@@ -231,9 +246,9 @@ struct SourceEntry {
     // The result memo (under mutex), allocated with its first insert.
     std::unique_ptr<ResultMemoTable> memo;
     std::uint64_t memoClock = 0;
-    std::vector<EmissionFailure> emissionFailures;
     // Memo misses since the last hit (under mutex), for the insert bypass.
     std::uint32_t memoMissRun = 0;
+    std::vector<EmissionFailure> emissionFailures;
 };
 
 namespace {
@@ -322,6 +337,176 @@ std::shared_ptr<SourceEntry> getSource(const RecompileRequest& request) {
 
 std::array<std::uint32_t, 3> partialThreads(const RecompileRequest& request) {
     return request.context.compute ? request.context.compute->partialThreads : std::array<std::uint32_t, 3>{};
+}
+
+// The user word `value` copies (through bit casts and the lane read of a uniform value, as the walk
+// evaluates them), or -1.
+std::int32_t copiedUserWord(const IrResourcePlan& plan, IrValue* value) {
+    auto* resolved = value != nullptr ? value->Resolve() : nullptr;
+    while (resolved != nullptr && resolved->ArgumentCount() >= 1 && (resolved->Opcode() == IrOpcode::BitCastU32F32 || resolved->Opcode() == IrOpcode::BitCastF32U32 || resolved->Opcode() == IrOpcode::ReadFirstLane)) resolved = resolved->Argument(0)->Resolve();
+    if (resolved == nullptr || resolved->Opcode() != IrOpcode::GetUserData || resolved->ArgumentCount() < 1) return -1;
+    const auto reg = RegIndex(static_cast<ScalarReg>(resolved->Argument(0)->Register().index));
+    if (reg < plan.userDataBase || reg - plan.userDataBase >= plan.userDataCount) return -1;
+    return static_cast<std::int32_t>(reg - plan.userDataBase);
+}
+
+// Marks every user word the values reachable from `root` read (the walk follows a ReadConst into its
+// slot's read); `unknown` when one is read outside the plan's user data.
+void markUserWords(const IrResourcePlan& plan, IrValue* root, std::vector<std::uint8_t>& read, std::unordered_set<const IrValue*>& visited, bool& unknown) {
+    std::vector<IrValue*> stack;
+    if (root != nullptr) stack.push_back(root);
+    while (!stack.empty()) {
+        auto* value = stack.back();
+        stack.pop_back();
+        if (value == nullptr) continue;
+        value = value->Resolve();
+        if (value == nullptr || !visited.insert(value).second) continue;
+        if (value->Opcode() == IrOpcode::GetUserData) {
+            if (value->ArgumentCount() < 1) {
+                unknown = true;
+                continue;
+            }
+            const auto reg = RegIndex(static_cast<ScalarReg>(value->Argument(0)->Register().index));
+            if (reg < plan.userDataBase || reg - plan.userDataBase >= read.size()) unknown = true;
+            else read[reg - plan.userDataBase] = 1;
+            continue;
+        }
+        if (value->Opcode() == IrOpcode::ReadConst && value->ArgumentCount() > 1) {
+            const auto* slot = value->Argument(1)->Resolve();
+            if (slot != nullptr && slot->HasImmediate() && slot->ImmediateU32() < plan.srtReads.size()) stack.push_back(plan.srtReads[slot->ImmediateU32()].value);
+        }
+        for (std::size_t i = 0; i < value->ArgumentCount(); ++i) stack.push_back(value->Argument(i));
+    }
+}
+
+// The user data analysis of a plan. A buffer's or direct image's descriptor dword that is a copy of
+// a user word is a copy; every other user word read anywhere in the plan (the other descriptor
+// dwords, samplers, bindless tables and the buffers they index, the SRT reads and their addresses,
+// control flow, the uniform fill) is read. The key keeps a read word whole, and of a copied one the
+// bits the specialization decodes: a V#'s stride, swizzle, size and format (words 1 high, 2, 3, the
+// base's zero-ness through bufferBases), a T#'s everything but its base (words 0 and 1 low byte).
+std::shared_ptr<const UserDataAnalysis> analyzeUserData(const IrResourcePlan& plan) {
+    auto analysis = std::make_shared<UserDataAnalysis>();
+    const auto count = static_cast<std::size_t>(plan.userDataCount);
+    std::vector<std::uint8_t> read(count, 0);
+    bool unknown = false;
+    std::unordered_set<const IrValue*> visited;
+    const auto mark = [&](IrValue* root) { markUserWords(plan, root, read, visited, unknown); };
+    const auto& sources = plan.descriptorSources;
+    // Sources read as a whole: the samplers', the bindless tables' and the buffers they index.
+    std::vector<std::uint8_t> whole(sources.size(), 0);
+    for (const auto& sampler : plan.info.samplers) {
+        if (sampler.source < whole.size()) whole[sampler.source] = 1;
+        else unknown = true;
+    }
+    for (const auto& image : plan.info.images) {
+        if (image.source >= sources.size()) {
+            unknown = true;
+            continue;
+        }
+        const auto& indirect = sources[image.source].indirectImage;
+        if (!indirect.has_value()) continue;
+        whole[image.source] = 1;
+        for (const auto index : {indirect->materialSource, indirect->heapSource}) {
+            if (index < whole.size()) whole[index] = 1;
+            else unknown = true;
+        }
+    }
+    for (std::size_t s = 0; s < sources.size(); ++s) {
+        if (whole[s] == 0) continue;
+        for (std::uint32_t d = 0; d < sources[s].dwordCount && d < sources[s].dwords.size(); ++d) mark(sources[s].dwords[d]);
+    }
+    const auto copies = [&](std::uint32_t sourceIndex, std::span<std::int32_t> out) {
+        std::fill(out.begin(), out.end(), -1);
+        if (sourceIndex >= sources.size()) {
+            unknown = true;
+            return;
+        }
+        const auto& source = sources[sourceIndex];
+        for (std::uint32_t d = 0; d < source.dwordCount && d < source.dwords.size(); ++d) {
+            const auto word = whole[sourceIndex] == 0 ? copiedUserWord(plan, source.dwords[d]) : -1;
+            if (word >= 0 && d < out.size()) out[d] = word;
+            else mark(source.dwords[d]);
+        }
+    };
+    analysis->bufferCopies.resize(plan.info.buffers.size());
+    for (std::size_t i = 0; i < plan.info.buffers.size(); ++i) copies(plan.info.buffers[i].source, analysis->bufferCopies[i]);
+    analysis->imageCopies.resize(plan.info.images.size());
+    for (std::size_t i = 0; i < plan.info.images.size(); ++i) {
+        const auto source = plan.info.images[i].source;
+        if (source < sources.size() && sources[source].indirectImage.has_value()) analysis->imageCopies[i].fill(-1);
+        else copies(source, analysis->imageCopies[i]);
+    }
+    for (const auto& srtRead : plan.srtReads) mark(srtRead.value);
+    for (const auto& block : plan.controlFlow) mark(block.condition);
+    if (plan.uniformFill.fill.kind != UniformFillKind::None) {
+        for (auto* value : plan.uniformFill.values) mark(value);
+    }
+    auto key = std::make_shared<UserDataKey>();
+    key->keepBits.assign(count, 0u);
+    for (std::size_t k = 0; k < count; ++k) {
+        if (unknown || read[k] != 0) key->keepBits[k] = ~0u;
+    }
+    for (const auto& words : analysis->bufferCopies) {
+        for (std::size_t d = 0; d < words.size(); ++d) {
+            if (words[d] >= 0) key->keepBits[static_cast<std::size_t>(words[d])] |= d == 0 ? 0u : d == 1 ? 0xffff0000u : ~0u;
+        }
+        // The base's other half read from memory: whether it is zero is the pair's, so the word is kept.
+        if (words[0] >= 0 && words[1] >= 0) key->bufferBases.emplace_back(static_cast<std::uint32_t>(words[0]), static_cast<std::uint32_t>(words[1]));
+        else if (words[0] >= 0) key->keepBits[static_cast<std::size_t>(words[0])] = ~0u;
+        else if (words[1] >= 0) key->keepBits[static_cast<std::size_t>(words[1])] = ~0u;
+    }
+    for (const auto& words : analysis->imageCopies) {
+        for (std::size_t d = 0; d < words.size(); ++d) {
+            if (words[d] >= 0) key->keepBits[static_cast<std::size_t>(words[d])] |= d == 0 ? 0u : d == 1 ? 0xffffff00u : ~0u;
+        }
+    }
+    std::sort(key->bufferBases.begin(), key->bufferBases.end());
+    key->bufferBases.erase(std::unique(key->bufferBases.begin(), key->bufferBases.end()), key->bufferBases.end());
+    analysis->key = std::move(key);
+    return analysis;
+}
+
+// The user data copies of a variant's results: its bindings in layout order (Populate's), the inline
+// descriptor words the analysis found, the shader data or push words (the layout's user registers).
+std::shared_ptr<const std::vector<UserDataPatch>> makeUserDataPatches(const UserDataAnalysis& analysis, const CompiledVariant& variant, std::size_t userWords) {
+    auto patches = std::make_shared<std::vector<UserDataPatch>>();
+    const auto& layout = variant.bindings.layout;
+    const auto base = variant.info.userDataBase;
+    for (std::size_t b = 0; b < layout.descriptors.size(); ++b) {
+        const auto& logical = layout.descriptors[b];
+        const auto binding = static_cast<std::uint32_t>(b);
+        if (logical.kind == DescriptorBindingKind::Buffers) {
+            for (std::size_t e = 0; e < logical.resources.size(); ++e) {
+                const auto resource = logical.resources[e];
+                if (resource >= analysis.bufferCopies.size()) continue;
+                for (std::uint32_t d = 0; d < 4u; ++d) {
+                    if (const auto word = analysis.bufferCopies[resource][d]; word >= 0) patches->push_back({binding, static_cast<std::uint32_t>(e * 4u + d), static_cast<std::uint32_t>(word)});
+                }
+            }
+        } else if (logical.kind == DescriptorBindingKind::ShaderData) {
+            for (std::size_t i = 0; i < layout.userDataRegisters.size(); ++i) {
+                const auto reg = layout.userDataRegisters[i];
+                if (reg >= base && reg - base < userWords) patches->push_back({binding, static_cast<std::uint32_t>(i), reg - base});
+            }
+        } else if (ImageBindingResourceClass(logical.kind) != ImageResourceClass::None) {
+            // Direct images are 8 dwords each; table slots past the plan's images come from memory.
+            for (std::size_t e = 0; e < logical.resources.size(); ++e) {
+                const auto resource = logical.resources[e];
+                if (resource >= analysis.imageCopies.size()) continue;
+                for (std::uint32_t d = 0; d < 8u; ++d) {
+                    if (const auto word = analysis.imageCopies[resource][d]; word >= 0) patches->push_back({binding, static_cast<std::uint32_t>(e * 8u + d), static_cast<std::uint32_t>(word)});
+                }
+            }
+        }
+    }
+    if (layout.UsesPushData()) {
+        for (std::size_t i = 0; i < layout.userDataRegisters.size(); ++i) {
+            const auto reg = layout.userDataRegisters[i];
+            if (reg >= base && reg - base < userWords) patches->push_back({UserDataPatch::PushConstants, static_cast<std::uint32_t>(i), reg - base});
+        }
+    }
+    return patches;
 }
 
 std::uint64_t nextVariantId() {
@@ -747,6 +932,56 @@ RecompileResult Recompile(const RecompileRequest& request) {
 std::shared_ptr<const RecompileResult> Recompile(const RecompileRequest& request, const ResourceCapture& capture, bool* memoHit) {
     if (memoHit != nullptr) *memoHit = false;
     return recompileReporting(request, [&] { return RecompileImpl(request, capture, memoHit); });
+}
+
+std::shared_ptr<const UserDataKey> UserDataKeyFor(const SourceHandle& handle) {
+    if (handle.source == nullptr) return nullptr;
+    auto& source = *handle.source;
+    std::lock_guard lock(source.mutex);
+    if (source.plan == nullptr) return nullptr;
+    if (source.userData == nullptr) source.userData = analyzeUserData(*source.plan);
+    return source.userData->key;
+}
+
+std::shared_ptr<const std::vector<UserDataPatch>> UserDataPatchesFor(const SourceHandle& handle, const RecompileResult& result) {
+    if (handle.source == nullptr || result.variantId == 0) return nullptr;
+    auto& source = *handle.source;
+    std::lock_guard lock(source.mutex);
+    if (source.plan == nullptr) return nullptr;
+    if (source.userData == nullptr) source.userData = analyzeUserData(*source.plan);
+    for (const auto& [variantId, patches] : source.patches) {
+        if (variantId == result.variantId) return patches;
+    }
+    for (const auto& variant : source.variants) {
+        if (variant->result.variantId != result.variantId) continue;
+        auto patches = makeUserDataPatches(*source.userData, *variant, source.plan->userDataCount);
+        source.patches.emplace_back(result.variantId, patches);
+        return patches;
+    }
+    return nullptr;
+}
+
+void PatchOverUserData(const RecompileRequest& request, RecompileResult& result, const std::vector<UserDataPatch>& patches) {
+    recompileReporting(request, [&] {
+        // As a capture does: the vertex family's inputs carry V# fields no key covers.
+        if (request.shader.stage != ShaderStage::Compute && request.shader.stage != ShaderStage::Fragment) ValidateRequestInputs(request);
+        const auto userData = request.context.userData;
+        for (const auto& patch : patches) {
+            if (patch.userWord >= userData.size()) throw std::runtime_error("user data patch exceeds the request's user data");
+            const auto value = userData[patch.userWord];
+            if (patch.binding == UserDataPatch::PushConstants) {
+                if ((static_cast<std::size_t>(patch.word) + 1u) * sizeof(value) > result.pushConstants.size()) throw std::runtime_error("user data patch exceeds the push constants");
+                std::memcpy(result.pushConstants.data() + static_cast<std::size_t>(patch.word) * sizeof(value), &value, sizeof(value));
+            } else {
+                result.bindings.at(patch.binding).guestDescriptor.at(patch.word) = value;
+            }
+        }
+        for (auto& attribute : result.vertexAttributes) {
+            if (!request.context.vertex || attribute.location >= request.context.vertex->resourcesNum) throw std::runtime_error("Shader cache: invalid vertex attribute metadata");
+            attribute.resource = request.context.vertex->resources[attribute.location];
+        }
+        result.cacheHit = true;
+    });
 }
 
 }

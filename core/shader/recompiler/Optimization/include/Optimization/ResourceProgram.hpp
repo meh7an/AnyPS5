@@ -43,6 +43,37 @@ struct SourceHandle {
 [[nodiscard]] std::shared_ptr<const SourceHandle> ResolveSource(const RecompileRequest& request);
 [[nodiscard]] std::shared_ptr<const ResourceCapture> CaptureResources(const RecompileRequest& request, const SrtRuntime& runtime, const SourceHandle& handle);
 
+// The user data a capture over a source and its results depend on, for a driver memo keyed over
+// the user data (the AGC driver's stage memo). Per user word, `keepBits` are the bits the walk or
+// the specialization can read: a pointer, a value the walk computes with, a sampler, a descriptor
+// word other than an inline buffer's or image's base, anything the analysis does not recognize.
+// The other bits reach a result only as copies (an inline V#'s or T#'s base, push or shader data),
+// which UserDataPatchesFor names. A key keeps those bits of each word and, for each inline V# in
+// `bufferBases` (the user words of its words 0 and 1), whether its base is zero: an empty buffer
+// specializes differently. Null when the source has no plan.
+struct UserDataKey {
+    std::vector<std::uint32_t> keepBits;
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> bufferBases;
+};
+[[nodiscard]] std::shared_ptr<const UserDataKey> UserDataKeyFor(const SourceHandle& handle);
+// A result word that is a copy of a user word: dword `word` of the guest descriptor of binding
+// `binding` (an index into RecompileResult::bindings), or of the push constants (PushConstants).
+struct UserDataPatch {
+    static constexpr std::uint32_t PushConstants = 0xffffffffu;
+    std::uint32_t binding = 0;
+    std::uint32_t word = 0;
+    std::uint32_t userWord = 0;
+};
+// The user data copies in a result materialized over `handle`'s source: every result of one variant
+// has them in the same places, so they are made once per variant. Null when the result's variant is
+// not one of the source's.
+[[nodiscard]] std::shared_ptr<const std::vector<UserDataPatch>> UserDataPatchesFor(const SourceHandle& handle, const RecompileResult& result);
+// Makes `result`, a result of the request's source and variant materialized over user data that
+// differs from the request's only where `patches` copy it, the request's: its user words copied in
+// and its vertex attributes resolved from the request's V#s, as Recompile(request, capture) would
+// materialize them. The vertex family's stage inputs are validated as a capture validates them.
+void PatchOverUserData(const RecompileRequest& request, RecompileResult& result, const std::vector<UserDataPatch>& patches);
+
 }
 
 #endif

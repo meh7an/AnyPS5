@@ -305,6 +305,32 @@ void ShaderMemory::Regions(std::vector<ShaderRecompiler::MemoryRegion>& result) 
     for (; next != initial.end(); ++next) result.push_back({next->first, next->second});
 }
 
+void ShaderMemory::Seed(std::span<const std::pair<std::uint64_t, std::vector<std::uint32_t>>> regions) {
+    const auto inInitial = [&](std::uint64_t address) {
+        const auto next = std::upper_bound(initial.begin(), initial.end(), address, [](std::uint64_t value, const auto& entry) { return value < entry.first; });
+        return next != initial.begin() && address - std::prev(next)->first < std::prev(next)->second.size();
+    };
+    for (const auto& [address, words] : regions) {
+        Page* current = nullptr;
+        std::uint64_t currentBase = 0;
+        for (std::size_t i = 0; i < words.size(); ++i) {
+            const auto at = address + i * sizeof(std::uint32_t);
+            if (!initial.empty() && inInitial(at)) continue;
+            const auto base = at & ~static_cast<std::uint64_t>(PageBytes - 1);
+            if (current == nullptr || base != currentBase) {
+                // Made without the whole-page fetch page() does: the page's other words are read
+                // one by one if a stage needs them.
+                current = &pages[base];
+                currentBase = base;
+            }
+            const auto index = static_cast<std::size_t>((at % PageBytes) / sizeof(std::uint32_t));
+            current->words[index] = words[i];
+            current->valid.set(index);
+            current->read.set(index);
+        }
+    }
+}
+
 std::vector<ShaderRecompiler::MemoryRegion> ShaderMemory::TakeRecentRegions() {
     std::vector<ShaderRecompiler::MemoryRegion> result;
     for (auto& [base, page] : pages) {

@@ -67,6 +67,12 @@ public:
     // included, the initial regions excluded: one stage's own reads on the draw path's shared
     // ShaderMemory (Regions() stays the union). The spans point into the pages, as Regions()'s do.
     [[nodiscard]] std::vector<ShaderRecompiler::MemoryRegion> TakeRecentRegions();
+    // Words a stage the draw did not capture read (the driver's stage memo, which proved them
+    // current), entered as this draw's reads: Regions() includes them and a later read of one takes
+    // the word instead of reading guest memory again. They are not recent (TakeRecentRegions keeps
+    // naming the reads of the stage that made them), and words inside an initial region are skipped
+    // (a read there takes the initial bytes).
+    void Seed(std::span<const std::pair<std::uint64_t, std::vector<std::uint32_t>>> regions);
     // The driver's source handle memo outcomes, for the [capture] line (APS5_PROFILE_DRAW).
     static void CountHandleMemo(bool hit);
 
