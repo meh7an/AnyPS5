@@ -1559,18 +1559,33 @@ void captureInputs(const Context& context, Recorder& recorder, VkCommandBuffer c
 struct RecordParts {
     enum Part { Stores, Bindings, Pass, Bind, Push, Command, Leave, Count };
     static constexpr const char* Names[Count] = {"store flushes", "draw bindings", "pass continue/begin", "descriptor bind", "push constants", "draw command", "leave pass"};
+    // A part taking this long in one draw is counted apart (with its total and the longest): the
+    // Vulkan driver waiting inside a command rather than recording it shows there, not in the mean.
+    static constexpr double SlowUs = 20.0;
     std::array<double, Count> us{};
+    std::array<double, Count> slowUs{};
+    std::array<double, Count> maxUs{};
+    std::array<std::uint64_t, Count> slow{};
     std::uint64_t draws = 0, continued = 0;
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
     std::chrono::steady_clock::time_point lap{};
-    bool enabled = std::getenv("APS5_PROFILE_DRAW_PHASES") != nullptr;
+    // APS5_PROFILE_RECORD_PARTS=1 times these parts alone (a few clock reads per draw, about 2% of
+    // the frame rate): the other phase timers cost about a quarter of it, which hides what the
+    // driver does at full speed.
+    bool enabled = std::getenv("APS5_PROFILE_DRAW_PHASES") != nullptr || std::getenv("APS5_PROFILE_RECORD_PARTS") != nullptr;
     void start() {
         if (enabled) lap = std::chrono::steady_clock::now();
     }
     void mark(Part part) {
         if (!enabled) return;
         const auto now = std::chrono::steady_clock::now();
-        us[part] += std::chrono::duration<double, std::micro>(now - lap).count();
+        const auto spent = std::chrono::duration<double, std::micro>(now - lap).count();
+        us[part] += spent;
+        maxUs[part] = std::max(maxUs[part], spent);
+        if (spent >= SlowUs) {
+            ++slow[part];
+            slowUs[part] += spent;
+        }
         lap = now;
     }
     void finish(bool passContinued) {
@@ -1580,14 +1595,19 @@ struct RecordParts {
         const auto now = std::chrono::steady_clock::now();
         if (now - lastReport < std::chrono::seconds(10)) return;
         lastReport = now;
-        std::string line;
+        std::string line, slowLine;
         for (std::size_t i = 0; i < Count; ++i) {
             char text[64];
             std::snprintf(text, sizeof(text), " %s %.2f", Names[i], us[i] / static_cast<double>(draws));
             line += text;
+            std::snprintf(text, sizeof(text), " %s %llu (%.1f ms, max %.0f us)", Names[i], static_cast<unsigned long long>(slow[i]), slowUs[i] / 1000.0, maxUs[i]);
+            slowLine += text;
         }
-        std::fprintf(stderr, "[record-parts] %llu draws (%llu continued a pass), us per draw:%s\n", static_cast<unsigned long long>(draws), static_cast<unsigned long long>(continued), line.c_str());
+        std::fprintf(stderr, "[record-parts] %llu draws (%llu continued a pass), us per draw:%s; parts of %.0f us or more:%s\n", static_cast<unsigned long long>(draws), static_cast<unsigned long long>(continued), line.c_str(), SlowUs, slowLine.c_str());
         us = {};
+        slowUs = {};
+        maxUs = {};
+        slow = {};
         draws = continued = 0;
     }
 };
