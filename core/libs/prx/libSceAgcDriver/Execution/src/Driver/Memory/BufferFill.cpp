@@ -169,7 +169,7 @@ bool Driver::fillBuffer(QueueState& queue, std::uint32_t queueId, std::span<cons
             if (Graphics::StorageTexture::FlushPending(base, bytes, nullptr, "buffer fill", Graphics::PublishScope::PartialUnits)) ++flushed;
         }
         phase(FillFlush);
-        const bool stored = cleared || localDevice->FillBuffer(base, bytes, pattern);
+        const bool stored = cleared || localDevice->FillBuffer(base, bytes, pattern, coverage.cover == Graphics::StorageTexture::FillCover::None);
         phase(FillDevice);
         if (uniformKeysFill && stored && !cleared) {
             Graphics::DccKeys filled = Graphics::DccKeys::Mixed;

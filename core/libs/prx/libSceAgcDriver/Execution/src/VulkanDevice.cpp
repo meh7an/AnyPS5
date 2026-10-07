@@ -23,6 +23,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libc/include/General.hpp"
+#include "prx/libc/include/GuestAllocations.hpp"
 #ifdef _WIN32
 #include <windows.h>
 #endif
@@ -273,6 +274,18 @@ struct VulkanDevice::State {
     // Device-local buffers of a repeated 16-byte fill pattern (FillBuffer), most recently used
     // last; each is filled once by a doubling chain in device memory.
     std::vector<std::pair<std::array<std::uint32_t, 4>, std::shared_ptr<Graphics::DeviceBuffer>>> patternBuffers;
+    // Recent fills recorded into host imports (FillBuffer's elision), most recently used last: the
+    // import's serial, the range, the pattern, the generation the fill stamped its blocks with and
+    // the guest registry's generation after it (it moves with every mapping change).
+    struct RecentFill {
+        std::uint64_t serial = 0;
+        std::uint64_t begin = 0;
+        std::uint64_t end = 0;
+        std::array<std::uint32_t, 4> pattern{};
+        std::uint64_t generation = 0;
+        std::uint64_t mappings = 0;
+    };
+    std::vector<RecentFill> recentFills;
     // Compute pipeline objects by variant (and push-constant use), under their own mutex: the
     // dispatch's find-or-insert and the verify switch's lookups touch the map, recipes hold weak
     // references to its objects.
@@ -567,6 +580,7 @@ struct VulkanDevice::State {
             Graphics::ClearImageMirrors(device);
             Graphics::ClearHostImports(device);
             patternBuffers.clear();
+            recentFills.clear();
             descriptorCache.reset();
             emptyBuffer.reset();
             samplerCache.reset();
@@ -1391,7 +1405,7 @@ bool VulkanDevice::DumpSamplesOnGpu(std::uint64_t address) {
     return true;
 }
 
-bool VulkanDevice::FillBuffer(std::uint64_t address, std::size_t bytes, std::span<const std::uint32_t, 4> pattern) {
+bool VulkanDevice::FillBuffer(std::uint64_t address, std::size_t bytes, std::span<const std::uint32_t, 4> pattern, bool elidable) {
     if (!state->recorder || bytes == 0 || bytes % 16 != 0 || address % 16 != 0) return false;
     auto& recorder = *state->recorder;
     // Finished batches are retired first (one fence status check, as WriteLabelOnGpu does): their
@@ -1427,7 +1441,7 @@ bool VulkanDevice::FillBuffer(std::uint64_t address, std::size_t bytes, std::spa
     // chain), notes (the pending-write note and the write stamp); fills by uniform dword vs
     // 16-byte pattern, with the pattern fills' doubling steps.
     static double decideMs = 0, recordMs = 0, notesMs = 0;
-    static std::uint64_t uniformFills = 0, patternFills = 0, doublingSteps = 0, patternBuffersReused = 0, patternBuffersMade = 0;
+    static std::uint64_t uniformFills = 0, patternFills = 0, doublingSteps = 0, patternBuffersReused = 0, patternBuffersMade = 0, elidedFills = 0, elidedBytes = 0;
     static auto lastReport = std::chrono::steady_clock::now();
     // A 16-byte pattern is copied from a device-local buffer holding it repeated (filled once by a
     // doubling chain in device memory, cached per pattern), one transfer into the import per fill.
@@ -1435,6 +1449,7 @@ bool VulkanDevice::FillBuffer(std::uint64_t address, std::size_t bytes, std::spa
     static const bool chainInPlace = std::getenv("APS5_FILL_CHAIN") != nullptr;
     constexpr std::size_t PatternBufferBytes = 16u << 20u;
     constexpr std::size_t PatternBuffersKept = 8;
+    constexpr std::size_t RecentFillsKept = 16;
     const auto fillStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     ++fills;
     if (recorder.PendingWriteOverlaps(address, bytes)) {
@@ -1466,7 +1481,7 @@ bool VulkanDevice::FillBuffer(std::uint64_t address, std::size_t bytes, std::spa
         const auto now = std::chrono::steady_clock::now();
         if (now - lastReport > std::chrono::seconds(10)) {
             lastReport = now;
-            AgcDriver::ProfilePrint_nid_no_patch("[fill-sync] fills: %llu synced (%llu with a completion label pending) waited %.0f ms, %llu ordered by barrier, %llu with no pending write; phases ms: decide %.0f record %.0f notes %.0f; %llu uniform, %llu pattern (%llu doubling steps in place; pattern buffers reused %llu, made %llu)\n", static_cast<unsigned long long>(synced), static_cast<unsigned long long>(labelSynced), syncedMs, static_cast<unsigned long long>(ordered), static_cast<unsigned long long>(fills - synced - ordered), decideMs, recordMs, notesMs, static_cast<unsigned long long>(uniformFills), static_cast<unsigned long long>(patternFills), static_cast<unsigned long long>(doublingSteps), static_cast<unsigned long long>(patternBuffersReused), static_cast<unsigned long long>(patternBuffersMade));
+            AgcDriver::ProfilePrint_nid_no_patch("[fill-sync] fills: %llu synced (%llu with a completion label pending) waited %.0f ms, %llu ordered by barrier, %llu with no pending write; phases ms: decide %.0f record %.0f notes %.0f; %llu uniform, %llu pattern (%llu doubling steps in place; pattern buffers reused %llu, made %llu); %llu elided (%.0f MiB)\n", static_cast<unsigned long long>(synced), static_cast<unsigned long long>(labelSynced), syncedMs, static_cast<unsigned long long>(ordered), static_cast<unsigned long long>(fills - synced - ordered), decideMs, recordMs, notesMs, static_cast<unsigned long long>(uniformFills), static_cast<unsigned long long>(patternFills), static_cast<unsigned long long>(doublingSteps), static_cast<unsigned long long>(patternBuffersReused), static_cast<unsigned long long>(patternBuffersMade), static_cast<unsigned long long>(elidedFills), elidedBytes / 1048576.0);
         }
     }
     auto phaseStart = fillStart;
@@ -1478,10 +1493,33 @@ bool VulkanDevice::FillBuffer(std::uint64_t address, std::size_t bytes, std::spa
     };
     phase(decideMs);
     using CommandClass = Graphics::Recorder::CommandClass;
-    // A queued DCC key store over the range must land before the fill.
+    // Queued DCC key and label stores over the range land before the fill (program order).
     recorder.FlushKeyStoresOverlapping(address, bytes);
+    recorder.FlushStoresOverlapping(address, bytes);
     const bool uniform = pattern[0] == pattern[1] && pattern[1] == pattern[2] && pattern[2] == pattern[3];
     const std::array<std::uint32_t, 4> patternWords{pattern[0], pattern[1], pattern[2], pattern[3]};
+    // Elision: an earlier fill of the same pattern over the range, into the same import, that nothing
+    // stored to since left the bytes this fill would store. "Since" is the tracker's: the uncached
+    // collect turns the CPU's stores into block stamps, every GPU store stamps (the queued ones were
+    // just flushed, a completion's CPU stores were synced above), and none may be newer than that
+    // fill's stamp; no mapping changed since (a remap or a guest heap decommit changes bytes without
+    // a stamp, and moves the registry's generation), and no unit shadow holds newer bytes over the
+    // range. The range keeps that stamp, so what was built over it stays valid. Only a fill no
+    // storage image overlaps (the caller's classification): an image's results are judged against
+    // the fill's own stamp. Debug aid: APS5_NO_FILL_ELIDE=1 records every fill.
+    static const bool elide = std::getenv("APS5_NO_FILL_ELIDE") == nullptr;
+    const auto serial = elide && elidable ? Graphics::HostImportSerial(context, address, bytes, false) : 0;
+    if (serial != 0) {
+        auto& recent = state->recentFills;
+        const auto found = std::find_if(recent.rbegin(), recent.rend(), [&](const auto& fill) { return fill.serial == serial && fill.begin <= address && address + bytes <= fill.end && fill.pattern == patternWords; });
+        if (found != recent.rend() && found->mappings == GuestAllocations::GuestAllocationsGeneration_nid_postfix() && GuestMemory::CollectWritesUncached(address, bytes) != 0 && GuestMemory::UnchangedSince(address, bytes, found->generation) && !Graphics::AnyShadowedOverlaps(address, bytes)) {
+            std::rotate(std::prev(found.base()), found.base(), recent.end());
+            ++elidedFills;
+            elidedBytes += bytes;
+            phase(decideMs);
+            return true;
+        }
+    }
     std::shared_ptr<Graphics::DeviceBuffer> patternBuffer;
     if (!uniform && !chainInPlace) {
         auto& buffers = state->patternBuffers;
@@ -1512,8 +1550,6 @@ bool VulkanDevice::FillBuffer(std::uint64_t address, std::size_t bytes, std::spa
         // The buffer outlives its use in this batch even when evicted from the cache meanwhile.
         recorder.Keep(patternBuffer);
     }
-    // A queued label store over the range lands before the fill (program order).
-    recorder.FlushStoresOverlapping(address, bytes);
     VkAccessFlags covered = 0;
     const auto commands = recorder.Commands(&covered);
     const auto timing = recorder.BeginGpuTiming(CommandClass::Fill);
@@ -1570,7 +1606,14 @@ bool VulkanDevice::FillBuffer(std::uint64_t address, std::size_t bytes, std::spa
     phase(recordMs);
     if (uniform && pattern[0] == (pattern[0] & 0xffu) * 0x01010101u) recorder.NotePendingFill(address, bytes, static_cast<std::uint8_t>(pattern[0]));
     else recorder.NotePendingWrite(address, bytes);
-    GuestMemory::MarkWritten(address, bytes);
+    const auto generation = GuestMemory::MarkWritten(address, bytes);
+    if (serial != 0 && generation != 0) {
+        // For the elision above; the fills this one covers are superseded by it.
+        auto& recent = state->recentFills;
+        std::erase_if(recent, [&](const auto& fill) { return fill.serial == serial && address <= fill.begin && fill.end <= address + bytes; });
+        if (recent.size() >= RecentFillsKept) recent.erase(recent.begin());
+        recent.push_back({serial, address, address + bytes, patternWords, generation, GuestAllocations::GuestAllocationsGeneration_nid_postfix()});
+    }
     phase(notesMs);
     return true;
 }

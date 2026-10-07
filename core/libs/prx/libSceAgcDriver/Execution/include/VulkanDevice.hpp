@@ -83,8 +83,9 @@ public:
     // Recorded GPU stores over the range are ordered before the fill by its barrier; finished
     // batches are retired first, and it waits only for stores a batch's completion makes on the
     // CPU (a copied buffer's write-back, a deferred label). Debug aid: APS5_FILL_SYNC=1 waits for
-    // every recorded store over the range.
-    bool FillBuffer(std::uint64_t address, std::size_t bytes, std::span<const std::uint32_t, 4> pattern);
+    // every recorded store over the range. `elidable` (no storage image over the range): the fill is
+    // dropped when the range still holds an earlier fill of the same pattern (see the definition).
+    bool FillBuffer(std::uint64_t address, std::size_t bytes, std::span<const std::uint32_t, 4> pattern, bool elidable = false);
     bool DumpSamplesOnGpu(std::uint64_t address);
     // Copies `bytes` of guest memory from `source` to `destination` (disjoint ranges) in place of the
     // engine's memcpy kernel (Driver.cpp copyBuffer). `path` 0: copied on the CPU at once, when
