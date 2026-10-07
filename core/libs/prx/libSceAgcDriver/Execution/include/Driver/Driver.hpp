@@ -310,8 +310,11 @@ private:
         // (a copy of the entry's result per hit cost a few dozen allocations).
         std::shared_ptr<ShaderRecompiler::RecompileResult> served;
         // The entry's misses in a row (its words changed): a key whose words keep changing is
-        // stored again only at powers of two of them.
+        // validated and stored again only at powers of two of them, then every 64th.
         std::uint32_t misses = 0;
+        // The generation the entry's words were last proven the guest's at: the capture's, then the
+        // collect before a compare that found them equal after a store stamped their blocks.
+        std::uint64_t generation = 0;
     };
     AgcDriver::Mutex stageMemoMutex;
     std::unordered_map<std::uint64_t, StageMemoSlot> stageMemo;

@@ -82,10 +82,10 @@ struct StageCapture {
 // The stage memo (Step 4, DrawCapture.cpp): a stage's compiled result and the words its capture
 // read, kept by its source, push offset and the user data bits the source's capture and results
 // depend on other than as copies (ShaderRecompiler::UserDataKeyFor). A later stage with an equal key
-// whose captured words are unchanged (no write stamp newer than the capture's over them, no storage
-// image results pending and no unit shadow live there, no mapping changed) takes the result with
-// its user words copied in (ShaderRecompiler::RecompileOverUserData) instead of capturing and
-// recompiling.
+// whose captured words are unchanged (no write stamp newer than the capture's over them, or else
+// equal to the guest's when compared, no storage image results pending and no unit shadow live
+// there, no mapping changed) takes the result with its user words copied in
+// (ShaderRecompiler::RecompileOverUserData) instead of capturing and recompiling.
 struct StageMemoEntry {
     std::shared_ptr<const ShaderRecompiler::SourceHandle> handle;
     std::uint32_t pushOffset = 0;
