@@ -142,7 +142,8 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
 
     const bool useDrawEntries = drawEntries() && !ShaderRecompiler::DebugProbeActive() && dumpTarget == 0 && dumpSlot1 == 0 && drawCacheActive();
     static const bool traceRelocation = std::getenv("APS5_TRACE_DRAW_RELOC") != nullptr;
-    const bool wantRegions = useDrawEntries || traceRelocation;
+    static const bool probeStageMemo = std::getenv("APS5_TRACE_STAGE_MEMO") != nullptr;
+    const bool wantRegions = useDrawEntries || traceRelocation || probeStageMemo;
     const bool registerKey = useDrawEntries && registerKeyEnabled();
     std::uint64_t drawKey = 0;
     std::shared_ptr<DrawEntry> entry;
@@ -328,6 +329,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     }
 
     if (traceRelocation && !drawHit) traceDrawRelocation(structuralDrawKey(queue, *submission.shaders, localDevice->Serial()), programs, stageCaptures);
+    if (probeStageMemo && !drawHit) traceStageMemo(structuralDrawKey(queue, *submission.shaders, localDevice->Serial()), programs, stageCaptures, programResults, vertexInfos);
     cacheDrawStages(useDrawEntries, drawHit, drawParameters, indirectCpu, programs, stageCaptures, vertexInfos, decodeReads, verifyHit, matched, fresh, drawKey, registerKey, decode, phaseTiming);
     timing.Mark("shader_compile_and_link");
 

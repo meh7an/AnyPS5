@@ -1,10 +1,10 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include <algorithm>
-#include <array>
-#include <cstdlib>
 #include <chrono>
 #include <cstdio>
+#include <array>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <map>
@@ -50,6 +50,92 @@ struct DrawKeyTrace {
     std::map<std::uint32_t, std::pair<std::uint32_t, std::uint32_t>> example;
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
 };
+
+// Where a word of a compiled stage result comes from, for the stage-memo probe: the descriptor words
+// of a binding by role (a V#'s base words apart), the push constants and the vertex attribute V#s.
+enum StageWordClass : std::uint8_t { WordBufferBase, WordBufferOther, WordImage, WordSampler, WordSrt, WordData, WordPush, WordVertex, WordOther, WordClassCount };
+constexpr const char* StageWordClassNames[WordClassCount] = {"buffer base", "buffer other", "image", "sampler", "flattened srt", "shader data", "push", "vertex", "other"};
+// A changed user word that reaches no result word: a vertex table pointer, or no use found.
+constexpr std::size_t DestinationVertexTable = WordClassCount;
+constexpr std::size_t DestinationNowhere = WordClassCount + 1;
+constexpr std::size_t DestinationCount = WordClassCount + 2;
+constexpr const char* DestinationNames[DestinationCount] = {"buffer base", "buffer other", "image", "sampler", "flattened srt", "shader data", "push", "vertex", "other", "vertex table pointer", "nowhere"};
+
+// One stage of a draw as the probe keeps it: the user data, the captured regions, the variant and
+// the per-draw words of its compiled result with their classes.
+struct StageWords {
+    std::uint64_t code = 0;
+    std::vector<std::uint32_t> userData;
+    std::vector<std::pair<std::uint64_t, std::vector<std::uint32_t>>> regions;
+    bool compiled = false;
+    std::uint64_t variantId = 0;
+    std::vector<std::uint32_t> words;
+    std::vector<std::uint8_t> classes;
+    std::vector<std::uint32_t> vertexTableWords;
+};
+
+struct StageMemoTrace {
+    AgcDriver::Mutex mutex;
+    std::unordered_map<std::uint64_t, std::vector<StageWords>> last;
+    std::uint64_t draws = 0, repeats = 0, wouldHit = 0, stages = 0, stageHits = 0, layout = 0, moved = 0, changed = 0, variant = 0, vertexTables = 0, vertexRefreshed = 0;
+    std::array<std::uint64_t, DestinationCount> destinations{};
+    std::array<std::uint64_t, WordClassCount> derivedWords{};
+    // (stage code address, user word) -> how often a change of that word reached each destination.
+    std::map<std::pair<std::uint64_t, std::uint32_t>, std::array<std::uint64_t, DestinationCount>> byWord;
+    std::vector<std::string> examples;
+    std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
+};
+
+StageWords stageWords(const DrawProgram& program, const StageCapture* capture, const ShaderRecompiler::RecompileResult* result, const std::optional<ShaderRecompiler::ShaderVertexStageInfo>* vertexInfo) {
+    StageWords stage;
+    stage.code = program.binary.codeAddress;
+    stage.userData = program.userData;
+    if (capture != nullptr) {
+        for (const auto& region : capture->regions) {
+            std::vector<std::uint32_t> words(region.bytes.size() / sizeof(std::uint32_t));
+            std::memcpy(words.data(), region.bytes.data(), words.size() * sizeof(std::uint32_t));
+            stage.regions.emplace_back(region.guestAddress, std::move(words));
+        }
+    }
+    if (vertexInfo != nullptr && vertexInfo->has_value() && (*vertexInfo)->fetchEmbedded) {
+        for (const auto reg : {(*vertexInfo)->fetchAttribReg, (*vertexInfo)->fetchBufferReg}) {
+            stage.vertexTableWords.push_back(reg);
+            stage.vertexTableWords.push_back(reg + 1u);
+        }
+    }
+    if (result == nullptr) return stage;
+    stage.compiled = true;
+    stage.variantId = result->variantId;
+    using Role = ShaderRecompiler::DescriptorRole;
+    for (const auto& binding : result->bindings) {
+        for (std::size_t w = 0; w < binding.guestDescriptor.size(); ++w) {
+            auto kind = WordOther;
+            switch (binding.role) {
+                case Role::GuestBuffers: kind = w % 4u < 2u ? WordBufferBase : WordBufferOther; break;
+                case Role::GuestImages: kind = WordImage; break;
+                case Role::GuestSamplers: kind = WordSampler; break;
+                case Role::FlattenedSrt: kind = WordSrt; break;
+                case Role::ShaderData: kind = WordData; break;
+                default: break;
+            }
+            stage.words.push_back(binding.guestDescriptor[w]);
+            stage.classes.push_back(kind);
+        }
+    }
+    for (std::size_t at = 0; at + sizeof(std::uint32_t) <= result->pushConstants.size(); at += sizeof(std::uint32_t)) {
+        std::uint32_t word = 0;
+        std::memcpy(&word, result->pushConstants.data() + at, sizeof(word));
+        stage.words.push_back(word);
+        stage.classes.push_back(WordPush);
+    }
+    for (const auto& attribute : result->vertexAttributes) {
+        for (const auto field : attribute.resource.fields) {
+            stage.words.push_back(field);
+            stage.classes.push_back(WordVertex);
+        }
+    }
+    return stage;
+}
 
 }
 
@@ -152,6 +238,139 @@ void Driver::traceDrawRelocation(std::uint64_t structuralKey, const std::vector<
     trace.examples.clear();
     trace.draws = trace.repeats = trace.stages = trace.layoutDiffer = trace.contentSame = trace.contentSameInPlace = trace.regions = trace.words = trace.movedRegions = trace.differingMoved = trace.differingStatic = 0;
     trace.buckets.fill(0);
+}
+
+// The Step 4 probe (APS5_TRACE_STAGE_MEMO): whether a draw cache keyed on the user data with the
+// changed words masked out would serve each draw that repeats a structural key. A stage would be
+// served when its captured regions are the same words at the same addresses as the previous draw's,
+// its result comes from the same variant with the same shape, and every result word that changed is
+// a copy of a changed user word (an overlay of the live user data reproduces it); a draw when every
+// stage would. Each changed user word is classified by the result words it reached.
+void Driver::traceStageMemo(std::uint64_t structuralKey, const std::vector<DrawProgram>& programs, const std::vector<StageCapture>& captures, const std::vector<const ShaderRecompiler::RecompileResult*>& results, const std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>>& vertexInfos) {
+    std::vector<StageWords> current;
+    current.reserve(programs.size());
+    for (std::size_t stage = 0; stage < programs.size(); ++stage) current.push_back(stageWords(programs[stage], stage < captures.size() ? &captures[stage] : nullptr, stage < results.size() ? results[stage] : nullptr, stage < vertexInfos.size() ? &vertexInfos[stage] : nullptr));
+    static StageMemoTrace trace;
+    std::lock_guard lock(trace.mutex);
+    ++trace.draws;
+    auto [it, inserted] = trace.last.try_emplace(structuralKey, current);
+    if (!inserted && it->second.size() == current.size()) {
+        ++trace.repeats;
+        bool drawServed = true;
+        for (std::size_t stage = 0; stage < current.size(); ++stage) {
+            const auto& a = it->second[stage];
+            const auto& b = current[stage];
+            ++trace.stages;
+            bool sameLayout = a.regions.size() == b.regions.size();
+            for (std::size_t r = 0; sameLayout && r < a.regions.size(); ++r) sameLayout = a.regions[r].second.size() == b.regions[r].second.size();
+            bool regionsSame = sameLayout;
+            if (!sameLayout) {
+                ++trace.layout;
+            } else {
+                bool moved = false, changed = false;
+                for (std::size_t r = 0; r < a.regions.size(); ++r) {
+                    moved = moved || a.regions[r].first != b.regions[r].first;
+                    changed = changed || a.regions[r].second != b.regions[r].second;
+                }
+                if (moved) ++trace.moved;
+                else if (changed) ++trace.changed;
+                regionsSame = !moved && !changed;
+            }
+            bool served = regionsSame;
+            std::vector<std::uint32_t> changedWords;
+            for (std::uint32_t k = 0; k < std::min(a.userData.size(), b.userData.size()); ++k) {
+                if (a.userData[k] != b.userData[k]) changedWords.push_back(k);
+            }
+            if (a.compiled != b.compiled || a.variantId != b.variantId || a.classes != b.classes) {
+                ++trace.variant;
+                served = false;
+            } else {
+                std::vector<std::array<bool, DestinationCount>> reached(changedWords.size());
+                for (std::size_t j = 0; j < b.words.size(); ++j) {
+                    if (a.words[j] == b.words[j]) continue;
+                    // Vertex attribute V#s come from the vertex tables, which a served draw reads
+                    // again (the decode's vertex info): refreshed, not overlaid.
+                    if (b.classes[j] == WordVertex) {
+                        ++trace.vertexRefreshed;
+                        continue;
+                    }
+                    bool explained = false;
+                    for (std::size_t c = 0; c < changedWords.size(); ++c) {
+                        const auto k = changedWords[c];
+                        if (a.userData[k] != a.words[j] || b.userData[k] != b.words[j]) continue;
+                        explained = true;
+                        reached[c][b.classes[j]] = true;
+                    }
+                    if (explained) continue;
+                    served = false;
+                    // Counted (and named) only where the regions were the same: in a moved or
+                    // rewritten region a descriptor word read from it changes with it.
+                    if (!regionsSame) continue;
+                    ++trace.derivedWords[b.classes[j]];
+                    if (trace.examples.size() < 16) {
+                        char text[200];
+                        std::snprintf(text, sizeof(text), "stage %zu (code 0x%llx) %s word %zu: 0x%08x -> 0x%08x, from no changed user word", stage, static_cast<unsigned long long>(b.code), StageWordClassNames[b.classes[j]], j, a.words[j], b.words[j]);
+                        trace.examples.emplace_back(text);
+                    }
+                }
+                for (std::size_t c = 0; c < changedWords.size(); ++c) {
+                    const auto k = changedWords[c];
+                    bool any = false;
+                    auto& counts = trace.byWord[{b.code, k}];
+                    for (std::size_t d = 0; d < WordClassCount; ++d) {
+                        if (!reached[c][d]) continue;
+                        any = true;
+                        ++trace.destinations[d];
+                        ++counts[d];
+                    }
+                    if (any) continue;
+                    const bool table = std::find(b.vertexTableWords.begin(), b.vertexTableWords.end(), k) != b.vertexTableWords.end();
+                    ++trace.destinations[table ? DestinationVertexTable : DestinationNowhere];
+                    ++counts[table ? DestinationVertexTable : DestinationNowhere];
+                    if (table) ++trace.vertexTables;
+                }
+            }
+            if (served) ++trace.stageHits;
+            drawServed = drawServed && served;
+        }
+        if (drawServed) ++trace.wouldHit;
+    }
+    if (!inserted) it->second = std::move(current);
+    const auto now = std::chrono::steady_clock::now();
+    if (now - trace.lastReport < std::chrono::seconds(10)) return;
+    trace.lastReport = now;
+    std::string destinations;
+    for (std::size_t d = 0; d < DestinationCount; ++d) {
+        if (trace.destinations[d] == 0) continue;
+        destinations += std::string(" ") + DestinationNames[d] + " " + std::to_string(trace.destinations[d]);
+    }
+    std::string derived;
+    for (std::size_t c = 0; c < WordClassCount; ++c) {
+        if (trace.derivedWords[c] == 0) continue;
+        derived += std::string(" ") + StageWordClassNames[c] + " " + std::to_string(trace.derivedWords[c]);
+    }
+    std::fprintf(stderr, "[stagememo] %llu draws, %llu repeating a structural key (%zu keys): %llu would be served (%.1f%%); %llu stages compared, %llu would be served; not served: layout %llu, regions moved %llu, regions changed %llu, variant or shape %llu; changed user words reached:%s; result words from no changed user word:%s; vertex table pointers changed %llu, vertex attribute words refreshed %llu\n",static_cast<unsigned long long>(trace.draws), static_cast<unsigned long long>(trace.repeats), trace.last.size(), static_cast<unsigned long long>(trace.wouldHit), trace.repeats != 0 ? 100.0 * static_cast<double>(trace.wouldHit) / static_cast<double>(trace.repeats) : 0.0, static_cast<unsigned long long>(trace.stages), static_cast<unsigned long long>(trace.stageHits), static_cast<unsigned long long>(trace.layout), static_cast<unsigned long long>(trace.moved), static_cast<unsigned long long>(trace.changed), static_cast<unsigned long long>(trace.variant), destinations.c_str(), derived.c_str(), static_cast<unsigned long long>(trace.vertexTables), static_cast<unsigned long long>(trace.vertexRefreshed));
+    std::vector<std::pair<std::uint64_t, std::pair<std::uint64_t, std::uint32_t>>> ranked;
+    for (const auto& [where, counts] : trace.byWord) {
+        std::uint64_t total = 0;
+        for (const auto count : counts) total += count;
+        ranked.push_back({total, where});
+    }
+    std::sort(ranked.begin(), ranked.end(), std::greater<>());
+    for (std::size_t i = 0; i < ranked.size() && i < 16; ++i) {
+        const auto& counts = trace.byWord[ranked[i].second];
+        std::string line;
+        for (std::size_t d = 0; d < DestinationCount; ++d) {
+            if (counts[d] != 0) line += std::string(" ") + DestinationNames[d] + " " + std::to_string(counts[d]);
+        }
+        std::fprintf(stderr, "[stagememo]   code 0x%llx user word %u changed %llu times:%s\n", static_cast<unsigned long long>(ranked[i].second.first), ranked[i].second.second, static_cast<unsigned long long>(ranked[i].first), line.c_str());
+    }
+    for (const auto& example : trace.examples) std::fprintf(stderr, "[stagememo]   %s\n", example.c_str());
+    trace.examples.clear();
+    trace.byWord.clear();
+    trace.draws = trace.repeats = trace.wouldHit = trace.stages = trace.stageHits = trace.layout = trace.moved = trace.changed = trace.variant = trace.vertexTables = trace.vertexRefreshed = 0;
+    trace.destinations.fill(0);
+    trace.derivedWords.fill(0);
 }
 
 void Driver::traceDrawKey(const QueueState& queue, const ShaderRegistry& registry, std::uint64_t deviceSerial, bool hit) {

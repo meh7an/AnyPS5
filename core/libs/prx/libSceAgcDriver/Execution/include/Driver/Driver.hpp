@@ -124,6 +124,11 @@ private:
     // APS5_TRACE_DRAW_RELOC: for a draw repeating an earlier draw's structural key, how its stages'
     // captured memory compares with the earlier draw's (moved, same words, differing words).
     static void traceDrawRelocation(std::uint64_t structuralKey, const std::vector<DrawProgram>& programs, const std::vector<StageCapture>& captures);
+    // APS5_TRACE_STAGE_MEMO: for a draw repeating an earlier draw's structural key, whether a draw
+    // cache keyed on the user data with the changed words masked would serve it (the same captured
+    // words in place, the same variant, every changed result word a copy of a changed user word),
+    // and where each changed user word went.
+    static void traceStageMemo(std::uint64_t structuralKey, const std::vector<DrawProgram>& programs, const std::vector<StageCapture>& captures, const std::vector<const ShaderRecompiler::RecompileResult*>& results, const std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>>& vertexInfos);
     static bool sameVertexInfo(const ShaderRecompiler::ShaderVertexStageInfo& a, const ShaderRecompiler::ShaderVertexStageInfo& b);
     static bool sameDecode(const DrawDecode& a, const DrawDecode& b);
     std::shared_ptr<DrawDecode> decodeDraw(const QueueState& queue, const Submission& submission);
