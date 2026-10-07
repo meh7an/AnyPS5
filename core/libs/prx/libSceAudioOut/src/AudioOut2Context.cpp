@@ -245,6 +245,7 @@ static void TraceSummary(AudioOut2Context& context, Clock::time_point now) {
         static_cast<double>(context.summaryPolls) / elapsed, QueueLevel(context, now), context.queueDepth, PendingMs(context), static_cast<double>(context.summaryPeak),
         static_cast<unsigned long long>(context.pushes), static_cast<unsigned long long>(context.blockingPushes), static_cast<unsigned long long>(context.fullRejects),
         static_cast<unsigned long long>(context.primes), static_cast<unsigned long long>(context.dropped));
+    AudioOut2TracePortData(context, context.grain);
     context.summaryStart = now;
     context.summaryPushes = 0;
     context.summaryAdvances = 0;
@@ -255,7 +256,8 @@ static void TraceSummary(AudioOut2Context& context, Clock::time_point now) {
 extern "C" {
 
 // The title's per-tick step between setting the ports' data and pushing. A push records the buffers the
-// ports point at and the next push reads them, and the push paces the clock, so nothing is due here.
+// ports point at and the next push reads them (a port sharing its buffer with another plays the grain
+// copied when it was set), and the push paces the clock, so nothing is due here.
 int APS5_VABI sceAudioOut2ContextAdvance(AudioOut2ContextHandle ctx) {
     auto* context = FromHandle(ctx);
     if (!context) return SCE_AUDIO_OUT2_ERROR_INVALID_HANDLE;

@@ -47,6 +47,9 @@ struct AudioOut2CapturedPort {
     std::size_t index = 0;
     std::uint64_t generation = 0;
     const void* data = nullptr;
+    // The port's grain as it was set, for a port whose buffer another port of the context was given
+    // as well (then `data` is null): see AudioOut2Port::pcm.
+    std::vector<std::byte> bytes;
 };
 
 using AudioOut2Grain = std::vector<AudioOut2CapturedPort>;
@@ -62,7 +65,12 @@ struct AudioOut2Port {
     std::uint32_t channels = 0;
     bool int16 = false;
     const AudioOut2StereoFold* fold = nullptr;
+    // The buffer the title last set (attribute 0), null until the first set, and a copy of the grain
+    // it held then. A push records the buffer and the next push reads it (a title may fill it after
+    // pushing), but a title may also hand every port the same scratch buffer, refilling it port by
+    // port before the push (CRI ADX2 in Sonic Origins): a port sharing its buffer plays the copy.
     const void* data = nullptr;
+    std::vector<std::byte> pcm;
     float volume[AUDIO_OUT2_PORT_CHANNELS_MAX] = {1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f};
     std::uint64_t dataSets = 0;
     std::uint64_t attributeTraces = 0;
@@ -111,6 +119,8 @@ struct AudioOut2Context {
 std::uint32_t AudioOut2MixPorts(const AudioOut2Context& context, const AudioOut2Grain& grain, float* out, float* padOut, std::uint32_t frames);
 AudioOut2Grain AudioOut2CaptureGrain(const AudioOut2Context& context);
 bool AudioOut2HasPadPorts(const AudioOut2Context& context);
+// APS5_TRACE_AUDIOOUT2: each port's grain as last set, on the summary: its data sets, non-zero samples and peak.
+void AudioOut2TracePortData(const AudioOut2Context& context, std::uint32_t frames);
 // Forgets the ports of a context being destroyed.
 void AudioOut2ReleasePorts(const AudioOut2Context& context);
 
