@@ -753,6 +753,9 @@ bool SameAsPreviousStorageElement(const ShaderRecompiler::DescriptorBinding& bin
 ShaderResources::ShaderResources(const Context& context, const ShaderRecompiler::RecompileResult& vertex, const ShaderRecompiler::RecompileResult& fragment, const ColorTarget& target, std::uint64_t indexAddress, std::size_t indexBytes) : ShaderResources(context, std::array<CompiledShader, 2>{{{ShaderRecompiler::ShaderStage::Vertex, &vertex, 0}, {ShaderRecompiler::ShaderStage::Fragment, &fragment, static_cast<std::uint32_t>(vertex.pushConstants.size())}}}, target, indexAddress, indexBytes) {}
 
 ShaderResources::ShaderResources(const Context& context, std::span<const CompiledShader> shaders, const ColorTarget& target, std::uint64_t indexAddress, std::size_t indexBytes, std::span<const GuestMemorySnapshot> snapshots) : context(context), guestMemory(context) {
+    // A draw reads large ranges through an existing buffer shadow; a synchronous one syncs the
+    // recorder first (Draw), since the shadow's seeds and writers sit in its batches.
+    guestMemory.AllowShadowReads();
     prepareAddressBindings(shaders, snapshots);
     build(shaders, &target, indexAddress, indexBytes);
 }
@@ -1845,6 +1848,12 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
         }
         return true;
     };
+    // A range this build reads in place that a buffer shadow serves now (its writer made it since):
+    // rebuilt, so the work binds the device copy instead of publishing it every use.
+    if (Recorder::Active() != nullptr && guestMemory.InPlaceShadowable()) return finish(fast, false, ProofFailure::Imports);
+    // A region the build's own buffer shadow serves gets the pending storage results stored without
+    // its shadow published (the rebind below seeds whatever changed).
+    const auto flushScope = [&](const DirectRegion& region) { return guestMemory.ShadowServed(region.begin, static_cast<std::size_t>(region.end - region.begin)) ? PublishScope::None : PublishScope::Whole; };
     if (EpochRevalidate()) {
         if (!directRegions.empty() && !(pendingSerialSeen != 0 && pendingSerialSeen == StorageTexture::PendingSerial())) {
             struct RegionsTag {};
@@ -1854,8 +1863,9 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
             StorageTexture::ScanPending(regions);
             // A region over a unit shadow's fresh results (a retile bumped the serial) is
             // published by the flush, as one over a pending image is stored.
-            for (const auto& region : regions) {
-                if (region.overlaps || AnyShadowedOverlaps(region.begin, static_cast<std::size_t>(region.end - region.begin))) StorageTexture::FlushPending(region.begin, static_cast<std::size_t>(region.end - region.begin), nullptr, "imported buffer region");
+            for (std::size_t index = 0; index < regions.size(); ++index) {
+                const auto& region = regions[index];
+                if (region.overlaps || AnyShadowedOverlaps(region.begin, static_cast<std::size_t>(region.end - region.begin))) StorageTexture::FlushPending(region.begin, static_cast<std::size_t>(region.end - region.begin), nullptr, "imported buffer region", flushScope(directRegions[index]));
             }
         }
         if (HostImportsUnchanged(context, importsProof)) {
@@ -1865,7 +1875,7 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
             importsProof = HostImportsIdentity(context);
         }
     } else {
-        for (const auto& region : directRegions) StorageTexture::FlushPending(region.begin, static_cast<std::size_t>(region.end - region.begin), nullptr, "imported buffer region");
+        for (const auto& region : directRegions) StorageTexture::FlushPending(region.begin, static_cast<std::size_t>(region.end - region.begin), nullptr, "imported buffer region", flushScope(region));
         if (!serialLoop()) return finish(fast, false, ProofFailure::Imports);
     }
     // (3) Buffers staged in device memory (GuestBufferMemory::AllowDeviceStaging) are copied in
@@ -1879,6 +1889,9 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
             return finish(fast, false);
         }
     }
+    // (4) Buffer shadows serving regions (GuestBufferMemory::AllowShadowReads) are bound again, their
+    // stale units seeded; a shadow gone since leaves the set naming a stale buffer: rebuilt.
+    if (guestMemory.UsesBufferShadows() && !guestMemory.RebindBufferShadows()) return finish(fast, false, ProofFailure::Imports);
     pendingSerialSeen = EpochRevalidate() && StorageTexture::PendingSerial() == serialBefore ? serialBefore : 0;
     return finish(fast, true);
 }

@@ -151,6 +151,39 @@ std::string ShadowReport();
 // than their generation (counted as mismatches otherwise).
 bool ShadowVerify();
 
+// Buffer shadows (APS5_BUFFER_SHADOW=1, off by default): a device-local copy of a large guest
+// buffer range inside a host import, bound in the import's place by the dispatches that write it and
+// the dispatches and draws that read it, so passes that produce and consume a buffer on the GPU stop
+// crossing PCIe for it. One slab of the import's shadow spans the range whole, and its units follow
+// every rule above: a unit stamped since its generation is seeded from the import before a use, a
+// writer's units hold the newest bytes unpublished, and every host-facing consumer publishes them as
+// it publishes retiled units (image retiles never land in a buffer slab's units). Off by default:
+// the title's own CPU code reads guest memory without the flush hook, so a native read of such a
+// range after the GPU's label would see the import's older bytes.
+bool BufferShadowEnabled();
+// The smallest range bound through a buffer shadow (APS5_BUFFER_SHADOW_MIN_MIB, default 8).
+std::uint64_t BufferShadowMinBytes();
+struct BufferShadowBinding {
+    VkBuffer buffer;
+    // The guest address of the buffer's first byte.
+    std::uint64_t base;
+    std::shared_ptr<ShadowSlab> slab;
+    // A writer's: keeps the slab from eviction until MarkBufferShadowWritten (an evicted slab would
+    // take the work's results with it).
+    std::shared_ptr<ShadowSlabPin> pin;
+};
+// Under GuestMemory::GpuMutex with an active recorder: the buffer shadow serving [begin, end) of
+// `import`, its stale units seeded from the import into the open batch first. A writer (`make`)
+// creates it when none spans the range; a reader only takes an existing one. Nothing when refused
+// (disabled, the budget, a shadow over part of the range): the caller binds the import instead.
+std::optional<BufferShadowBinding> BufferShadowFor(const Context& context, const HostImport& import, std::uint64_t begin, std::uint64_t end, bool make);
+// After the work writing [begin, end) through `slab` was recorded and the range stamped at
+// `generation` (GuestMemory::MarkWritten): its units hold the newest bytes, unpublished.
+void MarkBufferShadowWritten(const HostImport& import, const ShadowSlab& slab, std::uint64_t begin, std::uint64_t end, std::uint64_t generation);
+// Whether a buffer shadow spans [begin, end) (a build reading the range in place is rebuilt to bind
+// it, see ShaderResources::Revalidate).
+bool BufferShadowServes(std::uint64_t begin, std::uint64_t end);
+
 }
 
 #endif

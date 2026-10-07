@@ -2087,6 +2087,12 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     APS5_LOG_CHARS_OUT_DEBUG("Creating CommandBatch");
     std::optional<CommandBatch> batch;
     if (!recorded) {
+        // A buffer shadow the draw reads was seeded, or written, by recorded work this batch would
+        // otherwise run ahead of.
+        if (recorder != nullptr && resources->UsesBufferShadows()) {
+            Recorder::CountSync(4);
+            recorder->Sync();
+        }
         // The color-target detiles below take their descriptor sets from a fresh batch.
         if (context.detiler != nullptr) context.detiler->BeginBatch();
         batch.emplace(context);

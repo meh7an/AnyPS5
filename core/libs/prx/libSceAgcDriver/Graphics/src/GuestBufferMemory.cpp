@@ -1923,6 +1923,11 @@ bool GuestBufferMemory::stagingEligible(const Region& region, bool addressable) 
     return writtenShadowEnabled() && bytes >= writtenShadowMin() && bytes <= writtenShadowMax();
 }
 
+bool GuestBufferMemory::shadowEligible(const Region& region, bool addressable) const {
+    if (!(stagingAllowed || shadowReads) || addressable || region.sparse || region.mirror != nullptr || !BufferShadowEnabled()) return false;
+    return region.end - region.begin >= BufferShadowMinBytes();
+}
+
 void GuestBufferMemory::UploadPrepare(bool addressable) {
     Require(!prepared && !uploaded, "guest memory was already uploaded");
     prepared = true;
@@ -2148,6 +2153,10 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
             continue;
         }
         bool copyOnGpu = false;
+        // The import a buffer shadow may serve the region from (see shadowEligible), copied under
+        // the import lock: the flush below may retire the entry.
+        HostImport shadowCandidate{};
+        bool shadowable = false;
         if (context.hostImportAlignment != 0) {
             auto& state = Imports();
             std::lock_guard lock(state.mutex);
@@ -2174,6 +2183,10 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
                 // region in place (Descriptor prefers `direct`), and a kept buffer would count as copied.
                 region.buffer.reset();
                 region.deviceLocal = false;
+                if (recorder != nullptr && shadowEligible(region, addressable)) {
+                    shadowCandidate = *entry;
+                    shadowable = true;
+                }
             } else if (entry != nullptr && recorder != nullptr && (staged || gpuCopyEligible(region))) {
                 // Misaligned in the import (or staged): the GPU copies the sub-range out of it. The
                 // handle and base are taken now, under the import lock: a reconcile by the flush
@@ -2183,6 +2196,25 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
                 region.deviceLocal = staged;
                 region.copySource = entry->buffer;
                 region.copySourceBase = entry->base;
+            }
+        }
+        if (region.direct != nullptr && shadowable) {
+            // A buffer shadow serves the range in the import's place: storage results pending in it
+            // reach the import first without publishing the shadow's own (the shadow seeds whatever
+            // changed). A draw reads through an existing shadow only; a range it writes stays in place,
+            // where the flush below publishes the shadow first. Refused, the import serves the range.
+            const bool written = WritesOverlap(region.begin, static_cast<std::size_t>(bytes));
+            if (!written || stagingAllowed) {
+                StorageTexture::FlushPending(region.begin, static_cast<std::size_t>(bytes), nullptr, "imported buffer region", PublishScope::None);
+                if (auto binding = BufferShadowFor(context, shadowCandidate, region.begin, region.end, written)) {
+                    region.direct = nullptr;
+                    region.shadow = std::move(binding->slab);
+                    region.shadowBase = binding->base;
+                    region.shadowWritten = written;
+                    region.shadowImport = shadowCandidate;
+                    region.shadowPin = std::move(binding->pin);
+                    continue;
+                }
             }
         }
         if (region.direct != nullptr) {
@@ -2481,14 +2513,14 @@ VkDescriptorBufferInfo GuestBufferMemory::Descriptor(std::uint64_t address, std:
     const auto* found = owner(address);
     Require(found != nullptr, "guest buffer has no GPU owner");
     const auto& region = *found;
-    Require(address >= region.begin && address + bytes <= region.end && (region.buffer != nullptr || region.direct != nullptr || region.mirror != nullptr), "guest buffer view exceeds its GPU owner");
-    const auto base = region.direct != nullptr ? region.direct->base : region.mirror != nullptr ? region.mirror->base : region.begin;
+    Require(address >= region.begin && address + bytes <= region.end && (region.buffer != nullptr || region.direct != nullptr || region.mirror != nullptr || region.shadow != nullptr), "guest buffer view exceeds its GPU owner");
+    const auto base = region.shadow != nullptr ? region.shadowBase : region.direct != nullptr ? region.direct->base : region.mirror != nullptr ? region.mirror->base : region.begin;
     const auto offset = address - base;
     Require(context.limits.minStorageBufferOffsetAlignment != 0, "no storage buffer offset alignment");
     adjustment = static_cast<std::uint32_t>(offset % context.limits.minStorageBufferOffsetAlignment);
     Require(adjustment % 4 == 0, "guest buffer view off the storage buffer offset alignment is not DWORD aligned");
     Require(bytes + adjustment <= context.limits.maxStorageBufferRange, "guest buffer view exceeds descriptor range limit");
-    const auto handle = region.direct != nullptr ? region.direct->buffer : region.mirror != nullptr ? region.mirror->buffer->Handle() : region.buffer->Handle();
+    const auto handle = region.shadow != nullptr ? region.shadow->buffer : region.direct != nullptr ? region.direct->buffer : region.mirror != nullptr ? region.mirror->buffer->Handle() : region.buffer->Handle();
     return {handle, offset - adjustment, bytes + adjustment};
 }
 
@@ -2525,7 +2557,8 @@ bool GuestBufferMemory::HasCopiedWrites() const {
         const auto* found = owner(begin);
         if (found == nullptr) continue;
         const auto& region = *found;
-        if (region.direct != nullptr) continue;
+        // The work wrote a buffer shadow: it is marked, never stored by the CPU.
+        if (region.direct != nullptr || region.shadow != nullptr) continue;
         // A GPU copy whose written sub-ranges were copied back by the GPU lands like a direct
         // write; until RecordCopyBacks ran it still counts (a use without it stores in WriteBack).
         // A staged copy never counts: its use always records the copy-back (AllowDeviceStaging),
@@ -2543,8 +2576,16 @@ void GuestBufferMemory::MarkDirectWrites() const {
         const auto* found = owner(begin);
         if (found == nullptr) continue;
         const auto& region = *found;
+        if (region.shadow != nullptr) {
+            // The work wrote the buffer shadow: the import's stamp makes every other copy of the
+            // range stale, and the shadow's units hold the newest bytes at it.
+            if (region.shadowWritten) MarkBufferShadowWritten(region.shadowImport, *region.shadow, begin, end, GuestMemory::MarkWritten(begin, static_cast<std::size_t>(end - begin)));
+            continue;
+        }
         if (region.direct != nullptr || (region.gpuCopy && region.copiedBack)) GuestMemory::MarkWritten(begin, static_cast<std::size_t>(end - begin));
     }
+    // The writers' slabs may be evicted again once marked.
+    for (const auto& region : regions) region.shadowPin.reset();
 }
 
 namespace {
@@ -2606,6 +2647,9 @@ void GuestBufferMemory::WriteBack() {
         const auto* found = owner(begin);
         Require(found != nullptr, "write-back range has no GPU owner");
         const auto& region = *found;
+        // A buffer shadow holds the results, marked when the work was recorded (MarkDirectWrites);
+        // a stamp here would make them read as stale.
+        if (region.shadow != nullptr) continue;
         // Every branch below but the direct, copied-back and staged ones stores from the CPU.
         if (region.direct == nullptr && !(region.gpuCopy && (region.copiedBack || region.deviceLocal)) && !(region.mirror != nullptr && !region.mirror->writable)) Recorder::NoteWrittenBack(begin, static_cast<std::size_t>(end - begin));
         if (region.direct != nullptr) {
@@ -2695,15 +2739,18 @@ std::optional<std::vector<std::pair<std::uint64_t, std::uint64_t>>> GuestBufferM
         // of its copy-in and the destination of its copy-back, both recorded per use.
         const bool fixedMirror = region.mirror != nullptr && !region.mirror->writable && !region.mirror->heap;
         const bool staged = region.gpuCopy && region.deviceLocal;
-        if (region.direct == nullptr && !fixedMirror && !staged) return std::nullopt;
-        if (staged) {
-            // A later use copies from `copySource` again, so it must still be the import serving
-            // the range (the flush before the copy-in can retire and remake imports): the serial
-            // the caller records names the current import, and its buffer must be that one.
+        // A shadow-served region is keyed by its import too: the shadow belongs to it.
+        const bool shadowed = region.shadow != nullptr;
+        if (region.direct == nullptr && !fixedMirror && !staged && !shadowed) return std::nullopt;
+        if (staged || shadowed) {
+            // A later use copies from `copySource` again (or seeds the shadow from its import), so
+            // it must still be the import serving the range (the flush before the copy-in can
+            // retire and remake imports): the serial the caller records names the current import,
+            // and its buffer must be that one.
             auto& state = Imports();
             std::lock_guard lock(state.mutex);
             const auto* entry = state.device == context.device ? findImport(state, region.begin, region.end) : nullptr;
-            if (entry == nullptr || entry->buffer != region.copySource) return std::nullopt;
+            if (entry == nullptr || entry->buffer != (staged ? region.copySource : region.shadowImport.buffer)) return std::nullopt;
         }
         result.emplace_back(region.begin, region.end);
     }
@@ -2756,6 +2803,40 @@ void GuestBufferMemory::RecordStagingCopies(Recorder& recorder) {
     Require(Recorder::Active() == &recorder, "staging copies recorded into a recorder that is not the device's");
     if (profile) Copies().stagedReused.fetch_add(copies.size(), std::memory_order_relaxed);
     recordGpuCopies(copies, false);
+}
+
+bool GuestBufferMemory::RebindBufferShadows() {
+    if (!uploaded || committed) return true;
+    for (auto& region : regions) {
+        if (region.shadow == nullptr) continue;
+        // As at upload: pending storage results reach the import, and the shadow seeds what changed.
+        StorageTexture::FlushPending(region.begin, static_cast<std::size_t>(region.end - region.begin), nullptr, "imported buffer region", PublishScope::None);
+        auto binding = BufferShadowFor(context, region.shadowImport, region.begin, region.end, region.shadowWritten);
+        // Another slab, or none (evicted, retired): the set names a buffer that no longer holds the range.
+        if (!binding.has_value() || binding->slab != region.shadow) return false;
+        region.shadowPin = std::move(binding->pin);
+    }
+    return true;
+}
+
+bool GuestBufferMemory::InPlaceShadowable() const {
+    if (!uploaded || committed || !(stagingAllowed || shadowReads) || !BufferShadowEnabled()) return false;
+    for (const auto& region : regions) {
+        if (region.direct == nullptr || region.end - region.begin < BufferShadowMinBytes()) continue;
+        // A draw writing the range binds it in place whatever serves it (see AllowShadowReads).
+        if (!stagingAllowed && WritesOverlap(region.begin, static_cast<std::size_t>(region.end - region.begin))) continue;
+        if (BufferShadowServes(region.begin, region.end)) return true;
+    }
+    return false;
+}
+
+bool GuestBufferMemory::UsesBufferShadows() const {
+    return std::any_of(regions.begin(), regions.end(), [](const Region& region) { return region.shadow != nullptr; });
+}
+
+bool GuestBufferMemory::ShadowServed(std::uint64_t address, std::size_t bytes) const {
+    const auto* found = owner(address);
+    return found != nullptr && found->shadow != nullptr && address + bytes <= found->end;
 }
 
 std::uint64_t ImageMirrorSerial(const Context& context, std::uint64_t address, std::size_t bytes) {

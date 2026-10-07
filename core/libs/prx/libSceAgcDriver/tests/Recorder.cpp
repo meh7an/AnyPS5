@@ -1624,6 +1624,146 @@ void unitShadowTests(const Device& device, Recorder& recorder) {
     else Require(words[128 * unit] == 0x77, "the eviction before the retire did not publish unit 128");
 }
 
+// Buffer shadows (UnitShadow.hpp, APS5_BUFFER_SHADOW=1) over a host import of write-watched arena
+// memory: one slab over a bound range. A writer's binding makes it, seeded from the import and
+// pinned; the work's marked store makes its unit the newest, unpublished; a reader takes the same
+// slab; a publish lands the unit, the store's bytes and the seed's; a CPU store makes its unit stale
+// and the next binding seeds it, so a later publish keeps the CPU's byte; a stale unit's results lose
+// to the CPU's; retiles and bindings over part of the shadow are refused; a retire publishes the
+// units still registered. Off (the default), the primitives are inert.
+void bufferShadowTests(const Device& device, Recorder& recorder) {
+    using namespace AgcDriver::GuestMemory;
+    const auto& context = device.GetContext();
+    if (!BufferShadowEnabled()) {
+        Require(!BufferShadowServes(0x10000, 0x20000), "buffer shadows are off but serve a range");
+        std::cout << "buffer shadows off (APS5_BUFFER_SHADOW unset, or unit shadows off): primitives inert\n";
+        return;
+    }
+    if (context.hostImportAlignment == 0) {
+        std::cout << "host imports unavailable: buffer shadows not tested\n";
+        return;
+    }
+    constexpr std::uint64_t unit = 65536;
+    constexpr std::size_t bytes = 6 * unit;
+    void* block = AllocateWatched(bytes, 65536);
+    Require(block != nullptr, "buffer shadows are on without write watching");
+    struct Release {
+        void* block;
+        ~Release() { ReleaseWatched(block, bytes); }
+    } release{block};
+    std::memset(block, 0x11, bytes);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true);
+    }
+    struct Unregister {
+        void* block;
+        ~Unregister() {
+            GuestAllocations::Mutation mutation;
+            mutation.Remove(block);
+        }
+    } unregister{block};
+    const auto* import = HostImportFor(context, address, bytes);
+    if (import == nullptr) {
+        std::cout << "host import of the buffer shadow test block refused: buffer shadows not tested\n";
+        return;
+    }
+    if (!Watched(address, bytes)) {
+        std::cout << "host imports are compared, not watched: buffer shadows not tested\n";
+        return;
+    }
+    Require(import->base == address && import->bytes == bytes, "the import does not cover the block");
+    CollectWritesUncached(address, bytes);
+    const auto* words = static_cast<const std::uint8_t*>(block);
+    // A CPU store the write watch sees.
+    const auto cpuStore = [&](std::uint64_t offset, std::uint8_t value) { *static_cast<volatile std::uint8_t*>(static_cast<void*>(static_cast<std::uint8_t*>(block) + offset)) = value; };
+    // The shadowed range: units 1 and 2.
+    const auto first = address + unit;
+    const auto end = address + 3 * unit;
+    // The work's store through a binding: `value` over [begin, begin + length) of the slab, then the
+    // marks a recorded dispatch makes (MarkDirectWrites).
+    const auto copyBuffer = context.Function<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer");
+    const auto store = [&](const BufferShadowBinding& binding, std::uint64_t begin, std::uint64_t length, std::uint8_t value) {
+        auto pattern = std::make_shared<Buffer>(context, static_cast<std::size_t>(length), VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+        std::memset(pattern->Bytes().data(), value, pattern->Bytes().size());
+        const auto commands = recorder.Commands();
+        recorder.Keep(pattern);
+        recorder.Keep(binding.slab);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_HOST_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+        const VkBufferCopy piece{0, begin - binding.base, length};
+        copyBuffer(commands, pattern->Handle(), binding.buffer, 1, &piece);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+        recorder.MarkCovered(VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+        MarkBufferShadowWritten(*import, *binding.slab, begin, begin + length, MarkWritten(begin, static_cast<std::size_t>(length)));
+    };
+    auto writer = BufferShadowFor(context, *import, first, end, true);
+    Require(writer.has_value() && writer->pin != nullptr && writer->base == first && writer->slab->units == 2, "the writer's binding made no shadow over the range");
+    Require(BufferShadowServes(first, end) && BufferShadowServes(first + 100, first + 200) && !BufferShadowServes(address, end), "the shadow does not serve exactly its units");
+    Require(!AnyShadowedOverlaps(first, static_cast<std::size_t>(2 * unit)), "a seeded shadow counts as shadowed");
+    // The store over the first half of unit 1: the unit holds the newest bytes, unpublished.
+    store(*writer, first, unit / 2, 0x22);
+    writer->pin.reset();
+    Require(AnyShadowedOverlaps(first, 1) && AnyShadowedOverlaps(first + unit - 1, 1) && !AnyShadowedOverlaps(first + unit, unit), "the written unit is not shadowed, or its neighbour is");
+    recorder.Sync();
+    Require(words[unit] == 0x11, "the shadowed store reached the import without a publish");
+    // A reader takes the same slab, its units current: nothing pinned.
+    auto reader = BufferShadowFor(context, *import, first, end, false);
+    Require(reader.has_value() && reader->slab == writer->slab && reader->pin == nullptr, "a reader did not take the writer's shadow");
+    Require(!BufferShadowFor(context, *import, address, first + unit, false).has_value() && !BufferShadowFor(context, *import, address, first + unit, true).has_value(), "a binding over part of the shadow was served");
+    // The flush hook's publish lands unit 1: the store's half and the seed's half; it stamps nothing.
+    const auto pre = CollectWritesUncached(address, bytes);
+    Require(PublishShadow(first, 16, PublishScope::Whole, PublishReason::Hook) == 1, "the written unit was not published");
+    recorder.Sync();
+    Require(words[unit] == 0x22 && words[unit + unit / 2 - 1] == 0x22 && words[unit + unit / 2] == 0x11 && words[2 * unit - 1] == 0x11, "the published bytes are wrong");
+    Require(!AnyShadowedOverlaps(first, unit) && UnchangedSince(first, unit, pre), "the publish left the unit shadowed, or stamped it");
+    // A CPU store into unit 2 makes it stale: the next binding seeds it, so the publish after a
+    // later store keeps the CPU's byte.
+    cpuStore(2 * unit + 4096, 0x55);
+    auto seeded = BufferShadowFor(context, *import, first, end, true);
+    Require(seeded.has_value() && seeded->slab == writer->slab, "the rebinding lost the shadow");
+    store(*seeded, first + unit, 16, 0x33);
+    seeded->pin.reset();
+    Require(PublishShadow(first + unit, unit, PublishScope::Whole, PublishReason::Hook) == 1, "the re-written unit was not published");
+    recorder.Sync();
+    Require(words[2 * unit] == 0x33 && words[2 * unit + 15] == 0x33 && words[2 * unit + 16] == 0x11 && words[2 * unit + 4096] == 0x55, "the CPU's store was not seeded into the shadow before the publish");
+    // Unpublished results of a unit the CPU then writes lose to the CPU's bytes.
+    {
+        auto binding = BufferShadowFor(context, *import, first, end, true);
+        Require(binding.has_value(), "the shadow refused a writer");
+        store(*binding, first, 16, 0x44);
+    }
+    Require(AnyShadowedOverlaps(first, 1), "the re-written unit 1 is not shadowed");
+    cpuStore(unit + 8192, 0x66);
+    Require(PublishShadow(first, unit, PublishScope::Whole, PublishReason::Hook) == 0, "a stale unit's results were published over the CPU's store");
+    recorder.Sync();
+    Require(words[unit] == 0x22 && words[unit + 8192] == 0x66, "the stale unit's publish overwrote the import");
+    // A retile never lands in a buffer shadow's units; outside them it still does.
+    Require(!ShadowDestinationFor(context, *import, first, first + unit / 2).has_value(), "a retile landed in a buffer shadow's units");
+    Require(ShadowDestinationFor(context, *import, address + 4 * unit, address + 5 * unit).has_value(), "a retile outside the buffer shadow was refused");
+    // Retire: the block is registered again as its first two units, and the next lookup retires the
+    // import. Unit 1's unpublished results (still registered) reach its buffer; unit 2's (memory the
+    // title took back) are dropped.
+    {
+        auto binding = BufferShadowFor(context, *import, first, end, true);
+        Require(binding.has_value(), "the shadow refused a writer before the retire");
+        store(*binding, first, 16, 0x77);
+        store(*binding, first + unit, 16, 0x78);
+    }
+    Require(AnyShadowedOverlaps(first, 1) && AnyShadowedOverlaps(first + unit, 1), "units 1 and 2 are not shadowed before the retire");
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Remove(block);
+        mutation.Add(block, static_cast<std::size_t>(2 * unit), true, true);
+    }
+    Require(HostImportFor(context, address, bytes) == nullptr, "a shrunk registration still imports the old range");
+    Require(!AnyShadowedOverlaps(address, bytes) && !BufferShadowServes(first, end), "the retired import's buffer shadow survived");
+    recorder.Sync();
+    Require(words[unit] == 0x77 && words[unit + 16] == 0x22 && words[unit + 8192] == 0x66, "the retire did not publish the unit still registered");
+    Require(words[2 * unit] == 0x33, "the retire published a unit whose memory is no longer registered");
+    std::cout << "buffer shadows verified\n";
+}
+
 void storageRefreshTests(const Device& device, Recorder& recorder, bool watched) {
     const auto& base = device.GetContext();
     if (base.hostImportAlignment == 0) {
@@ -2946,6 +3086,7 @@ int main() {
         viewPastLastMipTests(device, recorder);
         keysFillTests(device, recorder);
         unitShadowTests(device, recorder);
+        bufferShadowTests(device, recorder);
         storageRefreshTests(device, recorder, false);
         storageRefreshTests(device, recorder, true);
         writeBackPaddingTests(device, recorder, false);
