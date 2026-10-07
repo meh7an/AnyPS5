@@ -119,6 +119,29 @@ std::uint64_t stageMemoKey(const ShaderRecompiler::UserDataKey& key, const void*
     return hash;
 }
 
+// A thread's memo keys by source (ShaderRecompiler::UserDataKeyFor; a source entry lives as long as
+// the process, its key with it): found per stage without a lock, through a direct-mapped array in
+// front of the map that owns them. A source without a key yet (no plan before its first capture)
+// is asked again.
+struct StageMemoKeys {
+    struct Way {
+        const void* source = nullptr;
+        const ShaderRecompiler::UserDataKey* key = nullptr;
+    };
+    std::array<Way, 256> ways{};
+    std::unordered_map<const void*, std::shared_ptr<const ShaderRecompiler::UserDataKey>> owned;
+
+    const ShaderRecompiler::UserDataKey* Find(const ShaderRecompiler::SourceHandle& handle) {
+        const void* source = handle.source.get();
+        auto& way = ways[(reinterpret_cast<std::uintptr_t>(source) >> 4) * 0x9e3779b97f4a7c15ull >> 56];
+        if (way.source == source) return way.key;
+        auto& known = owned[source];
+        if (known == nullptr) known = ShaderRecompiler::UserDataKeyFor(handle);
+        if (known != nullptr) way = {source, known.get()};
+        return known.get();
+    }
+};
+
 enum class StageMemoMiss { None, Absent, Mappings, Changed, Pending, Skipped };
 
 // Whether a key with `misses` misses in a row is tried (validated, and stored again after a miss):
@@ -232,14 +255,10 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::compileDrawStag
     // remembered result with this stage's user words copied in. Its words enter the draw's shader
     // memory as this stage's reads, so the draw's regions are those a capture would have made.
     static const bool memoize = StageMemoEnabled();
-    std::shared_ptr<const ShaderRecompiler::UserDataKey> memoKey;
+    const ShaderRecompiler::UserDataKey* memoKey = nullptr;
     if (memoize && handle != nullptr && dumpTarget == 0 && dumpSlot1 == 0 && !ShaderRecompiler::DebugProbeActive()) {
-        // Per thread by source (a source entry lives as long as the process): no lock per stage.
         struct MemoKeysTag {};
-        auto& keys = ThreadScratch<std::unordered_map<const void*, std::shared_ptr<const ShaderRecompiler::UserDataKey>>, MemoKeysTag>();
-        auto& known = keys[handle->source.get()];
-        if (known == nullptr) known = ShaderRecompiler::UserDataKeyFor(*handle);
-        memoKey = known;
+        memoKey = ThreadScratch<StageMemoKeys, MemoKeysTag>().Find(*handle);
     }
     struct MemoKeyTag {};
     auto& memoWords = ThreadScratch<std::vector<std::uint32_t>, MemoKeyTag>();
@@ -273,7 +292,7 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::compileDrawStag
             std::lock_guard lock(stageMemoMutex);
             entries = stageMemo.size();
             const auto found = stageMemo.find(memoHash);
-            if (found != stageMemo.end() && found->second.entry->handle->source == handle->source && found->second.entry->pushOffset == pushOffset && found->second.entry->key == memoWords) {
+            if (found != stageMemo.end() && found->second.source == handle->source.get() && found->second.pushOffset == pushOffset && found->second.entry->key == memoWords) {
                 auto& slot = found->second;
                 entry = slot.entry;
                 stageMemoOrder.splice(stageMemoOrder.end(), stageMemoOrder, slot.order);
@@ -319,7 +338,7 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::compileDrawStag
             if (fresh) {
                 std::lock_guard lock(stageMemoMutex);
                 const auto found = stageMemo.find(memoHash);
-                if (found != stageMemo.end() && found->second.entry == entry && found->second.served == nullptr) found->second.served = served;
+                if (found != stageMemo.end() && found->second.entry == entry && (found->second.served == nullptr || found->second.served.use_count() > 1)) found->second.served = served;
             }
             memoResult = served;
             if (!VerifyStageMemo()) {
@@ -483,6 +502,8 @@ void Driver::insertStageMemo(std::uint64_t hash, const std::shared_ptr<const Sha
     }
     // The served result belongs to the entry replaced; the misses in a row go on counting.
     slot->second.entry = std::move(entry);
+    slot->second.source = handle->source.get();
+    slot->second.pushOffset = pushOffset;
     slot->second.served.reset();
     slot->second.generation = generation;
     while (stageMemo.size() > StageMemoCapacity() && !stageMemoOrder.empty()) {
