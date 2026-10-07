@@ -132,6 +132,8 @@ static int mprotect(void* addr, size_t len, int prot) {
         }
         cursor = regionEnd;
     }
+    // The pages above lost any guard the arena holds over them (GuestArenaGuard).
+    if (KernelArena::Get().Contains(addr, len)) GuestArena::GuestArenaReguard_nid_postfix(addr, len, WinProtFromPosix(prot));
     return 0;
 }
 #endif

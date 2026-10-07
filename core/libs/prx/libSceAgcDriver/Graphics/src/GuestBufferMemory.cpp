@@ -366,7 +366,9 @@ const HostImport* importAllocation(const Context& context, HostImports& state, s
     HostImport entry{base, bytes, VK_NULL_HANDLE, VK_NULL_HANDLE, 0};
     entry.range = leasedRangeOwner(lease, base);
 #ifdef _WIN32
-    // Drivers pin imported pages, so every page must be committed and accessible.
+    // Drivers pin imported pages, so every page must be committed and accessible: guarded units
+    // (OpenShadowGuards) open first.
+    OpenShadowGuards(base, base + bytes);
     bool writable = true;
     bool readOnly = true;
     MEMORY_BASIC_INFORMATION refused{};
@@ -1924,7 +1926,7 @@ bool GuestBufferMemory::stagingEligible(const Region& region, bool addressable) 
 }
 
 bool GuestBufferMemory::shadowEligible(const Region& region, bool addressable) const {
-    if (!(stagingAllowed || shadowReads) || addressable || region.sparse || region.mirror != nullptr || !BufferShadowEnabled()) return false;
+    if (!(stagingAllowed || shadowReads) || addressable || region.sparse || region.mirror != nullptr || !(BufferShadowEnabled() || BufferShadowObserved())) return false;
     return region.end - region.begin >= BufferShadowMinBytes();
 }
 
@@ -2203,8 +2205,12 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
             // reach the import first without publishing the shadow's own (the shadow seeds whatever
             // changed). A draw reads through an existing shadow only; a range it writes stays in place,
             // where the flush below publishes the shadow first. Refused, the import serves the range.
+            // Observed instead (BufferShadowObserved), the import serves it as before and a writer's
+            // range is guarded once the work is recorded.
             const bool written = WritesOverlap(region.begin, static_cast<std::size_t>(bytes));
-            if (!written || stagingAllowed) {
+            if (BufferShadowObserved()) {
+                region.shadowObserved = written && stagingAllowed;
+            } else if (!written || stagingAllowed) {
                 StorageTexture::FlushPending(region.begin, static_cast<std::size_t>(bytes), nullptr, "imported buffer region", PublishScope::None);
                 if (auto binding = BufferShadowFor(context, shadowCandidate, region.begin, region.end, written)) {
                     region.direct = nullptr;
@@ -2583,6 +2589,7 @@ void GuestBufferMemory::MarkDirectWrites() const {
             continue;
         }
         if (region.direct != nullptr || (region.gpuCopy && region.copiedBack)) GuestMemory::MarkWritten(begin, static_cast<std::size_t>(end - begin));
+        if (region.direct != nullptr && region.shadowObserved) ObserveBufferShadowWrite(begin, end);
     }
     // The writers' slabs may be evicted again once marked.
     for (const auto& region : regions) region.shadowPin.reset();

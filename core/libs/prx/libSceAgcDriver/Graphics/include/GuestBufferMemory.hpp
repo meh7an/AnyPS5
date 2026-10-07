@@ -330,6 +330,9 @@ private:
         bool shadowWritten = false;
         HostImport shadowImport{};
         mutable std::shared_ptr<ShadowSlabPin> shadowPin;
+        // APS5_BUFFER_SHADOW_OBSERVE: the work writes a range a buffer shadow would serve, in place;
+        // MarkDirectWrites guards it (ObserveBufferShadowWrite).
+        bool shadowObserved = false;
     };
 
     // How [begin, end) lies against the space's base regions.

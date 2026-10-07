@@ -5,9 +5,14 @@
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libc/include/GuestArena.hpp"
+#ifdef _WIN32
+#include <windows.h>
+#endif
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -15,6 +20,9 @@
 #include <map>
 #include <mutex>
 #include <stdexcept>
+#include <string>
+#include <utility>
+#include <vector>
 
 namespace AgcDriver::Graphics {
 
@@ -1102,6 +1110,186 @@ std::string ShadowReport() {
         line += text;
     }
     return line;
+}
+
+namespace {
+
+// APS5_BUFFER_SHADOW_OBSERVE: what the guards saw since the last [shadow-guard] line. The fault
+// handler records into it, so a plain leaf mutex guards it and nothing is resolved under it.
+struct GuardTouch {
+    std::uint32_t thread;
+    std::uintptr_t instruction;
+    std::uintptr_t address;
+    bool write;
+    // The touching code's callers (the handler's own frames and the exception dispatch left out, or
+    // the whole captured stack when the faulting frame is not found in it).
+    std::array<std::uintptr_t, 16> callers{};
+};
+
+struct GuardObservation {
+    std::mutex mutex;
+    std::uint64_t writes = 0, guardedBytes = 0, refused = 0, refusedBytes = 0, touches = 0, touchWrites = 0;
+    std::vector<GuardTouch> first;
+    std::map<std::uintptr_t, std::uint64_t> byInstruction;
+    std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
+};
+
+GuardObservation& Observation() {
+    static GuardObservation observation;
+    return observation;
+}
+
+#ifdef _WIN32
+// The guard handler: counts the touch and opens its whole unit (its neighbours' bytes are as
+// current as the touched one's) until the next write guards it again.
+void observeTouch(std::uintptr_t address, bool write, std::uintptr_t instruction) {
+    auto& observation = Observation();
+    {
+        std::lock_guard lock(observation.mutex);
+        ++observation.touches;
+        if (write) ++observation.touchWrites;
+        if (observation.first.size() < 12) {
+            GuardTouch touch{static_cast<std::uint32_t>(GetCurrentThreadId()), instruction, address, write};
+            // This stack runs from the handler through the exception dispatch to the faulting frame:
+            // the frames after the one returning into the faulting function are its callers.
+            std::array<void*, 40> frames{};
+            const auto count = RtlCaptureStackBackTrace(0, static_cast<DWORD>(frames.size()), frames.data(), nullptr);
+            USHORT start = 0;
+            for (USHORT i = 0; i < count; ++i) {
+                if (reinterpret_cast<std::uintptr_t>(frames[i]) == instruction) start = static_cast<USHORT>(i + 1);
+            }
+            for (std::size_t next = 0; start + next < count && next < touch.callers.size(); ++next) touch.callers[next] = reinterpret_cast<std::uintptr_t>(frames[start + next]);
+            observation.first.push_back(touch);
+        }
+        if (observation.byInstruction.size() < 64 || observation.byInstruction.contains(instruction)) ++observation.byInstruction[instruction];
+    }
+    const auto unit = address & ~(UnitBytes - 1);
+    GuestArena::GuestArenaUnguard_nid_postfix(reinterpret_cast<void*>(unit), UnitBytes);
+}
+
+// "module+0xoffset" for a code address, or the bare address.
+std::string describeCode(std::uintptr_t address) {
+    HMODULE module = nullptr;
+    char path[MAX_PATH] = "";
+    char text[MAX_PATH + 32];
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, reinterpret_cast<LPCSTR>(address), &module) && GetModuleFileNameA(module, path, sizeof(path)) != 0) {
+        const char* name = std::strrchr(path, '\\');
+        std::snprintf(text, sizeof(text), "%s+0x%llx", name != nullptr ? name + 1 : path, static_cast<unsigned long long>(address - reinterpret_cast<std::uintptr_t>(module)));
+    } else {
+        std::snprintf(text, sizeof(text), "0x%llx", static_cast<unsigned long long>(address));
+    }
+    return text;
+}
+
+std::string threadName(std::uint32_t id) {
+    std::string name;
+    if (HANDLE thread = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, id)) {
+        PWSTR description = nullptr;
+        if (SUCCEEDED(GetThreadDescription(thread, &description)) && description != nullptr) {
+            char text[128];
+            if (WideCharToMultiByte(CP_UTF8, 0, description, -1, text, sizeof(text), nullptr, nullptr) > 0) name = text;
+            LocalFree(description);
+        }
+        CloseHandle(thread);
+    }
+    return name;
+}
+
+// The [shadow-guard] line, every 10 s with anything to say.
+void reportObservation() {
+    auto& observation = Observation();
+    std::uint64_t writes = 0, guardedBytes = 0, refused = 0, refusedBytes = 0, touches = 0, touchWrites = 0;
+    std::vector<GuardTouch> first;
+    std::map<std::uintptr_t, std::uint64_t> byInstruction;
+    {
+        std::lock_guard lock(observation.mutex);
+        const auto now = std::chrono::steady_clock::now();
+        if (now - observation.lastReport < std::chrono::seconds(10)) return;
+        observation.lastReport = now;
+        writes = std::exchange(observation.writes, 0);
+        guardedBytes = std::exchange(observation.guardedBytes, 0);
+        refused = std::exchange(observation.refused, 0);
+        refusedBytes = std::exchange(observation.refusedBytes, 0);
+        touches = std::exchange(observation.touches, 0);
+        touchWrites = std::exchange(observation.touchWrites, 0);
+        first.swap(observation.first);
+        byInstruction.swap(observation.byInstruction);
+    }
+    if (writes == 0 && refused == 0 && touches == 0) return;
+    std::vector<std::pair<std::uint64_t, std::uintptr_t>> hot;
+    for (const auto& [instruction, count] : byInstruction) hot.emplace_back(count, instruction);
+    std::sort(hot.rbegin(), hot.rend());
+    std::string byCode;
+    for (std::size_t i = 0; i < hot.size() && i < 8; ++i) byCode += " " + describeCode(hot[i].second) + " x" + std::to_string(hot[i].first);
+    std::string firstTouches;
+    for (std::size_t i = 0; i < first.size(); ++i) {
+        const auto& touch = first[i];
+        char text[96];
+        std::snprintf(text, sizeof(text), " %s of 0x%llx by thread %u '", touch.write ? "write" : "read", static_cast<unsigned long long>(touch.address), touch.thread);
+        firstTouches += text + threadName(touch.thread) + "' at " + describeCode(touch.instruction);
+        // The callers of the first three.
+        for (const auto caller : touch.callers) {
+            if (caller != 0 && i < 3) firstTouches += " <- " + describeCode(caller);
+        }
+        firstTouches += ";";
+    }
+    std::fprintf(stderr, "[shadow-guard] observe (10 s): %llu writes guarded (%.1f MiB), %llu refused (%.1f MiB); %llu host touches (%llu writes); by code:%s; first:%s\n", static_cast<unsigned long long>(writes), static_cast<double>(guardedBytes) / 1048576.0, static_cast<unsigned long long>(refused), static_cast<double>(refusedBytes) / 1048576.0, static_cast<unsigned long long>(touches), static_cast<unsigned long long>(touchWrites), byCode.c_str(), firstTouches.c_str());
+}
+#endif
+
+}
+
+bool BufferShadowObserved() {
+#ifdef _WIN32
+    static const bool observed = std::getenv("APS5_BUFFER_SHADOW_OBSERVE") != nullptr && !BufferShadowEnabled();
+    return observed;
+#else
+    return false;
+#endif
+}
+
+void ObserveBufferShadowWrite(std::uint64_t begin, std::uint64_t end) {
+#ifdef _WIN32
+    if (!BufferShadowObserved()) return;
+    static const bool installed = [] {
+        GuestArena::GuestArenaSetGuardHandler_nid_postfix(&observeTouch);
+        return true;
+    }();
+    static_cast<void>(installed);
+    // Whole units only: a partly covered one holds bytes beyond the range.
+    const auto first = (begin + UnitBytes - 1) & ~(UnitBytes - 1);
+    const auto last = end & ~(UnitBytes - 1);
+    if (last > first) {
+        const auto bytes = static_cast<std::size_t>(last - first);
+        const bool guarded = GuestArena::GuestArenaGuard_nid_postfix(reinterpret_cast<void*>(first), bytes);
+        {
+            auto& observation = Observation();
+            std::lock_guard lock(observation.mutex);
+            ++(guarded ? observation.writes : observation.refused);
+            (guarded ? observation.guardedBytes : observation.refusedBytes) += bytes;
+        }
+        static std::atomic<int> refusals{0};
+        if (!guarded && refusals.fetch_add(1) < 4) {
+            MEMORY_BASIC_INFORMATION memory{};
+            VirtualQuery(reinterpret_cast<const void*>(first), &memory, sizeof(memory));
+            std::fprintf(stderr, "[shadow-guard] cannot guard 0x%llx+0x%llx: state 0x%lx type 0x%lx protection 0x%lx\n", static_cast<unsigned long long>(first), static_cast<unsigned long long>(bytes), memory.State, memory.Type, memory.Protect);
+        }
+    }
+    reportObservation();
+#else
+    static_cast<void>(begin);
+    static_cast<void>(end);
+#endif
+}
+
+void OpenShadowGuards(std::uint64_t begin, std::uint64_t end) {
+#ifdef _WIN32
+    if (!BufferShadowObserved() || end <= begin) return;
+    GuestArena::GuestArenaUnguard_nid_postfix(reinterpret_cast<void*>(begin), static_cast<std::size_t>(end - begin));
+#else
+    static_cast<void>(begin);
+    static_cast<void>(end);
+#endif
 }
 
 }

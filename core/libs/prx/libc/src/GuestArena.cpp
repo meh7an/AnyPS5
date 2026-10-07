@@ -243,6 +243,32 @@ void* GuestArenaMapAlias_nid_postfix(std::uintptr_t address, std::size_t bytes) 
 void GuestArenaUnmapAlias_nid_postfix(void* alias) {
     WindowsMappings::Get().UnmapAlias(alias);
 }
+
+void GuestArenaSetGuardHandler_nid_postfix(GuestArenaGuardHandler handler) {
+    WindowsMappings::Get().SetGuardHandler(handler);
+}
+
+bool GuestArenaGuard_nid_postfix(void* pointer, std::size_t bytes) {
+    if (!Arena::Get().Contains(pointer, bytes)) return false;
+    return WindowsMappings::Get().Guard(reinterpret_cast<std::uintptr_t>(pointer), bytes);
+}
+
+void GuestArenaUnguard_nid_postfix(void* pointer, std::size_t bytes) {
+    WindowsMappings::Get().Unguard(reinterpret_cast<std::uintptr_t>(pointer), bytes);
+}
+
+bool GuestArenaGuardRun_nid_postfix(std::uintptr_t address, std::uintptr_t limit, std::uintptr_t* end, std::uint32_t* protection) {
+    return WindowsMappings::Get().GuardRun(address, limit, end, protection);
+}
+
+bool GuestArenaHandleGuard_nid_postfix(std::uintptr_t address, bool write, std::uintptr_t instruction) {
+    if (!Arena::Get().Contains(reinterpret_cast<const void*>(address), 1)) return false;
+    return WindowsMappings::Get().HandleGuard(address, write, instruction);
+}
+
+void GuestArenaReguard_nid_postfix(void* pointer, std::size_t bytes, std::uint32_t protection) {
+    WindowsMappings::Get().Reguard(reinterpret_cast<std::uintptr_t>(pointer), bytes, protection);
+}
 #endif
 
 bool GuestArenaWriteWatched_nid_postfix() {

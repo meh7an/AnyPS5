@@ -4,6 +4,7 @@
 #ifdef _WIN32
 #include <windows.h>
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstddef>
 #include <cstdint>
@@ -57,6 +58,8 @@ public:
                 }
                 DWORD previous;
                 if (!VirtualProtect(reinterpret_cast<void*>(cursor), stop - cursor, protection, &previous)) fail("protect guest memory");
+                // A guarded page takes the new protection as its logical one and stays guarded.
+                reguard(cursor, stop, protection);
                 cursor = stop;
             }
         }
@@ -90,6 +93,8 @@ public:
             shared->aliases.push_back(base);
             views.emplace(base, View{shared, protection, 0, false, owned, offset + done, 0});
             invalidate(*shared);
+            // A new alias of a guarded physical page is guarded with the others.
+            if (shared->guarded && !VirtualProtect(page, pageBytes, PAGE_NOACCESS, &previous)) fail("guard a new view of guarded guest memory");
         }
     }
 
@@ -131,7 +136,8 @@ public:
         std::lock_guard lock(mutex);
         const auto base = address & ~(pageBytes - 1);
         const auto found = views.find(base);
-        if (found == views.end() || !writable(found->second.protection)) return false;
+        // A guarded page's faults are HandleGuard's.
+        if (found == views.end() || !writable(found->second.protection) || found->second.page->guarded) return false;
         auto& view = found->second;
         invalidate(*view.page);
         DWORD previous;
@@ -141,6 +147,9 @@ public:
     }
 
     bool BeginHostWrite(std::uintptr_t address, std::size_t bytes) {
+        // A host write (file I/O into guest memory, say) cannot take a guard's fault: guarded pages
+        // become current and open first.
+        openForHostWrite(address, bytes);
         std::lock_guard lock(mutex);
         const auto first = views.lower_bound(address & ~(pageBytes - 1));
         const auto end = address + bytes;
@@ -206,10 +215,136 @@ public:
 
     bool Protection(std::uintptr_t address, std::uint32_t* protection) {
         std::lock_guard lock(mutex);
+        if (const auto guarded = guards.find(address & ~(pageBytes - 1)); guarded != guards.end()) {
+            *protection = guarded->second;
+            return true;
+        }
         const auto found = views.find(address & ~(pageBytes - 1));
         if (found == views.end()) return false;
         *protection = found->second.protection;
         return true;
+    }
+
+    // Guards (GuestArena.hpp): pages made PAGE_NOACCESS while the guest's bytes there are not
+    // current. A private page keeps its logical protection in `guards`; a shared view's physical
+    // page is guarded on every alias, its views keeping their logical protection and write arming.
+    // False, guarding nothing, when a page of the range is neither committed private memory nor a
+    // view with a readable protection.
+    bool Guard(std::uintptr_t address, std::size_t bytes) {
+        std::lock_guard lock(mutex);
+        if (address % pageBytes != 0 || bytes % pageBytes != 0 || bytes == 0) return false;
+        const auto end = address + bytes;
+        std::vector<std::pair<std::uintptr_t, std::uintptr_t>> runs;
+        std::vector<DWORD> protections;
+        std::vector<SharedPage*> shared;
+        for (auto cursor = address; cursor < end;) {
+            if (const auto view = views.find(cursor); view != views.end()) {
+                if (!readable(view->second.protection)) return false;
+                shared.push_back(view->second.page.get());
+                cursor += pageBytes;
+                continue;
+            }
+            auto next = guards.lower_bound(cursor);
+            if (next != guards.end() && next->first == cursor) {
+                cursor += pageBytes;
+                continue;
+            }
+            const auto memory = query(cursor);
+            if (memory.State != MEM_COMMIT || memory.Type != MEM_PRIVATE || !readable(memory.Protect)) return false;
+            auto stop = std::min(end, reinterpret_cast<std::uintptr_t>(memory.BaseAddress) + memory.RegionSize);
+            if (next != guards.end() && next->first < stop) stop = next->first;
+            runs.emplace_back(cursor, stop);
+            protections.push_back(memory.Protect);
+            cursor = stop;
+        }
+        for (std::size_t i = 0; i < runs.size(); ++i) {
+            const auto [begin, stop] = runs[i];
+            DWORD previous;
+            if (!VirtualProtect(reinterpret_cast<void*>(begin), stop - begin, PAGE_NOACCESS, &previous)) fail("guard guest memory");
+            for (auto page = begin; page < stop; page += pageBytes) guards.emplace(page, protections[i]);
+        }
+        for (auto* page : shared) guardShared(*page);
+        return true;
+    }
+
+    void Unguard(std::uintptr_t address, std::size_t bytes) {
+        std::lock_guard lock(mutex);
+        unguard(address, address + bytes);
+        for (auto it = views.lower_bound(address & ~(pageBytes - 1)); it != views.end() && it->first < address + bytes; ++it) openShared(*it->second.page);
+    }
+
+    // After a protection change made outside the arena over [address, address + bytes) (libkernel's
+    // mprotect): its guards hold again, private ones at `protection` as their logical one.
+    void Reguard(std::uintptr_t address, std::size_t bytes, DWORD protection) {
+        std::lock_guard lock(mutex);
+        reguard(address, address + bytes, protection);
+    }
+
+    // Whether the page holding `address` is guarded, and the end of the run of pages from it that
+    // share its guard state and logical protection (at most `limit`).
+    bool GuardRun(std::uintptr_t address, std::uintptr_t limit, std::uintptr_t* end, std::uint32_t* protection) {
+        std::lock_guard lock(mutex);
+        const auto page = address & ~(pageBytes - 1);
+        if (const auto view = views.find(page); view != views.end()) {
+            *end = std::min(page + pageBytes, limit);
+            *protection = view->second.protection;
+            return view->second.page->guarded;
+        }
+        auto it = guards.lower_bound(page);
+        if (it == guards.end() || it->first != page) {
+            *end = it != guards.end() ? std::min(it->first, limit) : limit;
+            return false;
+        }
+        const auto logical = it->second;
+        auto runEnd = page + pageBytes;
+        for (++it; it != guards.end() && it->first == runEnd && runEnd < limit && it->second == logical; ++it) runEnd += pageBytes;
+        *end = std::min(runEnd, limit);
+        *protection = logical;
+        return true;
+    }
+
+    // A host access fault at `address`: whether it was a guard's. The handler, called outside the
+    // lock, may make the bytes current and open the page; a page it leaves guarded is opened here.
+    // A fault on a page another thread opened meanwhile is a guard's too (the access runs again).
+    bool HandleGuard(std::uintptr_t address, bool write, std::uintptr_t instruction) {
+        const auto page = address & ~(pageBytes - 1);
+        {
+            std::lock_guard lock(mutex);
+            if (!guardedPage(page)) {
+                // An access the page allows now: a guard opened since the fault. A write to an armed
+                // view is HandleWrite's.
+                MEMORY_BASIC_INFORMATION memory{};
+                if (VirtualQuery(reinterpret_cast<void*>(address), &memory, sizeof(memory)) != sizeof(memory) || memory.State != MEM_COMMIT) return false;
+                if (memory.Type != MEM_PRIVATE && !views.contains(page)) return false;
+                return write ? writable(memory.Protect & 0xffu) : readable(memory.Protect);
+            }
+        }
+        if (const auto handler = guardHandler.load(std::memory_order_acquire)) handler(address, write, instruction);
+        std::lock_guard lock(mutex);
+        openPage(page);
+        return true;
+    }
+
+    // Before a host write into [address, address + bytes) (BeginHostWrite): the handler makes each
+    // guarded page's bytes current, and the page opens.
+    void openForHostWrite(std::uintptr_t address, std::size_t bytes) {
+        std::vector<std::uintptr_t> guarded;
+        {
+            std::lock_guard lock(mutex);
+            for (auto page = address & ~(pageBytes - 1); page < address + bytes; page += pageBytes) {
+                if (guardedPage(page)) guarded.push_back(page);
+            }
+        }
+        const auto handler = guardHandler.load(std::memory_order_acquire);
+        for (const auto page : guarded) {
+            if (handler != nullptr) handler(std::max(page, address), true, 0);
+            std::lock_guard lock(mutex);
+            openPage(page);
+        }
+    }
+
+    void SetGuardHandler(void (*handler)(std::uintptr_t, bool, std::uintptr_t)) {
+        guardHandler.store(handler, std::memory_order_release);
     }
 
     bool Collect(std::uintptr_t address, std::size_t bytes, void** pages, std::size_t* count, bool clear) {
@@ -245,10 +380,11 @@ public:
                     for (const auto alias : view.page->aliases) {
                         auto& other = views.at(alias);
                         if (!writable(other.protection) || other.armed || other.hostWrites != 0) continue;
-                        DWORD previous;
-                        const DWORD protection = other.protection == PAGE_EXECUTE_READWRITE ? PAGE_EXECUTE_READ : PAGE_READONLY;
-                        if (!VirtualProtect(reinterpret_cast<void*>(alias), pageBytes, protection, &previous)) fail("arm shared memory write tracking");
                         other.armed = true;
+                        // A guarded page stays inaccessible; it opens armed.
+                        if (other.page->guarded) continue;
+                        DWORD previous;
+                        if (!VirtualProtect(reinterpret_cast<void*>(alias), pageBytes, actualProtection(other), &previous)) fail("arm shared memory write tracking");
                     }
                     view.seen = view.page->generation;
                     rememberClean(base, base + pageBytes);
@@ -275,6 +411,8 @@ private:
     struct SharedPage {
         std::uint64_t generation = 1;
         std::vector<std::uintptr_t> aliases;
+        // Guarded (Guard): every alias is PAGE_NOACCESS, whatever its arming.
+        bool guarded = false;
         std::uint32_t pins = 0;
     };
     struct Section {
@@ -319,6 +457,95 @@ private:
     void invalidate(SharedPage& page) {
         ++page.generation;
         for (const auto alias : page.aliases) forgetClean(alias, alias + pageBytes);
+    }
+
+    // A view's protection as set on its page: none while its physical page is guarded, read-only
+    // while write tracking is armed, its logical protection otherwise.
+    static DWORD actualProtection(const View& view) {
+        if (view.page->guarded) return PAGE_NOACCESS;
+        if (view.armed) return view.protection == PAGE_EXECUTE_READWRITE ? PAGE_EXECUTE_READ : PAGE_READONLY;
+        return view.protection;
+    }
+
+    // A shared page guarded or opened on every alias.
+    void guardShared(SharedPage& page) {
+        if (page.guarded) return;
+        page.guarded = true;
+        for (const auto alias : page.aliases) {
+            DWORD previous;
+            if (!VirtualProtect(reinterpret_cast<void*>(alias), pageBytes, PAGE_NOACCESS, &previous)) fail("guard shared guest memory");
+        }
+    }
+
+    void openShared(SharedPage& page) {
+        if (!page.guarded) return;
+        page.guarded = false;
+        for (const auto alias : page.aliases) {
+            DWORD previous;
+            if (!VirtualProtect(reinterpret_cast<void*>(alias), pageBytes, actualProtection(views.at(alias)), &previous)) fail("open shared guest memory");
+        }
+    }
+
+    bool guardedPage(std::uintptr_t page) const {
+        if (const auto view = views.find(page); view != views.end()) return view->second.page->guarded;
+        return guards.contains(page);
+    }
+
+    // Opens the page at `page`, private or shared.
+    void openPage(std::uintptr_t page) {
+        if (const auto view = views.find(page); view != views.end()) openShared(*view->second.page);
+        else unguard(page, page + pageBytes);
+    }
+
+    // Opens the guarded private pages of [begin, end) at their logical protection, a run of equal
+    // ones per call.
+    void unguard(std::uintptr_t begin, std::uintptr_t end) {
+        auto it = guards.lower_bound(begin & ~(pageBytes - 1));
+        while (it != guards.end() && it->first < end) {
+            const auto runBegin = it->first;
+            const auto protection = it->second;
+            auto runEnd = runBegin + pageBytes;
+            it = guards.erase(it);
+            while (it != guards.end() && it->first == runEnd && runEnd < end && it->second == protection) {
+                runEnd += pageBytes;
+                it = guards.erase(it);
+            }
+            DWORD previous;
+            if (!VirtualProtect(reinterpret_cast<void*>(runBegin), runEnd - runBegin, protection, &previous)) fail("open guarded guest memory");
+        }
+    }
+
+    // After a protection change over [begin, end): its guarded private pages take `protection` as
+    // their logical one, and they and its views of guarded shared pages are guarded again (a view
+    // keeps the logical protection the change gave it).
+    void reguard(std::uintptr_t begin, std::uintptr_t end, DWORD protection) {
+        for (auto it = guards.lower_bound(begin); it != guards.end() && it->first < end;) {
+            const auto runBegin = it->first;
+            auto runEnd = runBegin;
+            for (; it != guards.end() && it->first == runEnd && runEnd < end; ++it, runEnd += pageBytes) it->second = protection;
+            DWORD previous;
+            if (!VirtualProtect(reinterpret_cast<void*>(runBegin), runEnd - runBegin, PAGE_NOACCESS, &previous)) fail("guard guest memory again");
+        }
+        for (auto it = views.lower_bound(begin & ~(pageBytes - 1)); it != views.end() && it->first < end; ++it) {
+            if (!it->second.page->guarded) continue;
+            DWORD previous;
+            if (!VirtualProtect(reinterpret_cast<void*>(it->first), pageBytes, PAGE_NOACCESS, &previous)) fail("guard shared guest memory again");
+        }
+    }
+
+    static bool readable(DWORD protection) {
+        if ((protection & PAGE_GUARD) != 0) return false;
+        switch (protection & 0xffu) {
+            case PAGE_READONLY:
+            case PAGE_READWRITE:
+            case PAGE_WRITECOPY:
+            case PAGE_EXECUTE_READ:
+            case PAGE_EXECUTE_READWRITE:
+            case PAGE_EXECUTE_WRITECOPY:
+                return true;
+            default:
+                return false;
+        }
     }
 
     bool sameSection(HANDLE first, HANDLE second) const {
@@ -369,6 +596,8 @@ private:
     void reset(std::uintptr_t address, std::size_t bytes) {
         const auto end = address + bytes;
         forgetClean(address, end);
+        // Released memory takes its guards with it.
+        guards.erase(guards.lower_bound(address), guards.lower_bound(end));
         for (auto cursor = address; cursor < end;) {
             const auto memory = query(cursor);
             if (memory.State == MEM_RESERVE) {
@@ -407,6 +636,9 @@ private:
 
     std::map<std::uintptr_t, std::uintptr_t> cleanRanges;
     std::map<std::uintptr_t, View> views;
+    // Guarded private pages and their logical protection (Guard), and the fault handler.
+    std::map<std::uintptr_t, DWORD> guards;
+    std::atomic<void (*)(std::uintptr_t, bool, std::uintptr_t)> guardHandler{nullptr};
     std::map<std::pair<std::uintptr_t, std::uint64_t>, std::weak_ptr<SharedPage>> physical;
     std::mutex mutex;
     AllocateFunction allocate = nullptr;
