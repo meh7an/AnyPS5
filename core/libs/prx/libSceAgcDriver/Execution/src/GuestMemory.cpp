@@ -1731,6 +1731,11 @@ GpuMutexType& GpuMutex() {
     return mutex;
 }
 
+QueueMutexType& QueueMutex() {
+    static QueueMutexType mutex;
+    return mutex;
+}
+
 void TagGpuLockThread(std::uint32_t queue) {
     LockStats().tag = queue;
 }

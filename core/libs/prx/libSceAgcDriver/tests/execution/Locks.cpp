@@ -1,5 +1,6 @@
-// The driver's locks: Mutex, the device use gate and the recursive GPU mutex, under contention; and
-// the thread slots that stand in for thread_local on the hot paths.
+// The driver's locks: Mutex, the device use gate and the recursive GPU mutex, under contention, and
+// the queue mutex's hand-over from the GPU mutex; and the thread slots that stand in for
+// thread_local on the hot paths.
 #include "prx/libSceAgcDriver/Execution/include/Driver/DeviceAccess.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
@@ -157,6 +158,36 @@ void GpuMutexRecursion() {
     Check(counter == 80000, "every nested increment under the GPU mutex counted");
 }
 
+// The presenter's hand-over (Driver::Present): the queue is taken under the GPU mutex and held past
+// its release, so another thread takes the GPU mutex at once and waits only in its queue call; the
+// holder taking the queue again (the GPU mutex's unlock hook may) nests instead of deadlocking.
+void QueueMutexHandOver() {
+    auto& gpu = AgcDriver::GuestMemory::GpuMutex();
+    auto& queue = AgcDriver::GuestMemory::QueueMutex();
+    gpu.lock();
+    queue.lock();
+    gpu.unlock();
+    {
+        std::lock_guard nested(queue);
+    }
+    std::atomic<bool> drew{false};
+    std::atomic<bool> submitted{false};
+    std::thread worker([&] {
+        std::lock_guard lock(gpu);
+        drew = true;
+        std::lock_guard submit(queue);
+        submitted = true;
+    });
+    const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!drew && std::chrono::steady_clock::now() < until) std::this_thread::yield();
+    Check(drew, "another thread takes the GPU mutex while the queue stays held");
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    Check(!submitted, "its queue call waits for the held queue, past the holder's nested release");
+    queue.unlock();
+    worker.join();
+    Check(submitted, "the queue call goes ahead once the queue is released");
+}
+
 template<typename TTag>
 void SlotIsolation(const char* what) {
     using Slot = HostThreadSlot<std::uint64_t, TTag>;
@@ -220,6 +251,7 @@ int main() {
     MutexWakesSleeper();
     DeviceGate();
     GpuMutexRecursion();
+    QueueMutexHandOver();
     ThreadSlots();
     if (failures != 0) {
         std::fprintf(stderr, "%d lock check(s) failed\n", failures);

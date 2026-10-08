@@ -147,6 +147,38 @@ private:
     std::uint32_t depth = 0;
 };
 GpuMutexType& GpuMutex();
+// Host access to the device's queue: vkQueueSubmit, vkQueueWaitIdle, vkDeviceWaitIdle and
+// vkQueuePresentKHR must not overlap (Vulkan's external synchronization), so each call holds this
+// mutex around just that call. A thread holding GpuMutex may take it, never the other way around:
+// the presenter takes it before it gives up GpuMutex and queues its presentation holding only this
+// one, so the presentation stays right behind its blit while draws go on. Recursive: that release
+// runs the unlock hook (SetGpuUnlockHook) on the presenter, and an object it destroys there may
+// reach the queue.
+class QueueMutexType {
+public:
+    void lock() noexcept {
+        if (owner.load(std::memory_order_relaxed) == CurrentThreadToken()) {
+            ++depth;
+            return;
+        }
+        mutex.lock();
+        owner.store(CurrentThreadToken(), std::memory_order_relaxed);
+        depth = 1;
+    }
+
+    void unlock() noexcept {
+        if (--depth != 0) return;
+        owner.store(nullptr, std::memory_order_relaxed);
+        mutex.unlock();
+    }
+
+private:
+    Mutex mutex;
+    // The holder's thread token and recursion depth, written by the holder only.
+    std::atomic<const void*> owner{nullptr};
+    std::uint32_t depth = 0;
+};
+QueueMutexType& QueueMutex();
 // Called on the thread that just gave up its outermost hold, right after the mutex was released:
 // work the hold deferred to run without it (the recorder's release of the objects completed batches
 // kept). One hook, set once; it must not take GpuMutex itself.

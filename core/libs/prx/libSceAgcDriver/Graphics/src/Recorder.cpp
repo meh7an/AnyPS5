@@ -156,7 +156,8 @@ std::string ThreadSyncReport() {
 }
 // Unlocked timeline waits (WaitSerial): count and time, for the [recorder] line.
 std::atomic<std::uint64_t> unlockedWaits{0}, unlockedWaitedUs{0};
-// vkQueueSubmit calls and their time (APS5_PROFILE_DRAW; Submit runs under the GpuMutex).
+// vkQueueSubmit calls and their time, the wait for the queue included (APS5_PROFILE_DRAW; Submit
+// runs under the GpuMutex).
 std::uint64_t submitCount = 0;
 double submitUs = 0, submitMaxUs = 0;
 // Threads inside a timeline wait with the GpuMutex released (WaitSerial, syncThroughUnlocked): a
@@ -2888,7 +2889,11 @@ void Recorder::Submit() {
         submission.pSignalSemaphores = &timeline;
     }
     const auto submitStart = DrawProfiled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-    Check(function(queueSubmit, "vkQueueSubmit")(context.queue, 1, &submission, batch->fence), "vkQueueSubmit recorder");
+    {
+        // The presenter may be queueing a presentation without the GpuMutex (GuestMemory::QueueMutex).
+        std::lock_guard queue(GuestMemory::QueueMutex());
+        Check(function(queueSubmit, "vkQueueSubmit")(context.queue, 1, &submission, batch->fence), "vkQueueSubmit recorder");
+    }
     batch->submitted = true;
     batch->serial = ++submissions;
     batch->submittedAt = std::chrono::steady_clock::now();
@@ -3341,7 +3346,11 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
             result = waitFences(context.device, 1, &batch->fence, VK_TRUE, 5'000'000'000ull);
         }
         if (result != VK_SUCCESS && result != VK_ERROR_DEVICE_LOST) {
-            const auto idle = context.Function<PFN_vkDeviceWaitIdle>("vkDeviceWaitIdle")(context.device);
+            VkResult idle;
+            {
+                std::lock_guard queue(GuestMemory::QueueMutex());
+                idle = context.Function<PFN_vkDeviceWaitIdle>("vkDeviceWaitIdle")(context.device);
+            }
             Check(idle, "vkDeviceWaitIdle after recorder fence failure");
         }
         if (result != VK_SUCCESS) {

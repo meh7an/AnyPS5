@@ -1191,7 +1191,11 @@ void runImportProbe(const Context& context, std::uint64_t base, std::uint64_t by
         VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
         submit.commandBufferCount = 1;
         submit.pCommandBuffers = &commands;
-        if ((probe.result = context.Function<PFN_vkQueueSubmit>("vkQueueSubmit")(context.queue, 1, &submit, fence)) != VK_SUCCESS) return "vkQueueSubmit";
+        {
+            std::lock_guard queue(GuestMemory::QueueMutex());
+            probe.result = context.Function<PFN_vkQueueSubmit>("vkQueueSubmit")(context.queue, 1, &submit, fence);
+        }
+        if (probe.result != VK_SUCCESS) return "vkQueueSubmit";
         submitted = true;
         if ((probe.result = context.Function<PFN_vkWaitForFences>("vkWaitForFences")(context.device, 1, &fence, VK_TRUE, 10'000'000'000ull)) != VK_SUCCESS) return "vkWaitForFences";
         submitted = false;
@@ -1201,7 +1205,10 @@ void runImportProbe(const Context& context, std::uint64_t base, std::uint64_t by
         return nullptr;
     };
     probe.failure = run();
-    if (submitted) context.Function<PFN_vkQueueWaitIdle>("vkQueueWaitIdle")(context.queue);
+    if (submitted) {
+        std::lock_guard queue(GuestMemory::QueueMutex());
+        context.Function<PFN_vkQueueWaitIdle>("vkQueueWaitIdle")(context.queue);
+    }
     if (fence != VK_NULL_HANDLE) context.Function<PFN_vkDestroyFence>("vkDestroyFence")(context.device, fence, nullptr);
     if (commands != VK_NULL_HANDLE) context.Function<PFN_vkFreeCommandBuffers>("vkFreeCommandBuffers")(context.device, context.pool, 1, &commands);
     if (destination != VK_NULL_HANDLE) context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer")(context.device, destination, nullptr);

@@ -163,17 +163,19 @@ public:
     bool PrimitiveListRestart() const;
     bool SamplerFilterMinmax() const;
     // A presentation is a few steps so the presenter holds GuestMemory::GpuMutex only while it
-    // touches the queue. Presentations are slots (FlipInFlight() + 1, each with its own command
-    // buffer, fence, kept resident image and dump buffer): RetirePresents(keep) (no mutex) retires
-    // the slots whose fence signaled, oldest first, and waits for the oldest ones until at most
-    // `keep` are in flight (the only CPU wait of the flip path; it returns the time spent waiting);
-    // AcquireImage takes the next swapchain image (no mutex needed: the swapchain and its fences
-    // are the presenter's own, and in FIFO mode this is where a frame waits for the vblank);
+    // submits the frame and its blit. Presentations are slots (FlipInFlight() + 1, each with its own
+    // command buffer, fence, kept resident image and dump buffer): RetirePresents(keep) (no mutex)
+    // retires the slots whose fence signaled, oldest first, and waits for the oldest ones until at
+    // most `keep` are in flight (the only CPU wait of the flip path; it returns the time spent
+    // waiting); AcquireImage takes the next swapchain image (no mutex needed: the swapchain and its
+    // fences are the presenter's own, and in FIFO mode this is where a frame waits for the vblank);
     // PresentClear/PresentDisplayBuffer record and submit the frame into the next slot (under the
     // mutex; the blit follows the frame's batches in queue order, so the displayed image is always
     // complete) and return whether one was submitted; QueuePresent hands the image to the swapchain
-    // (under the mutex). FinishPresent = RetirePresents(0): the render fence wait of the
-    // synchronous paths (APS5_FLIP_INFLIGHT=0, APS5_SYNC_FLIP, PresentPixels). AcquireImage returns
+    // with only GuestMemory::QueueMutex held by the caller (taken before the mutex was given up, so
+    // nothing comes between the blit and its presentation in queue order). FinishPresent =
+    // RetirePresents(0): the render fence wait of the synchronous paths (APS5_FLIP_INFLIGHT=0,
+    // APS5_SYNC_FLIP, PresentPixels). AcquireImage returns
     // false when the swapchain is out of date (the frame is dropped; the next Resize recreates it);
     // a present without a prior AcquireImage acquires itself, one whose slot is in flight waits for
     // it. PresentPixels does all steps itself. Retiring a slot releases its kept image and writes

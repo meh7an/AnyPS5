@@ -139,33 +139,46 @@ void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buff
             if (pacing) Pacing().Mark(PresentPacing::Acquire);
         }
         if (presentable) {
-            GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Present);
-            std::lock_guard lock(GuestMemory::GpuMutex());
-            timing.Mark("gpu_mutex_wait");
-            if (buffer != nullptr) {
-                if (syncFlip) {
-                    presenting->WaitIdle();
-                    timing.Mark("device_idle_wait");
-                }
-                submitted = presenting->PresentDisplayBuffer(*buffer);
-                timing.Mark("present_display_buffer");
-            } else {
-                submitted = presenting->PresentClear(window.width, window.height, opaque);
-                timing.Mark("present_clear");
-            }
-            if (pacing) Pacing().Mark(PresentPacing::Blit);
-            if (submitted && syncFlip) {
-                waitedMs = presenting->FinishPresent();
-                timing.Mark("render_fence_wait");
-            }
-            if (submitted && (syncFlip || inFlight != 0)) {
-
+            // The presentation is queued without the GPU mutex, so the queue workers' draws go on
+            // meanwhile (a submit of theirs waits for it). The queue is taken before the GPU mutex
+            // goes: nothing comes between the blit and its presentation in queue order.
+            // APS5_NO_UNLOCKED_PRESENT=1 queues it under the GPU mutex as well, as before.
+            static const bool lockedPresent = std::getenv("APS5_NO_UNLOCKED_PRESENT") != nullptr;
+            std::unique_lock queue(GuestMemory::QueueMutex(), std::defer_lock);
+            const auto queuePresent = [&] {
                 presenting->QueuePresent();
+                queue.unlock();
                 timing.Mark("queue_present");
                 if (pacing) Pacing().Mark(PresentPacing::Queue);
                 trailing = !syncFlip;
                 submitted = false;
+            };
+            {
+                GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Present);
+                std::lock_guard lock(GuestMemory::GpuMutex());
+                timing.Mark("gpu_mutex_wait");
+                if (buffer != nullptr) {
+                    if (syncFlip) {
+                        presenting->WaitIdle();
+                        timing.Mark("device_idle_wait");
+                    }
+                    submitted = presenting->PresentDisplayBuffer(*buffer);
+                    timing.Mark("present_display_buffer");
+                } else {
+                    submitted = presenting->PresentClear(window.width, window.height, opaque);
+                    timing.Mark("present_clear");
+                }
+                if (pacing) Pacing().Mark(PresentPacing::Blit);
+                if (submitted && syncFlip) {
+                    waitedMs = presenting->FinishPresent();
+                    timing.Mark("render_fence_wait");
+                }
+                if (submitted && (syncFlip || inFlight != 0)) {
+                    queue.lock();
+                    if (lockedPresent) queuePresent();
+                }
             }
+            if (queue.owns_lock()) queuePresent();
         }
         if (trailing) {
             waitedMs += presenting->FinishPresent();
@@ -176,8 +189,7 @@ void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buff
             waitedMs = presenting->FinishPresent();
             timing.Mark("render_fence_wait");
 
-            GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Present);
-            std::lock_guard lock(GuestMemory::GpuMutex());
+            std::lock_guard queue(GuestMemory::QueueMutex());
             presenting->QueuePresent();
             timing.Mark("queue_present");
         }
