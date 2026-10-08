@@ -164,7 +164,9 @@ def main():
                                          capture_output=True, text=True, timeout=30)
                     assert run.returncode == (42 if windows else 0), (name, run.returncode, run.stdout, run.stderr)
                     actual = events.read_text()
-                    assert actual == ('HHhh' if replacement and replacement != 'libc.prx' else 'Hh' if suppressed else 'HIAaih'), (name, actual)
+                    hosts = 2 if replacement and replacement != 'libc.prx' else 1
+                    guest_lifecycle = '' if suppressed and not windows else 'IAai'
+                    assert actual == 'H' * hosts + guest_lifecycle + 'h' * hosts, (name, actual)
             case = work / f'{windows}-missing-import'
             modules = case / 'sce_module'
             modules.mkdir(parents=True)

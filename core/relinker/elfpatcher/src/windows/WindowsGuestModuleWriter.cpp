@@ -170,12 +170,13 @@ std::vector<std::uint8_t> GuestModuleWriter::WriteWindows(const Relinker::GuestI
     }
     const auto entry = nextRva;
     sections.push_back({".dllmain", entry, SectionRead | SectionExecute | 0x20u, {0xb8, 1, 0, 0, 0, 0xc3}});
-    if (guest.ReplacementModule.empty()) {
-        for (const auto slot : guest.InitArray) runtime.InitArrayRvas.push_back(image.GetRva(slot, 8));
-        for (const auto slot : guest.FiniArray) runtime.FiniArrayRvas.push_back(image.GetRva(slot, 8));
-        runtime.InitRva = guest.Init == 0 ? 0 : image.GetRva(guest.Init);
-        runtime.FiniRva = guest.Fini == 0 ? 0 : image.GetRva(guest.Fini);
-    }
+    // A bundled module a host library replaces keeps its lifecycle on Windows: the title's imports from it
+    // still bind to its own code (Sonic Origins Plus's libc.prx, whose operator new throws std::bad_alloc
+    // at startup on a heap its initializers never set up).
+    for (const auto slot : guest.InitArray) runtime.InitArrayRvas.push_back(image.GetRva(slot, 8));
+    for (const auto slot : guest.FiniArray) runtime.FiniArrayRvas.push_back(image.GetRva(slot, 8));
+    runtime.InitRva = guest.Init == 0 ? 0 : image.GetRva(guest.Init);
+    runtime.FiniRva = guest.Fini == 0 ? 0 : image.GetRva(guest.Fini);
     auto result = WindowsPeWriter().Write(sections, entry, directories);
     const auto characteristics = Io::ReadU16(result, 0x80 + 22);
     Io::WriteU16(result, 0x80 + 22, static_cast<std::uint16_t>((characteristics | 0x2000) & ~1u));
