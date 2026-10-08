@@ -1568,6 +1568,22 @@ void descriptorCacheTests() {
     Require(mock.live == 0, "the descriptor cache leaked a pool or layout");
 }
 
+// A storage image's unit generations: one assignment moves every unit, a store to one unit fills
+// the list first, and the whole list and the oldest unit see both.
+void unitGenerationTests() {
+    AgcDriver::Graphics::UnitGenerations units;
+    units.assign(4, 0);
+    Require(units.size() == 4 && units[0] == 0 && units[3] == 0 && units.oldest() == 0, "fresh units are not untracked");
+    units.assign(4, 7);
+    Require(units[1] == 7 && units.oldest() == 7, "a uniform assignment did not move every unit");
+    units.at(2) = 9;
+    Require(units[0] == 7 && units[2] == 9 && units[3] == 7 && units.oldest() == 7, "a store to one unit changed the others");
+    const auto all = units.all();
+    Require(all.size() == 4 && all[0] == 7 && all[1] == 7 && all[2] == 9 && all[3] == 7, "the whole list misses the uniform value or the store");
+    units.assign(4, 11);
+    Require(units[2] == 11 && units.oldest() == 11 && units.all()[2] == 11, "a uniform assignment after a store kept the stored unit");
+}
+
 void misalignedShaderDataTests() {
     mock = MockVulkan{};
     auto context = mockContext();
@@ -2535,6 +2551,7 @@ int main() {
         pushConstantTests();
         resourceTests();
         descriptorCacheTests();
+        unitGenerationTests();
         misalignedShaderDataTests();
         debugBranchTests();
         meshArgumentTests();

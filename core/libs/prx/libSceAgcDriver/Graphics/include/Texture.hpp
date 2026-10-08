@@ -7,6 +7,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/TextureDetiler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -108,6 +109,44 @@ private:
 };
 
 VkFormat AttachmentProxyFormat(const Context& context, VkFormat format);
+
+// The write generation each unit of a storage image is known current at (StorageTexture's
+// layerGeneration), with a uniform form: a refresh that finds the surface unchanged moves every unit
+// to one generation with a single store (its memo hit runs about once per draw, and a 4K target has
+// about a thousand units). Reads answer from the uniform value; a store to one unit, and a consumer
+// of the whole list, fill the list first (under the GPU mutex, as every store here).
+class UnitGenerations {
+public:
+    // `count` units, every one at `value`.
+    void assign(std::size_t count, std::uint64_t value) {
+        units.resize(count);
+        uniformValue = value;
+        uniform = true;
+    }
+    std::size_t size() const { return units.size(); }
+    std::uint64_t operator[](std::size_t unit) const { return uniform ? uniformValue : units[unit]; }
+    // The unit to store to.
+    std::uint64_t& at(std::size_t unit) {
+        fill();
+        return units[unit];
+    }
+    // Every unit, as one list (ChangedBlocks).
+    std::span<const std::uint64_t> all() {
+        fill();
+        return units;
+    }
+    std::uint64_t oldest() const { return uniform ? uniformValue : *std::min_element(units.begin(), units.end()); }
+
+private:
+    void fill() {
+        if (!uniform) return;
+        std::fill(units.begin(), units.end(), uniformValue);
+        uniform = false;
+    }
+    std::vector<std::uint64_t> units;
+    std::uint64_t uniformValue = 0;
+    bool uniform = false;
+};
 
 // A guest texture a shader writes through a storage image. It is uploaded like a sampled texture;
 // after the GPU work completes its results are stored to guest memory (retiled, changed bytes only),
@@ -447,7 +486,7 @@ private:
     std::uint64_t refreshSerial = 0;
     std::uint32_t trackedLayers = 1;
     std::uint64_t trackedLayerBytes = 0;
-    std::vector<std::uint64_t> layerGeneration;
+    UnitGenerations layerGeneration;
     std::vector<bool> layerPending;
     bool blockUnits = false;
     // Write-back hysteresis (block units, see writeBack): partial stores in the current window of
