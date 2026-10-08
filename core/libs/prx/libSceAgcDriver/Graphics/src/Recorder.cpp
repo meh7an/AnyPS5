@@ -2341,8 +2341,10 @@ std::pair<std::size_t, std::size_t> Recorder::DrawSnapshotPoolUse(SnapshotUse us
 }
 
 Recorder::UploadSlice Recorder::DrawUpload(std::size_t bytes) {
+    // A power of two (Vulkan requires it of the limit): a mask rounds up, where a division was a
+    // visible share of the per-draw work.
     const VkDeviceSize alignment = std::max<VkDeviceSize>(context.limits.minStorageBufferOffsetAlignment, 16);
-    auto offset = (drawUploadUsed + alignment - 1) / alignment * alignment;
+    auto offset = (drawUploadUsed + alignment - 1) & ~(alignment - 1);
     if (drawUpload == nullptr || offset + bytes > drawUpload->Bytes().size()) {
         drawUpload = std::make_shared<Buffer>(context, std::max(DrawUploadChunk, bytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
         offset = 0;
