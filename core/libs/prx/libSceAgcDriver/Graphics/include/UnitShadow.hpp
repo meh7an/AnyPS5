@@ -69,6 +69,10 @@ struct ShadowSlab {
     // A buffer slab whose import pages are guarded (BufferShadowGuarded): set when a write's units
     // are marked, cleared when a host touch made them current and opened them. Under the GpuMutex.
     mutable std::atomic<bool> guarded{false};
+    // Its host touches: the present of the last one, and how many in a row came close enough to
+    // the one before to count towards dropping the slab. Under the GpuMutex.
+    std::uint64_t lastTouch = 0;
+    std::uint32_t touchStreak = 0;
 };
 
 // Holds one pin of a slab (ShadowDestination::pin).
@@ -163,7 +167,10 @@ bool ShadowVerify();
 // it publishes retiled units (image retiles never land in a buffer slab's units). The title's own
 // CPU code reads guest memory without the flush hook, so on Windows a written slab's import pages
 // are guarded (GuestArenaGuard): a host touch publishes the slab whole, waits for it and opens it,
-// and a slab that cannot be guarded has its written units published at once. Off by default.
+// and a slab that cannot be guarded has its written units published at once. A slab touched again
+// and again (APS5_BUFFER_SHADOW_DROP times in a row, default 8, each within 30 presents of the last;
+// 0 never drops) costs more than it saves: it is dropped, and its range is served in place from
+// then on. Off by default.
 bool BufferShadowEnabled();
 // Whether buffer shadows guard their import pages (Windows, buffer shadows on).
 bool BufferShadowGuarded();

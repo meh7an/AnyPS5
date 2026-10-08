@@ -72,8 +72,9 @@ struct Statistics {
     // Buffer shadows: made (and their bytes), refused, uses bound, seeds recorded, writes marked.
     std::atomic<std::uint64_t> buffersMade{0}, buffersMadeBytes{0}, buffersRefused{0}, bufferUses{0}, bufferSeeds{0}, bufferSeedBytes{0}, bufferWrites{0};
     // Their guards: armed (and their bytes), refused (the units published at once), host touches of
-    // a live slab's, of a guard its slab left behind, and imports refused over a guard.
-    std::atomic<std::uint64_t> guardsArmed{0}, guardsArmedBytes{0}, guardsRefused{0}, guardTouches{0}, staleTouches{0}, importsGuarded{0};
+    // a live slab's, of a guard its slab left behind, imports refused over a guard, and slabs host
+    // touches dropped.
+    std::atomic<std::uint64_t> guardsArmed{0}, guardsArmedBytes{0}, guardsRefused{0}, guardTouches{0}, staleTouches{0}, importsGuarded{0}, buffersDropped{0};
 };
 
 Statistics& Stats() {
@@ -100,6 +101,9 @@ struct UnitShadow {
     // Buffer shadows (BufferShadowFor): slabs spanning a bound range's units whole, disjoint, a few
     // per import. A unit inside one lives there, whatever fixed slab lies over it.
     std::vector<std::shared_ptr<ShadowSlab>> bufferSlabs;
+    // Per unit: whether host touches dropped its buffer slab (dropBufferSlab): no buffer shadow
+    // serves it again while the import lives.
+    std::vector<std::uint8_t> dropped;
     std::uint32_t liveUnits = 0;
 
     const std::shared_ptr<ShadowSlab>* BufferSlabOf(std::uint64_t unit) const {
@@ -120,6 +124,12 @@ struct UnitShadow {
     // The unit's bytes inside the import.
     std::pair<std::uint64_t, std::uint64_t> UnitRange(std::uint64_t unit) const { return {std::max(UnitBegin(unit), importBase), std::min(UnitBegin(unit + 1), ImportEnd())}; }
     bool Live(std::uint64_t unit) const { return generation[unit] != 0 && published[unit] == 0; }
+    bool AnyDropped(std::uint64_t first, std::uint64_t last) const {
+        for (auto unit = first; unit <= last; ++unit) {
+            if (dropped[unit] != 0) return true;
+        }
+        return false;
+    }
     void Recount() {
         std::uint32_t live = 0;
         for (std::uint64_t unit = 0; unit < Units(); ++unit) live += Live(unit) ? 1u : 0u;
@@ -241,6 +251,7 @@ std::shared_ptr<UnitShadow> findOrCreate(Shadows& registry, const Context& conte
     const auto units = (import.base + import.bytes - shadow->base + UnitBytes - 1) / UnitBytes;
     shadow->generation.assign(static_cast<std::size_t>(units), 0);
     shadow->published.assign(static_cast<std::size_t>(units), 0);
+    shadow->dropped.assign(static_cast<std::size_t>(units), 0);
     const auto slabs = (units + SlabUnits() - 1) / SlabUnits();
     shadow->slabs.assign(static_cast<std::size_t>(slabs), nullptr);
     shadow->slabFailedUntil.assign(static_cast<std::size_t>(slabs), 0);
@@ -981,12 +992,63 @@ bool BufferShadowGuarded() {
 #ifdef _WIN32
 namespace {
 
+// Host touches in a row that drop a buffer slab (APS5_BUFFER_SHADOW_DROP, default 8; 0 never drops),
+// and how many presents after the last one a touch still counts towards them.
+std::uint32_t DropTouches() {
+    static const std::uint32_t touches = [] {
+        const char* text = std::getenv("APS5_BUFFER_SHADOW_DROP");
+        return text != nullptr ? static_cast<std::uint32_t>(std::strtoul(text, nullptr, 10)) : 8u;
+    }();
+    return touches;
+}
+constexpr std::uint64_t DropWindowPresents = 30;
+
+// A host touch of a guarded buffer slab: whether it completes a run of touches that drops the slab.
+// A slab read every frame or so (by the title, or by the driver itself) pays a publish and a GPU
+// wait each time, more than the shadow saves. Under the GpuMutex.
+bool keepsBeingTouched(ShadowSlab& slab) {
+    const auto present = Recorder::Presents();
+    slab.touchStreak = slab.touchStreak != 0 && present - slab.lastTouch <= DropWindowPresents ? slab.touchStreak + 1 : 1;
+    slab.lastTouch = present;
+    return DropTouches() != 0 && slab.touchStreak >= DropTouches();
+}
+
+// Drops a buffer slab host touches made a loss, once published and open: its units read from the
+// import, and no buffer shadow serves them again while the import lives, so their writers bind the
+// import in place (a build bound to the slab finds it gone when it binds it again, and rebuilds). A
+// slab a writer still pins (its work recorded, its units not marked yet) waits for the next touch.
+// Under the GpuMutex.
+void dropBufferSlab(const std::shared_ptr<UnitShadow>& shadow, const std::shared_ptr<ShadowSlab>& slab) {
+    if (slab->pins.load(std::memory_order_relaxed) != 0) return;
+    auto& registry = Registry();
+    std::uint64_t begin = 0, end = 0;
+    {
+        std::lock_guard lock(registry.mutex);
+        const auto found = std::find(shadow->bufferSlabs.begin(), shadow->bufferSlabs.end(), slab);
+        if (found == shadow->bufferSlabs.end()) return;
+        std::tie(begin, end) = slabRange(*shadow, *slab);
+        for (auto unit = slab->firstUnit; unit < slab->firstUnit + slab->units && unit < shadow->Units(); ++unit) {
+            shadow->generation[unit] = 0;
+            shadow->published[unit] = 0;
+            shadow->dropped[unit] = 1;
+        }
+        shadow->Recount();
+        registry.liveBytes -= SlabBytes(*slab);
+        --registry.liveSlabs;
+        shadow->bufferSlabs.erase(found);
+    }
+    Stats().buffersDropped.fetch_add(1, std::memory_order_relaxed);
+    std::fprintf(stderr, "[shadow] buffer slab 0x%llx+0x%llx dropped after %u host touches in a row: the range is served in place from now on\n", static_cast<unsigned long long>(begin), static_cast<unsigned long long>(end - begin), slab->touchStreak);
+    StorageTexture::BumpPendingSerial();
+}
+
 // The guard handler of buffer shadows (armBufferGuard), on the thread whose host access touched a
 // guarded page, under the GpuMutex so that no write is recorded (and guarded) meanwhile.
 //  - A live slab's page: the slab's import range is made current (the flush hook waits for the
 //    recorded writes and publishes; every unit it left, such as a store's whole ones, is published
-//    and waited for here) and opens whole. A unit that could not be published (a store inside a
-//    completion, whose own stamp makes it stale) keeps the slab guarded: the page opens alone.
+//    and waited for here) and opens whole; a slab touched again and again is then dropped. A unit
+//    that could not be published (a store inside a completion, whose own stamp makes it stale)
+//    keeps the slab guarded: the page opens alone.
 //  - A page of a range a guarded slab left behind (staleGuards): the hook waits for the publish
 //    that took the units out, and the range opens.
 //  - Any other guarded page is made current alone, and the arena opens it.
@@ -994,6 +1056,7 @@ void shadowTouch(std::uintptr_t address, bool write, std::uintptr_t instruction)
     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Hook);
     std::lock_guard gpu(GuestMemory::GpuMutex());
     auto& registry = Registry();
+    std::shared_ptr<UnitShadow> owner;
     std::shared_ptr<ShadowSlab> slab;
     std::uint64_t begin = 0, end = 0;
     bool stale = false;
@@ -1002,6 +1065,7 @@ void shadowTouch(std::uintptr_t address, bool write, std::uintptr_t instruction)
         anyOverlapping(registry, address, address + 1, [&](const std::shared_ptr<UnitShadow>& shadow) {
             const auto* held = shadow->BufferSlabOf(shadow->UnitOf(address));
             if (held == nullptr || !(*held)->guarded.load(std::memory_order_relaxed)) return false;
+            owner = shadow;
             slab = *held;
             std::tie(begin, end) = slabRange(*shadow, *slab);
             return true;
@@ -1037,6 +1101,7 @@ void shadowTouch(std::uintptr_t address, bool write, std::uintptr_t instruction)
         slab->guarded.store(false, std::memory_order_relaxed);
     }
     GuestArena::GuestArenaUnguard_nid_postfix(reinterpret_cast<void*>(begin), bytes);
+    if (slab != nullptr && keepsBeingTouched(*slab)) dropBufferSlab(owner, slab);
 }
 
 // After a write of [begin, end) through a buffer slab, under the GpuMutex: the slab's import pages
@@ -1100,6 +1165,8 @@ std::optional<BufferShadowBinding> BufferShadowFor(const Context& context, const
         if (shadow == nullptr || shadow->context.device != context.device) return std::nullopt;
         first = shadow->UnitOf(begin);
         last = shadow->UnitOf(end - 1);
+        // Host touches dropped a buffer slab over the range (dropBufferSlab): served in place.
+        if (shadow->AnyDropped(first, last)) return std::nullopt;
         for (const auto& candidate : shadow->bufferSlabs) {
             if (candidate->firstUnit <= first && last - candidate->firstUnit < candidate->units) {
                 slab = candidate;
@@ -1264,7 +1331,7 @@ std::string ShadowReport() {
         line += text;
     }
     if (BufferShadowGuarded()) {
-        std::snprintf(text, sizeof(text), ", guards armed %llu/%.1f (refused %llu), host touches %llu (stale %llu), imports held %llu", take(statistics.guardsArmed), mib(take(statistics.guardsArmedBytes)), take(statistics.guardsRefused), take(statistics.guardTouches), take(statistics.staleTouches), take(statistics.importsGuarded));
+        std::snprintf(text, sizeof(text), ", guards armed %llu/%.1f (refused %llu), host touches %llu (stale %llu), imports held %llu, dropped %llu", take(statistics.guardsArmed), mib(take(statistics.guardsArmedBytes)), take(statistics.guardsRefused), take(statistics.guardTouches), take(statistics.staleTouches), take(statistics.importsGuarded), take(statistics.buffersDropped));
         line += text;
     }
     if (ShadowVerify()) {

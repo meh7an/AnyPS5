@@ -1811,6 +1811,77 @@ void bufferShadowTests(const Device& device, Recorder& recorder) {
     std::cout << "buffer shadows verified\n";
 }
 
+// Guarded buffer shadows (Windows) over a slab the host touches after every write: the touches in a
+// row (APS5_BUFFER_SHADOW_DROP, default 8; the presents do not move here) each read the newest
+// results, and the last drops the slab once it is published and open: the range is shadowed no more,
+// and no binding is served over it again.
+void bufferShadowDropTests(const Device& device, Recorder& recorder) {
+    using namespace AgcDriver::GuestMemory;
+    const auto& context = device.GetContext();
+    if (!BufferShadowGuarded() || context.hostImportAlignment == 0) return;
+    constexpr std::uint64_t unit = 65536;
+    constexpr std::size_t bytes = 2 * unit;
+    void* block = AllocateWatched(bytes, 65536);
+    Require(block != nullptr, "buffer shadows are on without write watching");
+    struct Release {
+        void* block;
+        ~Release() { ReleaseWatched(block, bytes); }
+    } release{block};
+    std::memset(block, 0x11, bytes);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true);
+    }
+    struct Unregister {
+        void* block;
+        ~Unregister() {
+            GuestAllocations::Mutation mutation;
+            mutation.Remove(block);
+        }
+    } unregister{block};
+    const auto* import = HostImportFor(context, address, bytes);
+    if (import == nullptr || !Watched(address, bytes)) {
+        std::cout << "host import of the drop test block refused or compared: buffer shadow drops not tested\n";
+        return;
+    }
+    CollectWritesUncached(address, bytes);
+    const auto first = address + unit;
+    const auto end = address + bytes;
+    const auto copyBuffer = context.Function<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer");
+    const auto* words = static_cast<const volatile std::uint8_t*>(block);
+    const char* limit = std::getenv("APS5_BUFFER_SHADOW_DROP");
+    const std::uint32_t expected = limit != nullptr ? static_cast<std::uint32_t>(std::strtoul(limit, nullptr, 10)) : 8u;
+    std::uint32_t touches = 0;
+    for (; touches < 32; ++touches) {
+        auto binding = BufferShadowFor(context, *import, first, end, true);
+        if (!binding.has_value()) break;
+        const auto value = static_cast<std::uint8_t>(0x20 + touches);
+        auto pattern = std::make_shared<Buffer>(context, 16, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+        std::memset(pattern->Bytes().data(), value, pattern->Bytes().size());
+        const auto commands = recorder.Commands();
+        recorder.Keep(pattern);
+        recorder.Keep(binding->slab);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_HOST_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+        const VkBufferCopy piece{0, first - binding->base, 16};
+        copyBuffer(commands, pattern->Handle(), binding->buffer, 1, &piece);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+        recorder.MarkCovered(VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+        MarkBufferShadowWritten(*import, *binding->slab, first, first + 16, MarkWritten(first, 16));
+        // The writer's work is marked: its slab may be dropped again (MarkDirectWrites does the same).
+        binding->pin.reset();
+        Require(words[unit] == value && words[unit + 16] == 0x11, "a touched slab read wrong");
+    }
+    if (expected == 0) {
+        Require(touches == 32 && BufferShadowServes(first, end), "a slab was dropped with drops off");
+    } else {
+        Require(touches == expected, "the slab was not dropped after its run of touches");
+        Require(!BufferShadowServes(first, end) && !AnyShadowedOverlaps(first, unit), "the dropped slab still serves its range");
+        Require(words[unit] == 0x20 + expected - 1, "the dropped slab's last results did not reach the import");
+    }
+    std::cout << "buffer shadow drops verified\n";
+}
+
 void storageRefreshTests(const Device& device, Recorder& recorder, bool watched) {
     const auto& base = device.GetContext();
     if (base.hostImportAlignment == 0) {
@@ -3134,6 +3205,7 @@ int main() {
         keysFillTests(device, recorder);
         unitShadowTests(device, recorder);
         bufferShadowTests(device, recorder);
+        bufferShadowDropTests(device, recorder);
         storageRefreshTests(device, recorder, false);
         storageRefreshTests(device, recorder, true);
         writeBackPaddingTests(device, recorder, false);
