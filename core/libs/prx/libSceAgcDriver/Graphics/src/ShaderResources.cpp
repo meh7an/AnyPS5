@@ -1982,16 +1982,52 @@ bool chargeShaderKey(ChurnCounts& profile, const ResourceCache::Key& key, std::s
 
 }
 
+namespace {
+
+// The Find and Touch counts of the [rescache] line, kept while it is printed (APS5_PROFILE_DRAW):
+// otherwise a locked increment of a shared counter on every lookup.
+bool CountCacheCalls() {
+    static const bool counted = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    return counted;
+}
+
+}
+
+std::uint64_t ResourceCache::hashKey(const Key& key) {
+    // FNV-1a steps in four independent lanes (their multiplies overlap), folded at the end with a
+    // mix that leaves the low bits, which index the map, depending on every lane.
+    constexpr std::uint64_t prime = 1099511628211ull;
+    std::uint64_t lanes[4] = {14695981039346656037ull, 0x9e3779b97f4a7c15ull, 0xc2b2ae3d27d4eb4full, 0x165667b19e3779f9ull};
+    const auto pair = [&](std::size_t at) { return key[at] | static_cast<std::uint64_t>(key[at + 1]) << 32u; };
+    std::size_t at = 0;
+    for (; at + 8 <= key.size(); at += 8) {
+        lanes[0] = (lanes[0] ^ pair(at)) * prime;
+        lanes[1] = (lanes[1] ^ pair(at + 2)) * prime;
+        lanes[2] = (lanes[2] ^ pair(at + 4)) * prime;
+        lanes[3] = (lanes[3] ^ pair(at + 6)) * prime;
+    }
+    for (; at < key.size(); ++at) lanes[at & 3u] = (lanes[at & 3u] ^ key[at]) * prime;
+    std::uint64_t hash = key.size();
+    for (const auto lane : lanes) hash = (hash ^ lane ^ (lane >> 29u)) * 0x9e3779b97f4a7c15ull;
+    return hash ^ (hash >> 32u);
+}
+
+ResourceCache::Entries::iterator* ResourceCache::lookup(std::uint64_t hash, const Key& key) {
+    auto* found = index.find(hash);
+    return found != nullptr && (*found)->key == key ? found : nullptr;
+}
+
 std::shared_ptr<ShaderResources> ResourceCache::Find(const Key& key) {
-    resourceCacheFinds.fetch_add(1, std::memory_order_relaxed);
+    if (CountCacheCalls()) resourceCacheFinds.fetch_add(1, std::memory_order_relaxed);
+    const auto hash = hashKey(key);
     std::lock_guard lock(mutex);
-    const auto found = index.find(key);
-    if (found == index.end()) {
+    auto* found = lookup(hash, key);
+    if (found == nullptr) {
         noteMiss(key);
         return nullptr;
     }
-    entries.splice(entries.begin(), entries, found->second);
-    return found->second->second;
+    entries.splice(entries.begin(), entries, *found);
+    return (*found)->resources;
 }
 
 void ResourceCache::noteMiss(const Key& key) {
@@ -2066,14 +2102,17 @@ void ResourceCache::noteMiss(const Key& key) {
 }
 
 void ResourceCache::Insert(const Key& key, std::shared_ptr<ShaderResources> resources, std::vector<std::shared_ptr<ShaderResources>>* evicted) {
+    const auto hash = hashKey(key);
     std::lock_guard lock(mutex);
-    if (const auto found = index.find(key); found != index.end()) {
-        if (evicted != nullptr) evicted->push_back(std::move(found->second->second));
-        entries.erase(found->second);
-        index.erase(found);
+    auto [slot, inserted] = index.try_emplace(hash);
+    if (!inserted) {
+        // The key's entry, or another key's sharing its hash: replaced either way.
+        if (evicted != nullptr) evicted->push_back(std::move((*slot)->resources));
+        entries.erase(*slot);
     }
-    entries.emplace_front(key, std::move(resources));
-    index.emplace(key, entries.begin());
+    entries.push_front({key, hash, std::move(resources)});
+    // The eviction below moves entries in the map: `slot` is not used past this.
+    *slot = entries.begin();
     // Entries pin their textures and storage images past the texture caches' budgets, so the bound
     // stays modest: APS5_RESOURCE_CACHE_ENTRIES (default 1024) covers several frames of distinct
     // dispatch and draw content.
@@ -2083,27 +2122,28 @@ void ResourceCache::Insert(const Key& key, std::shared_ptr<ShaderResources> reso
         return static_cast<std::size_t>(parsed != 0 ? parsed : 1024ull);
     }();
     while (entries.size() > capacity) {
-        if (evicted != nullptr) evicted->push_back(std::move(entries.back().second));
-        index.erase(entries.back().first);
+        if (evicted != nullptr) evicted->push_back(std::move(entries.back().resources));
+        index.erase(entries.back().hash);
         entries.pop_back();
     }
 }
 
 void ResourceCache::Remove(const Key& key, const ShaderResources* object) {
+    const auto hash = hashKey(key);
     std::lock_guard lock(mutex);
-    if (object != nullptr) {
-        const auto found = index.find(key);
-        if (found == index.end() || found->second->second.get() != object) return;
-    }
-    erase(key);
+    auto* found = lookup(hash, key);
+    if (found == nullptr || (object != nullptr && (*found)->resources.get() != object)) return;
+    entries.erase(*found);
+    index.erase(hash);
 }
 
 bool ResourceCache::Touch(const Key& key) {
-    resourceCacheTouches.fetch_add(1, std::memory_order_relaxed);
+    if (CountCacheCalls()) resourceCacheTouches.fetch_add(1, std::memory_order_relaxed);
+    const auto hash = hashKey(key);
     std::lock_guard lock(mutex);
-    const auto found = index.find(key);
-    if (found == index.end()) return false;
-    entries.splice(entries.begin(), entries, found->second);
+    auto* found = lookup(hash, key);
+    if (found == nullptr) return false;
+    entries.splice(entries.begin(), entries, *found);
     return true;
 }
 
@@ -2124,13 +2164,6 @@ void ResourceCache::Clear() {
 std::size_t ResourceCache::Size() const {
     std::lock_guard lock(mutex);
     return entries.size();
-}
-
-void ResourceCache::erase(const Key& key) {
-    const auto found = index.find(key);
-    if (found == index.end()) return;
-    entries.erase(found->second);
-    index.erase(found);
 }
 
 ResourceCache& SharedResourceCache() {

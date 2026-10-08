@@ -3,6 +3,7 @@
 
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
+#include "prx/libSceAgcDriver/Execution/include/HashSlotMap.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BdaResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/InlineList.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
@@ -567,23 +568,25 @@ public:
     std::size_t Size() const;
 
 private:
-    void erase(const Key& key);
-    void noteMiss(const Key& key);
-    // FNV-1a over two words at a time (a draw key is about a hundred words, hashed on every lookup).
-    // Not noexcept on purpose: libstdc++ then keeps each node's hash, so a bucket walk compares
-    // stored hashes instead of hashing every key it passes.
-    struct KeyHash {
-        std::size_t operator()(const Key& key) const {
-            std::uint64_t hash = 14695981039346656037ull;
-            std::size_t at = 0;
-            for (; at + 2 <= key.size(); at += 2) hash = (hash ^ (key[at] | static_cast<std::uint64_t>(key[at + 1]) << 32u)) * 1099511628211ull;
-            if (at < key.size()) hash = (hash ^ key[at]) * 1099511628211ull;
-            return static_cast<std::size_t>(hash ^ (hash >> 32u));
-        }
+    struct Entry {
+        Key key;
+        std::uint64_t hash;
+        std::shared_ptr<ShaderResources> resources;
     };
+    using Entries = std::list<Entry>;
+    void noteMiss(const Key& key);
+    // A key's hash, in four lanes over pairs of words (a draw key is about a hundred words, hashed
+    // on every lookup: one FNV chain over it was a multiply waiting on the one before), computed
+    // before the mutex is taken.
+    static std::uint64_t hashKey(const Key& key);
+    // The entry under `hash` when it holds `key`, else null (the mutex held).
+    Entries::iterator* lookup(std::uint64_t hash, const Key& key);
     mutable AgcDriver::Mutex mutex;
-    std::list<std::pair<Key, std::shared_ptr<ShaderResources>>> entries;
-    std::unordered_map<Key, decltype(entries)::iterator, KeyHash> index;
+    // Most recently used first.
+    Entries entries;
+    // The entries by key hash, without a division or a bucket list to walk; a lookup compares the
+    // key it finds, so two keys sharing a hash only make the newer one replace the older.
+    HashSlotMap<Entries::iterator> index;
 };
 
 // The process-wide cache the device and the draw path share (keys name the device; a device clears

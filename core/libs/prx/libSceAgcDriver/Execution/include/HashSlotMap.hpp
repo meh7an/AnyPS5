@@ -21,6 +21,8 @@ public:
 
     std::size_t size() const { return count; }
 
+    void clear() { reset(16); }
+
     TValue* find(std::uint64_t key) {
         key = stored(key);
         for (auto index = key & mask; keys[index] != 0; index = (index + 1) & mask) {
