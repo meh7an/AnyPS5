@@ -2,6 +2,7 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_SHADERMEMORY_HPP
 
 #include "Recompiler.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/InlineList.hpp"
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -107,8 +108,9 @@ private:
 
     // Regions given at construction (the registered shader's code and header), referenced as given:
     // the caller keeps them alive for as long as the capture is used. Sorted by address in one
-    // vector, not a map: a draw makes one of these, and the map's node per region was an allocation.
-    std::vector<std::pair<std::uint64_t, std::span<const std::byte>>> initial;
+    // inline list, not a map or a vector: a draw makes one of these, and its allocation was 1.5% of
+    // the worker on S3K.
+    Graphics::InlineList<std::pair<std::uint64_t, std::span<const std::byte>>, 16> initial;
     std::map<std::uint64_t, Page> pages;
     PendingWriteQuery pendingWrite = nullptr;
     PendingWriteObserver observe = nullptr;
