@@ -2786,6 +2786,32 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> GuestBufferMemory::InPlaceR
     return result;
 }
 
+void GuestBufferMemory::AppendInPlaceReads(InlineList<std::pair<std::uint64_t, std::uint64_t>, 16>& out) const {
+    if (!uploaded || committed) return;
+    if (space != nullptr) {
+        for (const auto& region : space->base) {
+            if (region.direct != nullptr) out.push_back({region.begin, region.end});
+        }
+    }
+    for (const auto& region : regions) {
+        if (region.direct != nullptr) out.push_back({region.begin, region.end});
+    }
+}
+
+bool GuestBufferMemory::InPlaceReadOverlaps(std::uint64_t address, std::size_t bytes) const {
+    if (!uploaded || committed) return false;
+    const auto overlaps = [&](std::uint64_t begin, std::uint64_t end) { return address < end && begin < address + bytes; };
+    if (space != nullptr) {
+        for (const auto& region : space->base) {
+            if (region.direct != nullptr && overlaps(region.begin, region.end)) return true;
+        }
+    }
+    for (const auto& region : regions) {
+        if (region.direct != nullptr && overlaps(region.begin, region.end)) return true;
+    }
+    return false;
+}
+
 bool GuestBufferMemory::ReadInPlace(std::uint64_t address, std::size_t bytes) const {
     if (!uploaded || committed) return false;
     const auto holds = [&](std::uint64_t begin, std::uint64_t end) { return address >= begin && address < end && bytes <= end - address; };

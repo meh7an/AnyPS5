@@ -3216,7 +3216,9 @@ void ShaderResources::MarkGpuWrites(Recorder& recorder) {
     // The ranges this use reads in place through their host imports (read-only and written elements
     // alike, and an address-based build's whole leased heaps), before the writes: a CPU store into
     // one of them (the copy HLE) must not land before the recorded work read it.
-    recorder.NotePendingReads(guestMemory.InPlaceReads(), guestMemory.HoldsLease() ? Recorder::ReadKind::AddressBased : Recorder::ReadKind::DispatchElement);
+    InlineList<std::pair<std::uint64_t, std::uint64_t>, 16> reads;
+    guestMemory.AppendInPlaceReads(reads);
+    recorder.NotePendingReads(std::span<const std::pair<std::uint64_t, std::uint64_t>>(reads.data(), reads.size()), guestMemory.HoldsLease() ? Recorder::ReadKind::AddressBased : Recorder::ReadKind::DispatchElement);
     copyWrittenDepthSurfaces();
     if (SkipWriteBack()) return;
     for (std::size_t index = 0; index < storageTextures.size(); ++index) {
@@ -3254,8 +3256,7 @@ bool ShaderResources::WritesMemory() const {
 }
 
 bool ShaderResources::ReadsOverlap(std::uint64_t address, std::size_t bytes) const {
-    const auto reads = guestMemory.InPlaceReads();
-    return std::any_of(reads.begin(), reads.end(), [&](const auto& range) { return address < range.second && range.first < address + bytes; });
+    return guestMemory.InPlaceReadOverlaps(address, bytes);
 }
 
 std::vector<std::pair<VkImage, bool>> ShaderResources::StorageImages() const {
