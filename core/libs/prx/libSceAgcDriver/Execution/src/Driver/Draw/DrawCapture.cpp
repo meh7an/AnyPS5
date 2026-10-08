@@ -300,9 +300,9 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::compileDrawStag
         {
             std::lock_guard lock(stageMemoMutex);
             entries = stageMemo.size();
-            const auto found = stageMemo.find(memoHash);
-            if (found != stageMemo.end() && found->second.source == handle->source.get() && found->second.pushOffset == pushOffset && found->second.entry->key == memoWords) {
-                auto& slot = found->second;
+            auto* found = stageMemo.find(memoHash);
+            if (found != nullptr && found->source == handle->source.get() && found->pushOffset == pushOffset && found->entry->key == memoWords) {
+                auto& slot = *found;
                 entry = slot.entry;
                 stageMemoOrder.splice(stageMemoOrder.end(), stageMemoOrder, slot.order);
                 miss = stageMemoTried(slot.misses) ? stageMemoCurrent(*entry, slot.generation, collected) : StageMemoMiss::Skipped;
@@ -326,10 +326,10 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::compileDrawStag
                 }
             }
             std::lock_guard lock(stageMemoMutex);
-            const auto found = stageMemo.find(memoHash);
-            if (found != stageMemo.end() && found->second.entry == entry) {
-                if (miss == StageMemoMiss::None) found->second.generation = std::max(found->second.generation, collected);
-                settle(found->second);
+            auto* found = stageMemo.find(memoHash);
+            if (found != nullptr && found->entry == entry) {
+                if (miss == StageMemoMiss::None) found->generation = std::max(found->generation, collected);
+                settle(*found);
             }
         }
         switch (miss) {
@@ -346,8 +346,8 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::compileDrawStag
             ShaderRecompiler::PatchOverUserData(request, *served, *entry->patches);
             if (fresh) {
                 std::lock_guard lock(stageMemoMutex);
-                const auto found = stageMemo.find(memoHash);
-                if (found != stageMemo.end() && found->second.entry == entry && (found->second.served == nullptr || found->second.served.use_count() > 1)) found->second.served = served;
+                auto* found = stageMemo.find(memoHash);
+                if (found != nullptr && found->entry == entry && (found->served == nullptr || found->served.use_count() > 1)) found->served = served;
             }
             memoResult = served;
             if (!VerifyStageMemo()) {
@@ -505,16 +505,17 @@ void Driver::insertStageMemo(std::uint64_t hash, const std::shared_ptr<const Sha
     auto [slot, inserted] = stageMemo.try_emplace(hash);
     if (inserted) {
         stageMemoOrder.push_back(hash);
-        slot->second.order = std::prev(stageMemoOrder.end());
+        slot->order = std::prev(stageMemoOrder.end());
     } else {
-        stageMemoOrder.splice(stageMemoOrder.end(), stageMemoOrder, slot->second.order);
+        stageMemoOrder.splice(stageMemoOrder.end(), stageMemoOrder, slot->order);
     }
     // The served result belongs to the entry replaced; the misses in a row go on counting.
-    slot->second.entry = std::move(entry);
-    slot->second.source = handle->source.get();
-    slot->second.pushOffset = pushOffset;
-    slot->second.served.reset();
-    slot->second.generation = generation;
+    slot->entry = std::move(entry);
+    slot->source = handle->source.get();
+    slot->pushOffset = pushOffset;
+    slot->served.reset();
+    slot->generation = generation;
+    // Eviction moves entries in the map: `slot` is not used past this point.
     while (stageMemo.size() > StageMemoCapacity() && !stageMemoOrder.empty()) {
         stageMemo.erase(stageMemoOrder.front());
         stageMemoOrder.pop_front();

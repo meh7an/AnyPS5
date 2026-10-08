@@ -3,6 +3,7 @@
 
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/Submission.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
+#include "prx/libSceAgcDriver/Execution/include/HashSlotMap.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/DeviceAccess.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Packets/PacketHistory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Dispatch/DispatchCache.hpp"
@@ -321,7 +322,7 @@ private:
         std::uint64_t generation = 0;
     };
     AgcDriver::Mutex stageMemoMutex;
-    std::unordered_map<std::uint64_t, StageMemoSlot> stageMemo;
+    HashSlotMap<StageMemoSlot> stageMemo;
     std::list<std::uint64_t> stageMemoOrder;
 
     AgcDriver::Mutex driverPhasesMutex;

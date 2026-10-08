@@ -8,6 +8,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/KeptArena.hpp"
+#include "prx/libSceAgcDriver/Execution/include/HashSlotMap.hpp"
 #include "SceShaders.hpp"
 #include "ControlFlow/RequestSerializer.hpp"
 #include "CacheKey.hpp"
@@ -1616,6 +1617,26 @@ void keptArenaTests() {
     Require(KeptArena::LiveBlocks() == live, "the last object's release kept its block");
 }
 
+// The stage memo's map: every key found after inserts, growth and erases, including an erase whose
+// probe run wraps past the end of the table and must move the entries after it back.
+void hashSlotMapTests() {
+    AgcDriver::HashSlotMap<std::uint64_t> map(16);
+    // 15, 31 and 47 share home slot 15 and wrap to slots 0 and 1; 0x1000 (home 0) lands at 2.
+    for (const std::uint64_t key : {15ull, 31ull, 47ull, 0x1000ull}) *map.try_emplace(key).first = key;
+    Require(map.size() == 4 && !map.try_emplace(31).second && *map.find(31) == 31, "a key inserted again was not found as it was");
+    Require(map.erase(15) && map.find(15) == nullptr && map.size() == 3, "an erased key is still found");
+    Require(*map.find(31) == 31 && *map.find(47) == 47 && *map.find(0x1000) == 0x1000, "an erase lost the entries probed past it");
+    Require(!map.erase(15) && map.find(0x2000) == nullptr, "an absent key was found or erased");
+    const auto key = [](std::uint64_t index) { return index * 0x9e3779b97f4a7c15ull; };
+    for (std::uint64_t index = 1; index <= 1000; ++index) *map.try_emplace(key(index)).first = index;
+    bool found = true;
+    for (std::uint64_t index = 1; index <= 1000; ++index) found = found && map.find(key(index)) != nullptr && *map.find(key(index)) == index;
+    Require(found && map.size() == 1003, "growth lost a key");
+    for (std::uint64_t index = 1; index <= 1000; index += 2) map.erase(key(index));
+    for (std::uint64_t index = 1; index <= 1000; ++index) found = found && (map.find(key(index)) != nullptr) == (index % 2 == 0);
+    Require(found && map.size() == 503 && *map.find(31) == 31, "erasing half the keys lost or kept the wrong ones");
+}
+
 void misalignedShaderDataTests() {
     mock = MockVulkan{};
     auto context = mockContext();
@@ -2585,6 +2606,7 @@ int main() {
         descriptorCacheTests();
         unitGenerationTests();
         keptArenaTests();
+        hashSlotMapTests();
         misalignedShaderDataTests();
         debugBranchTests();
         meshArgumentTests();
