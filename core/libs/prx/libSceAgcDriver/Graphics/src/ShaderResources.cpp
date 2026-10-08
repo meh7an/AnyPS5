@@ -1210,7 +1210,7 @@ void ShaderResources::reportDescriptorCaches() const {
     const auto descriptors = context.descriptorCache != nullptr ? context.descriptorCache->Counters() : DescriptorCache::Stats{};
     const auto samplerHits = context.samplerCache != nullptr ? context.samplerCache->Hits() : 0;
     const auto samplerMisses = context.samplerCache != nullptr ? context.samplerCache->Misses() : 0;
-    AgcDriver::ProfilePrint_nid_no_patch("[descriptors] layouts %llu hits / %llu created, sets %llu from %llu pools and %llu dedicated pools, transient sets %llu from %llu pools (%llu resets), samplers %llu hits / %llu created\n", static_cast<unsigned long long>(descriptors.layoutHits), static_cast<unsigned long long>(descriptors.layoutMisses), static_cast<unsigned long long>(descriptors.sets), static_cast<unsigned long long>(descriptors.pools), static_cast<unsigned long long>(descriptors.dedicatedPools), static_cast<unsigned long long>(descriptors.transientSets), static_cast<unsigned long long>(descriptors.transientPools), static_cast<unsigned long long>(descriptors.transientResets), static_cast<unsigned long long>(samplerHits), static_cast<unsigned long long>(samplerMisses));
+    AgcDriver::ProfilePrint_nid_no_patch("[descriptors] layouts %llu hits / %llu created, sets %llu from %llu pools and %llu dedicated pools, transient sets %llu in %llu allocate calls from %llu pools (%llu resets), samplers %llu hits / %llu created\n", static_cast<unsigned long long>(descriptors.layoutHits), static_cast<unsigned long long>(descriptors.layoutMisses), static_cast<unsigned long long>(descriptors.sets), static_cast<unsigned long long>(descriptors.pools), static_cast<unsigned long long>(descriptors.dedicatedPools), static_cast<unsigned long long>(descriptors.transientSets), static_cast<unsigned long long>(descriptors.transientCalls), static_cast<unsigned long long>(descriptors.transientPools), static_cast<unsigned long long>(descriptors.transientResets), static_cast<unsigned long long>(samplerHits), static_cast<unsigned long long>(samplerMisses));
 }
 
 std::vector<std::uint32_t> ShaderResources::ContentKey(const CompiledShader& shader, bool dataWords, bool movableBuffers) {
@@ -2181,6 +2181,8 @@ constexpr std::array<VkDescriptorPoolSize, 4> ChainPoolSizes{{{VK_DESCRIPTOR_TYP
 constexpr std::array<VkDescriptorPoolSize, 4> ChainPoolCreateSizes{{{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4096 + 2}, {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1024}, {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1024}, {VK_DESCRIPTOR_TYPE_SAMPLER, 512}}};
 // A transient pool: four chain pools' worth, so a frame's draw sets (a few thousand) fill few pools.
 constexpr std::uint32_t TransientPoolScale = 4;
+// Transient sets of one layout taken by one driver allocate call (DescriptorCache::waitingSets).
+constexpr std::uint32_t TransientBatch = 16;
 
 bool transientSetsEnabled() {
     static const bool disabled = std::getenv("APS5_NO_TRANSIENT_SETS") != nullptr;
@@ -2199,6 +2201,17 @@ bool DescriptorCache::fitsChainPool(std::span<const VkDescriptorPoolSize> sizes)
 void DescriptorCache::retireTransient(std::size_t index) {
     auto& entry = transientPools[index];
     entry.full = true;
+    // Its sets still waiting for a draw are no draw's: dropped, so the pool can be reset.
+    for (auto& [layout, waiting] : waitingSets) {
+        for (auto it = waiting.begin(); it != waiting.end();) {
+            if (it->pool != index) {
+                ++it;
+                continue;
+            }
+            if (entry.live != 0) --entry.live;
+            it = waiting.erase(it);
+        }
+    }
     if (entry.live != 0) return;
     // No set of it lives (every owner was kept until its batch completed): whole again.
     static_cast<void>(resetPool(context.device, entry.pool, 0));
@@ -2215,6 +2228,16 @@ void DescriptorCache::retireTransient(std::size_t index) {
 
 DescriptorCache::SetAllocation DescriptorCache::AllocateTransient(VkDescriptorSetLayout layout, std::span<const VkDescriptorPoolSize> sizes) {
     if (!transientSetsEnabled()) return Allocate(layout, sizes);
+    {
+        // A set an earlier call took ahead for this layout (it counts as live in its pool already).
+        std::lock_guard lock(mutex);
+        if (const auto found = waitingSets.find(layout); found != waitingSets.end() && !found->second.empty()) {
+            const auto waiting = found->second.back();
+            found->second.pop_back();
+            ++stats.transientSets;
+            return {waiting.set, transientPools[waiting.pool].pool, true};
+        }
+    }
     if (!fitsChainPool(sizes)) return {};
     // The set's needs by chain pool type (fitsChainPool found every type there).
     std::array<std::uint32_t, ChainPoolSizes.size()> needs{};
@@ -2225,9 +2248,14 @@ DescriptorCache::SetAllocation DescriptorCache::AllocateTransient(VkDescriptorSe
     }
     std::lock_guard lock(mutex);
     const auto allocate = context.Resolved(&DeviceFunctions::allocateDescriptorSets, "vkAllocateDescriptorSets");
+    std::array<VkDescriptorSetLayout, TransientBatch> batchLayouts;
+    batchLayouts.fill(layout);
+    std::array<VkDescriptorSet, TransientBatch> batchSets{};
     VkDescriptorSetAllocateInfo allocation{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
-    allocation.descriptorSetCount = 1;
-    allocation.pSetLayouts = &layout;
+    allocation.pSetLayouts = batchLayouts.data();
+    // Room for the batch's waiting sets before the driver hands them out: none can be lost after.
+    auto& waiting = waitingSets[layout];
+    waiting.reserve(waiting.size() + TransientBatch);
     // Two tries: the pool being filled, then (when it has no room) a reset or a new one, which
     // holds any set the chain check above admitted.
     for (int attempt = 0; attempt < 2; ++attempt) {
@@ -2255,20 +2283,27 @@ DescriptorCache::SetAllocation DescriptorCache::AllocateTransient(VkDescriptorSe
             }
         }
         auto& entry = transientPools[fillingTransient];
-        bool room = entry.sets < ChainPoolSets * TransientPoolScale;
-        for (std::size_t type = 0; type < needs.size(); ++type) room = room && entry.descriptors[type] + needs[type] <= ChainPoolSizes[type].descriptorCount * TransientPoolScale;
-        if (room) {
+        // As many sets as the pool still holds, up to a batch; the first is this call's.
+        std::uint32_t count = std::min<std::uint32_t>(TransientBatch, ChainPoolSets * TransientPoolScale - entry.sets);
+        for (std::size_t type = 0; type < needs.size(); ++type) {
+            if (needs[type] != 0) count = std::min(count, (ChainPoolSizes[type].descriptorCount * TransientPoolScale - entry.descriptors[type]) / needs[type]);
+        }
+        while (count != 0) {
             allocation.descriptorPool = entry.pool;
-            VkDescriptorSet set = VK_NULL_HANDLE;
-            const auto result = allocate(context.device, &allocation, &set);
+            allocation.descriptorSetCount = count;
+            const auto result = allocate(context.device, &allocation, batchSets.data());
             if (result == VK_SUCCESS) {
-                ++entry.live;
-                ++entry.sets;
-                for (std::size_t type = 0; type < needs.size(); ++type) entry.descriptors[type] += needs[type];
+                entry.live += count;
+                entry.sets += count;
+                for (std::size_t type = 0; type < needs.size(); ++type) entry.descriptors[type] += needs[type] * count;
                 ++stats.transientSets;
-                return {set, entry.pool, true};
+                ++stats.transientCalls;
+                for (std::uint32_t index = 1; index < count; ++index) waiting.push_back({batchSets[index], fillingTransient});
+                return {batchSets[0], entry.pool, true};
             }
             if (result != VK_ERROR_OUT_OF_POOL_MEMORY && result != VK_ERROR_FRAGMENTED_POOL) Check(result, "vkAllocateDescriptorSets");
+            // The driver holds less than the pool's sizes say: one set, else the pool is full.
+            count = count > 1 ? 1 : 0;
         }
         // No room: no longer filled, and reset once its last set is released.
         const auto full = fillingTransient;

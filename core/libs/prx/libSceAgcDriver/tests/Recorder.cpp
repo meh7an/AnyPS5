@@ -1225,6 +1225,7 @@ void drawSnapshotReuseTests(const Device& device, Recorder& recorder) {
         Require(holds(first->snapshots[0], std::byte{0x11}), "a later draw's upload overwrote an earlier draw's bytes");
         Require(second->snapshots[0].buffer == first->snapshots[0].buffer && second->snapshots[0].offset >= first->snapshots[0].offset + smallBytes, "consecutive draw uploads do not share the chunk");
         Require(first->allocation.transient && second->allocation.transient && cache.Counters().transientSets == before.transientSets + 2, "draw sets were not taken from the transient pools");
+        Require(cache.Counters().transientCalls == before.transientCalls + 1, "consecutive draw sets of a layout were not taken by one allocate call");
         snapshotRecorder.Sync();
     } else {
         std::cout << "draw uploads disabled: not tested\n";
@@ -1307,6 +1308,35 @@ void transientSetTests(const Device& device) {
     Require(second.back().pool == pool && cache.Counters().transientPools == 2, "the reset transient pool was not filled again");
     for (const auto& set : second) cache.Free(set);
     Require(cache.Counters().transientResets == 2, "only the full pool is reset when its sets are released");
+
+    // Sets one allocate call took ahead for a layout wait in their pool; filled by another layout,
+    // the pool drops them (no draw holds them), so releasing the handed-out sets resets it, and the
+    // layout's next set is a new one.
+    DescriptorCache batches(context);
+    const auto otherLayout = batches.Layout(key, std::span<const VkDescriptorSetLayoutBinding>(&layoutBinding, 1));
+    const VkDescriptorSetLayoutBinding pairBinding{0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+    const std::array<std::uint32_t, 4> pairKey{0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2, VK_SHADER_STAGE_COMPUTE_BIT};
+    const auto pairLayout = batches.Layout(pairKey, std::span<const VkDescriptorSetLayoutBinding>(&pairBinding, 1));
+    const std::array<VkDescriptorPoolSize, 1> pairSizes{{{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2}}};
+    const auto waiter = batches.AllocateTransient(otherLayout, sizes);
+    const auto calls = batches.Counters().transientCalls;
+    Require(waiter.set != VK_NULL_HANDLE && calls == 1, "the first transient set took no allocate call");
+    std::vector<DescriptorCache::SetAllocation> filler;
+    while (batches.Counters().transientPools < 2) {
+        filler.push_back(batches.AllocateTransient(pairLayout, pairSizes));
+        Require(filler.back().set != VK_NULL_HANDLE && filler.size() < 100000, "the batch test's pool never filled");
+    }
+    const auto next = filler.back();
+    filler.pop_back();
+    Require(next.pool != waiter.pool && std::all_of(filler.begin(), filler.end(), [&](const auto& set) { return set.pool == waiter.pool; }), "the batch test's pool did not fill");
+    const auto resets = batches.Counters().transientResets;
+    for (const auto& set : filler) batches.Free(set);
+    batches.Free(waiter);
+    Require(batches.Counters().transientResets == resets + 1, "sets waiting for a draw kept a full transient pool from its reset");
+    const auto again = batches.AllocateTransient(otherLayout, sizes);
+    Require(again.set != VK_NULL_HANDLE && batches.Counters().transientCalls > calls, "a set waiting in a reset pool was handed out");
+    batches.Free(again);
+    batches.Free(next);
 }
 
 void drawSnapshotEvictionTests(const Device& device) {

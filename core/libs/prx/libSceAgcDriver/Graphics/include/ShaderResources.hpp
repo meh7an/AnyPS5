@@ -69,8 +69,9 @@ public:
     // ShaderResources::PrepareDrawBindings): taken from pools made without FREE_DESCRIPTOR_SET (a
     // bump allocation in the driver, where a freeable pool searches its free list on every
     // allocation) and never freed one by one: a pool counts its live sets, and once it is full and
-    // its last set was released it is reset whole and filled again. APS5_NO_TRANSIENT_SETS=1 takes
-    // these sets from the freeable chain as before.
+    // its last set was released it is reset whole and filled again. The driver's allocate call is
+    // most of a set's cost, so one call takes several sets of the layout and the rest wait for the
+    // next draws of it. APS5_NO_TRANSIENT_SETS=1 takes these sets from the freeable chain as before.
     SetAllocation AllocateTransient(VkDescriptorSetLayout layout, std::span<const VkDescriptorPoolSize> sizes);
     void Free(const SetAllocation& allocation) noexcept;
     // APS5_PROFILE_DRAW counters: layouts served from the map / created, sets allocated, pools opened.
@@ -81,6 +82,8 @@ public:
         std::uint64_t pools = 0;
         std::uint64_t dedicatedPools = 0;
         std::uint64_t transientSets = 0;
+        // Driver allocate calls that took transient sets (several sets each).
+        std::uint64_t transientCalls = 0;
         std::uint64_t transientPools = 0;
         std::uint64_t transientResets = 0;
     };
@@ -115,6 +118,14 @@ private:
     std::vector<TransientPool> transientPools;
     std::size_t fillingTransient = ~std::size_t{0};
     std::vector<std::size_t> resetTransient;
+    // Transient sets taken ahead of their draws, by layout, with the pool (index) each came from.
+    // Each counts as live in its pool until a draw took it and released it; a pool marked full drops
+    // the ones still waiting (no draw holds them), so it can be reset.
+    struct WaitingSet {
+        VkDescriptorSet set;
+        std::size_t pool;
+    };
+    std::unordered_map<VkDescriptorSetLayout, std::vector<WaitingSet>> waitingSets;
     Stats stats;
 };
 
