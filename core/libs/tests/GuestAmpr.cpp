@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <future>
 #include <string>
@@ -504,6 +505,26 @@ bool MatchesFile(const std::uint8_t* data, std::size_t offset, std::size_t bytes
     return true;
 }
 
+// A package file the title names under /app0 that the package keeps under /app0/raw resolves there (CRI
+// ADX2 in Sonic Origins streams its banks from /app0/sound); a file in neither place still fails.
+void TestRawFallback() {
+    const bool hadApp0 = std::filesystem::exists("app0");
+    const std::filesystem::path directory = "app0/raw/apr_raw_fallback";
+    std::filesystem::create_directories(directory);
+    {
+        std::ofstream file(directory / "bank.awb", std::ios::binary);
+        file << "bank";
+    }
+    const char* paths[] = {"/app0/apr_raw_fallback/bank.awb", "/app0/raw/apr_raw_fallback/bank.awb"};
+    std::uint32_t ids[2] = {};
+    std::uint32_t failed = 0;
+    Require(sceKernelAprResolveFilepathsToIds(paths, 2, ids, &failed) == 0);
+    Require(ids[0] == ids[1]);
+    const char* missing = "/app0/apr_raw_fallback/missing.awb";
+    Require(sceKernelAprResolveFilepathsToIds(&missing, 1, ids, &failed) != 0);
+    std::filesystem::remove_all(hadApp0 ? directory : std::filesystem::path("app0"));
+}
+
 void TestGatherScatter() {
     const char* path = "ampr_gather_scatter.bin";
     {
@@ -938,6 +959,7 @@ int main() {
     TestVersionedCommands();
     TestVersionedCounters();
     TestConstructed();
+    TestRawFallback();
     TestGatherScatter();
     TestAmm();
     TestAmmRemapAndProtect();

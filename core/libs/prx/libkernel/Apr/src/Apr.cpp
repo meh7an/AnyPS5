@@ -19,6 +19,7 @@
 #include <fstream>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -102,14 +103,31 @@ int _fail(int guestErrno) {
     return -1;
 }
 
+// A package path the title names under /app0 that the package keeps under /app0/raw, or nothing. Hedgehog
+// Engine titles ship their data in raw/ and their own loader tries both places, but middleware resolves
+// on its own: CRI ADX2 in Sonic Origins streams its banks from /app0/sound/<name>.awb.
+std::optional<std::filesystem::path> _rawFallback(const std::string& guestPath, std::uint64_t& bytes) {
+    constexpr const char* app0 = "/app0/";
+    constexpr std::size_t app0Length = 6;
+    if (guestPath.rfind(app0, 0) != 0 || guestPath.rfind("/app0/raw/", 0) == 0) return std::nullopt;
+    auto hostPath = ResolvePath_nid_no_patch(("/app0/raw/" + guestPath.substr(app0Length)).c_str());
+    if (!_fileSize(hostPath, bytes)) return std::nullopt;
+    return hostPath;
+}
+
 bool _resolve(const char* guestPath, std::uint32_t* id, std::uint64_t* size) {
     if (!guestPath) return false;
+    static const bool trace = std::getenv("APS5_TRACE_APR") != nullptr;
     auto hostPath = ResolvePath_nid_no_patch(guestPath);
     std::uint64_t bytes = 0;
     if (!_fileSize(hostPath, bytes)) {
-        static const bool trace = std::getenv("APS5_TRACE_APR") != nullptr;
-        if (trace) std::fprintf(stderr, "[apr] resolve %s: not found (%s)\n", guestPath, hostPath.string().c_str());
-        return false;
+        auto raw = _rawFallback(guestPath, bytes);
+        if (!raw) {
+            if (trace) std::fprintf(stderr, "[apr] resolve %s: not found (%s)\n", guestPath, hostPath.string().c_str());
+            return false;
+        }
+        if (trace) std::fprintf(stderr, "[apr] resolve %s: found under /app0/raw (%s)\n", guestPath, raw->string().c_str());
+        hostPath = std::move(*raw);
     }
     std::lock_guard lock(g_filesLock);
     const auto key = hostPath.string();
