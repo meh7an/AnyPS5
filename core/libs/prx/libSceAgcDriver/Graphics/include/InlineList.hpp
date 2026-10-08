@@ -59,7 +59,12 @@ private:
         if (count < N) {
             local[count] = std::forward<U>(value);
         } else {
-            if (heap.empty()) heap.assign(std::make_move_iterator(local.begin()), std::make_move_iterator(local.end()));
+            if (heap.empty()) {
+                // Room for as many again: the spill is one allocation, not one for the inline
+                // elements and another as the first push grows it.
+                heap.reserve(2 * N);
+                heap.assign(std::make_move_iterator(local.begin()), std::make_move_iterator(local.end()));
+            }
             heap.push_back(std::forward<U>(value));
         }
         ++count;

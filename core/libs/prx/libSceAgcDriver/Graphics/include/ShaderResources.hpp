@@ -162,8 +162,9 @@ public:
         };
         DescriptorCache* cache = nullptr;
         DescriptorCache::SetAllocation allocation;
-        // A handful per draw (about five on S3K): inline, no allocation of their own.
-        InlineList<Snapshot, 8> snapshots;
+        // A handful per draw (about five on S3K, more than eight often enough that spilling to the
+        // heap was 0.6% of the worker): inline, no allocation of their own.
+        InlineList<Snapshot, 16> snapshots;
         ~DrawBindings();
     };
     // A data buffer's new words point into the draw's compiled stage (its binding's guest
