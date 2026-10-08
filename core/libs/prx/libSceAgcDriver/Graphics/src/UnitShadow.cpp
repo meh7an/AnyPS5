@@ -977,7 +977,15 @@ void DestroyShadows(VkDevice device) {
 }
 
 bool BufferShadowEnabled() {
-    static const bool enabled = std::getenv("APS5_BUFFER_SHADOW") != nullptr && UnitShadowEnabled();
+    static const bool enabled = [] {
+        const char* text = std::getenv("APS5_BUFFER_SHADOW");
+#ifdef _WIN32
+        const bool wanted = text == nullptr || std::strcmp(text, "0") != 0;
+#else
+        const bool wanted = text != nullptr && std::strcmp(text, "0") != 0;
+#endif
+        return wanted && UnitShadowEnabled();
+    }();
     return enabled;
 }
 

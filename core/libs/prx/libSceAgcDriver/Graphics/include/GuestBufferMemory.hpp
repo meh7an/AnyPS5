@@ -190,7 +190,7 @@ public:
     // calls RecordCopyBacks (a dispatch), since a staged region's results reach guest memory by
     // that copy alone. Call before Upload.
     void AllowDeviceStaging() { stagingAllowed = true; }
-    // Buffer shadows (UnitShadow.hpp, APS5_BUFFER_SHADOW=1): a region of at least
+    // Buffer shadows (UnitShadow.hpp, BufferShadowEnabled): a region of at least
     // BufferShadowMinBytes inside a host import binds the shadow's device buffer in the import's
     // place. A dispatch build (AllowDeviceStaging) writes through one, made on its first write; a
     // draw build (AllowShadowReads) only reads through an existing one, and binds a region it

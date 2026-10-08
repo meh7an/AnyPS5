@@ -1624,7 +1624,7 @@ void unitShadowTests(const Device& device, Recorder& recorder) {
     else Require(words[128 * unit] == 0x77, "the eviction before the retire did not publish unit 128");
 }
 
-// Buffer shadows (UnitShadow.hpp, APS5_BUFFER_SHADOW=1) over a host import of write-watched arena
+// Buffer shadows (UnitShadow.hpp, BufferShadowEnabled) over a host import of write-watched arena
 // memory: one slab over a bound range. A writer's binding makes it, seeded from the import and
 // pinned; the work's marked store makes its unit the newest, unpublished; a reader takes the same
 // slab; a publish lands the unit, the store's bytes and the seed's; a CPU store makes its unit stale
@@ -1639,7 +1639,7 @@ void bufferShadowTests(const Device& device, Recorder& recorder) {
     const auto& context = device.GetContext();
     if (!BufferShadowEnabled()) {
         Require(!BufferShadowServes(0x10000, 0x20000), "buffer shadows are off but serve a range");
-        std::cout << "buffer shadows off (APS5_BUFFER_SHADOW unset, or unit shadows off): primitives inert\n";
+        std::cout << "buffer shadows off (APS5_BUFFER_SHADOW=0, not set off Windows, or unit shadows off): primitives inert\n";
         return;
     }
     if (context.hostImportAlignment == 0) {

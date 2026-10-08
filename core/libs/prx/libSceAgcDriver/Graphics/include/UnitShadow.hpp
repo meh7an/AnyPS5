@@ -158,7 +158,8 @@ std::string ShadowReport();
 // than their generation (counted as mismatches otherwise).
 bool ShadowVerify();
 
-// Buffer shadows (APS5_BUFFER_SHADOW=1, off by default): a device-local copy of a large guest
+// Buffer shadows (on by default on Windows, APS5_BUFFER_SHADOW=0 turns them off; elsewhere, where
+// nothing guards them, APS5_BUFFER_SHADOW=1 turns them on): a device-local copy of a large guest
 // buffer range inside a host import, bound in the import's place by the dispatches that write it and
 // the dispatches and draws that read it, so passes that produce and consume a buffer on the GPU stop
 // crossing PCIe for it. One slab of the import's shadow spans the range whole, and its units follow
@@ -170,7 +171,8 @@ bool ShadowVerify();
 // and a slab that cannot be guarded has its written units published at once. A slab touched again
 // and again (APS5_BUFFER_SHADOW_DROP times in a row, default 8, each within 30 presents of the last;
 // 0 never drops) costs more than it saves: it is dropped, and its range is served in place from
-// then on. Off by default.
+// then on. Unguarded (off Windows), a native read of a range after the GPU's label would see the
+// import's older bytes.
 bool BufferShadowEnabled();
 // Whether buffer shadows guard their import pages (Windows, buffer shadows on).
 bool BufferShadowGuarded();
@@ -197,13 +199,13 @@ void MarkBufferShadowWritten(const HostImport& import, const ShadowSlab& slab, s
 // it, see ShaderResources::Revalidate).
 bool BufferShadowServes(std::uint64_t begin, std::uint64_t end);
 
-// Guarded buffer shadows, phase 0 (APS5_BUFFER_SHADOW_OBSERVE=1 with buffer shadows off): the whole
-// 64 KiB units of a range a buffer shadow would serve are guarded (GuestArenaGuard) once a write of
-// it is recorded, and a host CPU touch of one (the title's code, the driver's, the Vulkan driver's)
-// is counted and opens its unit until the next write. A [shadow-guard] line every 10 s says what was
-// guarded and which code touched it. The GPU writes the import in place meanwhile, so no byte
-// anyone reads changes. A host write announced by GuestArena::HostWrite opens the range first; a
-// host API reading a guarded range (WriteFile from it, say) would fail instead.
+// Guarded buffer shadows, phase 0 (APS5_BUFFER_SHADOW_OBSERVE=1 with buffer shadows off,
+// APS5_BUFFER_SHADOW=0): the whole 64 KiB units of a range a buffer shadow would serve are guarded
+// (GuestArenaGuard) once a write of it is recorded, and a host CPU touch of one (the title's code,
+// the driver's, the Vulkan driver's) is counted and opens its unit until the next write. A
+// [shadow-guard] line every 10 s says what was guarded and which code touched it. The GPU writes the
+// import in place meanwhile, so no byte anyone reads changes. A host access GuestArena announces
+// (HostWrite, OpenForHostRead) is counted and opens its units first.
 bool BufferShadowObserved();
 void ObserveBufferShadowWrite(std::uint64_t begin, std::uint64_t end);
 // Before an import of [begin, end), which pins accessible pages only: whether the range is open.
