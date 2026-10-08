@@ -2,6 +2,7 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_RECORDER_HPP
 
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/KeptArena.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include <atomic>
 #include <chrono>
@@ -137,6 +138,9 @@ public:
         std::byte* bytes = nullptr;
     };
     UploadSlice DrawUpload(std::size_t bytes);
+    // Storage for the objects a recorded draw keeps until its batch completed (see KeptArena);
+    // under the GPU mutex, as recording is.
+    KeptArena& DrawArena() { return drawArena; }
     void OnComplete(std::function<void()> action);
     void NotePendingWrite(std::uint64_t address, std::size_t bytes);
     void NotePendingFill(std::uint64_t address, std::size_t bytes, std::uint8_t value);
@@ -833,6 +837,7 @@ private:
     // The draw upload chunk being filled and its bytes in use (see DrawUpload).
     std::shared_ptr<Buffer> drawUpload;
     VkDeviceSize drawUploadUsed = 0;
+    KeptArena drawArena;
     template <typename Entries>
     void eraseDrawSnapshot(Entries& entries, typename Entries::iterator entry);
 };

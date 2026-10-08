@@ -7,6 +7,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/ShaderInputState.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/KeptArena.hpp"
 #include "SceShaders.hpp"
 #include "ControlFlow/RequestSerializer.hpp"
 #include "CacheKey.hpp"
@@ -25,6 +26,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <type_traits>
 #include <vector>
 
@@ -1584,6 +1586,36 @@ void unitGenerationTests() {
     Require(units[2] == 11 && units.oldest() == 11 && units.all()[2] == 11, "a uniform assignment after a store kept the stored unit");
 }
 
+// The kept-object arena: objects carved in order and released from any thread in any order; a block
+// returns to the heap once its objects were released and the arena moved on from it, also when an
+// object outlives the arena.
+void keptArenaTests() {
+    using AgcDriver::Graphics::KeptArena;
+    using Object = std::array<std::byte, 600>;
+    const auto live = KeptArena::LiveBlocks();
+    {
+        KeptArena arena;
+        std::vector<std::shared_ptr<Object>> objects;
+        for (int i = 0; i < 1000; ++i) objects.push_back(std::allocate_shared<Object>(KeptArena::Allocator<Object>(arena)));
+        Require(KeptArena::LiveBlocks() >= live + 9, "a thousand 600-byte objects took fewer blocks than they fill");
+        std::thread other([&] {
+            for (std::size_t i = 0; i < objects.size(); i += 2) objects[i].reset();
+        });
+        other.join();
+        for (auto& object : objects) object.reset();
+        Require(KeptArena::LiveBlocks() == live + 1, "a block outlived its released objects (only the arena's current one stays)");
+    }
+    Require(KeptArena::LiveBlocks() == live, "the arena's current block outlived the arena");
+    std::shared_ptr<int> survivor;
+    {
+        KeptArena arena;
+        survivor = std::allocate_shared<int>(KeptArena::Allocator<int>(arena), 5);
+    }
+    Require(*survivor == 5 && KeptArena::LiveBlocks() == live + 1, "an object outliving its arena lost its block");
+    survivor.reset();
+    Require(KeptArena::LiveBlocks() == live, "the last object's release kept its block");
+}
+
 void misalignedShaderDataTests() {
     mock = MockVulkan{};
     auto context = mockContext();
@@ -2552,6 +2584,7 @@ int main() {
         resourceTests();
         descriptorCacheTests();
         unitGenerationTests();
+        keptArenaTests();
         misalignedShaderDataTests();
         debugBranchTests();
         meshArgumentTests();

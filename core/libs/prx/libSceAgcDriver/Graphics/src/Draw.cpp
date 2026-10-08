@@ -1399,7 +1399,7 @@ struct Kept {
 // targets marked dirty.
 void keepRecordedDraw(Recorder& recorder, std::shared_ptr<Kept> kept, const std::shared_ptr<ShaderResources>& resources, std::shared_ptr<Pipeline> pipeline, std::shared_ptr<Framebuffer> framebuffer, DrawInputs& inputs, TargetList targets, std::unique_ptr<DeviceBuffer> scratch, std::function<void()> checkRecords, bool listed, bool completion, const DrawOutcome& outcome) {
     if (kept == nullptr) {
-        kept = std::make_shared<Kept>();
+        kept = std::allocate_shared<Kept>(KeptArena::Allocator<Kept>(recorder.DrawArena()));
         recorder.Keep(kept);
     }
     kept->resources = resources;
@@ -1663,7 +1663,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     parts.mark(RecordParts::Stores);
     // Kept in the open batch before the draw's own set is made: the set and the copies it binds
     // live until the batch completed.
-    auto kept = std::make_shared<Kept>();
+    auto kept = std::allocate_shared<Kept>(KeptArena::Allocator<Kept>(recorder->DrawArena()));
     recorder->Keep(kept);
     const auto keptBatch = recorder->Submissions();
     const bool ownSet = resources.PrepareDrawBindings(*recorder, record.moved, kept->bindings);
