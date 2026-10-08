@@ -73,6 +73,15 @@ void ReleaseWatched(void* block, std::size_t bytes) {
 #endif
 }
 
+// A draw's own set the way a recorded draw makes one: its bindings held by an object kept in the
+// recorder's open batch first. Null when the object's set serves the draw as it is.
+std::shared_ptr<ShaderResources::DrawBindings> PrepareDrawBindings(const ShaderResources& resources, Recorder& recorder) {
+    auto bindings = std::make_shared<ShaderResources::DrawBindings>();
+    recorder.Keep(bindings);
+    if (!resources.PrepareDrawBindings(recorder, {}, *bindings)) return nullptr;
+    return bindings;
+}
+
 // A compute-capable device with host imports (VK_EXT_external_memory_host) when the host offers
 // them, as the driver creates its own; the recorder's batches need a real queue and real fences.
 class Device {
@@ -1017,10 +1026,10 @@ void resourceReadTests(const Device& device, Recorder& recorder) {
         Recorder snapshotRecorder(snapshotContext);
         snapshotRecorder.Activate();
         ShaderResources resources(snapshotContext, compute);
-        auto first = resources.PrepareDrawBindings(snapshotRecorder);
+        auto first = PrepareDrawBindings(resources, snapshotRecorder);
         Require(first != nullptr && first->snapshots.size() == 1, "read-only draw input was not snapshotted");
         std::memset(reinterpret_cast<void*>(element), 0x22, elementBytes);
-        auto second = resources.PrepareDrawBindings(snapshotRecorder);
+        auto second = PrepareDrawBindings(resources, snapshotRecorder);
         Require(second != nullptr && second->snapshots.size() == 1, "cached draw input was not snapshotted again");
         Require(first->allocation.set != second->allocation.set, "in-flight draws share mutable descriptor bindings");
         std::memset(reinterpret_cast<void*>(element), 0x33, elementBytes);
@@ -1043,7 +1052,7 @@ void resourceReadTests(const Device& device, Recorder& recorder) {
         Require(std::all_of(contents.begin(), contents.begin() + elementBytes, [](std::byte value) { return value == std::byte{0x11}; }), "first draw observed overwritten input");
         Require(std::all_of(contents.begin() + elementBytes, contents.end(), [](std::byte value) { return value == std::byte{0x22}; }), "second draw observed overwritten input");
         snapshotRecorder.NotePendingWrite(element, elementBytes);
-        Require(resources.PrepareDrawBindings(snapshotRecorder) == nullptr, "GPU-produced input was replaced with stale CPU memory");
+        Require(PrepareDrawBindings(resources, snapshotRecorder) == nullptr, "GPU-produced input was replaced with stale CPU memory");
         snapshotRecorder.Sync();
     }
     Require(snapshotLifetime.expired(), "draw snapshots outlived their recorder");
@@ -1126,7 +1135,7 @@ void misalignedSnapshotTests(const Device& device, Recorder& recorder) {
         resources.PatchPushConstants(push);
         const auto adjustment = std::to_integer<std::uint32_t>(push[1]);
         Require(push[0] == std::byte{0} && adjustment == offset % alignment, "the inner view's shader offset is not its distance from the binding");
-        const auto bindings = resources.PrepareDrawBindings(snapshotRecorder);
+        const auto bindings = PrepareDrawBindings(resources, snapshotRecorder);
         Require(bindings != nullptr && bindings->snapshots.size() == 2, "read-only draw inputs were not snapshotted");
         const auto outerContents = bindings->snapshots[0].Bytes();
         Require(outerContents.size() >= outerBytes && std::memcmp(outerContents.data(), guest + outer, outerBytes) == 0, "an aligned draw snapshot misses its view's bytes");
@@ -1207,11 +1216,11 @@ void drawSnapshotReuseTests(const Device& device, Recorder& recorder) {
             return contents.size() == smallBytes && std::all_of(contents.begin(), contents.end(), [&](std::byte value) { return value == expected; });
         };
         const auto before = cache.Counters();
-        const auto first = resources.PrepareDrawBindings(snapshotRecorder);
+        const auto first = PrepareDrawBindings(resources, snapshotRecorder);
         Require(first != nullptr && first->snapshots.size() == 1 && holds(first->snapshots[0], std::byte{0x11}), "a small draw input was not uploaded with its guest bytes");
         Require(first->snapshots[0].offset % context.limits.minStorageBufferOffsetAlignment == 0, "a draw upload breaks the storage buffer offset alignment");
         std::memset(reinterpret_cast<void*>(small), 0x44, smallBytes);
-        const auto second = resources.PrepareDrawBindings(snapshotRecorder);
+        const auto second = PrepareDrawBindings(resources, snapshotRecorder);
         Require(second != nullptr && second->snapshots.size() == 1 && holds(second->snapshots[0], std::byte{0x44}), "a draw upload missed a CPU store before its draw");
         Require(holds(first->snapshots[0], std::byte{0x11}), "a later draw's upload overwrote an earlier draw's bytes");
         Require(second->snapshots[0].buffer == first->snapshots[0].buffer && second->snapshots[0].offset >= first->snapshots[0].offset + smallBytes, "consecutive draw uploads do not share the chunk");
@@ -1232,7 +1241,7 @@ void drawSnapshotReuseTests(const Device& device, Recorder& recorder) {
         snapshotRecorder.Activate();
         ShaderResources resources(snapshotContext, compute);
         const auto snapshot = [&](std::byte expected) {
-            const auto bindings = resources.PrepareDrawBindings(snapshotRecorder);
+            const auto bindings = PrepareDrawBindings(resources, snapshotRecorder);
             Require(bindings != nullptr && bindings->snapshots.size() == 1, "read-only draw input was not snapshotted");
             const auto buffer = bindings->snapshots[0].buffer;
             const auto contents = bindings->snapshots[0].Bytes();

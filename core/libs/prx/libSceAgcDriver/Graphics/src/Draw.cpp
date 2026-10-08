@@ -1389,13 +1389,19 @@ struct Kept {
     VertexBufferList vertexBuffers;
     TargetList targets;
     std::unique_ptr<DeviceBuffer> scratch;
+    // The draw's own set and the copies it binds (ShaderResources::PrepareDrawBindings), if any.
+    ShaderResources::DrawBindings bindings;
 };
 
-// The completion side of a recorded draw: the kept objects, the record check, the lease outcome,
-// the GPU write notes, the copied-buffer write-back (listed in DrawCopiedWriters or run as a
-// completion action) and the targets marked dirty.
-void keepRecordedDraw(Recorder& recorder, const std::shared_ptr<ShaderResources>& resources, std::shared_ptr<Pipeline> pipeline, std::shared_ptr<Framebuffer> framebuffer, DrawInputs& inputs, TargetList targets, std::unique_ptr<DeviceBuffer> scratch, std::function<void()> checkRecords, bool listed, bool completion, const DrawOutcome& outcome) {
-    auto kept = std::make_shared<Kept>();
+// The completion side of a recorded draw: the kept objects (in `kept` when the caller kept it
+// already, for the draw's own set), the record check, the lease outcome, the GPU write notes, the
+// copied-buffer write-back (listed in DrawCopiedWriters or run as a completion action) and the
+// targets marked dirty.
+void keepRecordedDraw(Recorder& recorder, std::shared_ptr<Kept> kept, const std::shared_ptr<ShaderResources>& resources, std::shared_ptr<Pipeline> pipeline, std::shared_ptr<Framebuffer> framebuffer, DrawInputs& inputs, TargetList targets, std::unique_ptr<DeviceBuffer> scratch, std::function<void()> checkRecords, bool listed, bool completion, const DrawOutcome& outcome) {
+    if (kept == nullptr) {
+        kept = std::make_shared<Kept>();
+        recorder.Keep(kept);
+    }
     kept->resources = resources;
     kept->pipeline = std::move(pipeline);
     kept->framebuffer = std::move(framebuffer);
@@ -1404,7 +1410,6 @@ void keepRecordedDraw(Recorder& recorder, const std::shared_ptr<ShaderResources>
     kept->scratch = std::move(scratch);
     kept->targets = std::move(targets);
     const auto& residents = kept->targets;
-    recorder.Keep(kept);
     if (checkRecords) recorder.OnComplete(std::move(checkRecords));
     // Counted for the [address-sync] line: a lease released by the completion (the pin waiter
     // finishes the recorder up to the open batch, which holds the kept resources and gets the
@@ -1484,7 +1489,7 @@ bool CaptureInputsEnabled() {
     return enabled;
 }
 
-void captureInputs(const Context& context, Recorder& recorder, VkCommandBuffer commands, const ShaderResources& resources, const std::shared_ptr<ShaderResources::DrawBindings>& bindings, std::uint64_t target) {
+void captureInputs(const Context& context, Recorder& recorder, VkCommandBuffer commands, const ShaderResources& resources, const ShaderResources::DrawBindings* bindings, std::uint64_t target) {
     struct Sample {
         std::uint64_t address;
         std::size_t offset;
@@ -1656,7 +1661,12 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     // A queued label store over such memory likewise (Recorder::RecordStore).
     if (recorder->HasQueuedStores() && (resources.HoldsLease() || recorder->AnyQueuedStore(touches))) recorder->FlushStores();
     parts.mark(RecordParts::Stores);
-    const auto drawBindings = resources.PrepareDrawBindings(*recorder, record.moved);
+    // Kept in the open batch before the draw's own set is made: the set and the copies it binds
+    // live until the batch completed.
+    auto kept = std::make_shared<Kept>();
+    recorder->Keep(kept);
+    const auto keptBatch = recorder->Submissions();
+    const bool ownSet = resources.PrepareDrawBindings(*recorder, record.moved, kept->bindings);
     parts.mark(RecordParts::Bindings);
     const bool capture = CaptureInputsEnabled();
     const bool meshIndirect = state.stages.mesh && args != nullptr;
@@ -1664,7 +1674,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     outcome.passContinued = continued;
     outcome.passBegun = !continued;
     const auto commands = continued ? recorder->CommandsInRenderPass() : recorder->Commands();
-    if (capture) captureInputs(context, *recorder, commands, resources, drawBindings, record.targets.empty() || record.targets.front() == nullptr ? 0 : record.targets.front()->Descriptor().baseAddress);
+    if (capture) captureInputs(context, *recorder, commands, resources, ownSet ? &kept->bindings : nullptr, record.targets.empty() || record.targets.front() == nullptr ? 0 : record.targets.front()->Descriptor().baseAddress);
     // The draw's [gputime] class range: from its first barrier to the pass's trailing barrier (a
     // continued draw lies inside its pass's range).
     const auto drawTiming = !continued ? recorder->BeginGpuTiming(CommandClass::Draw) : Recorder::NoTiming;
@@ -1707,8 +1717,8 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     }
     parts.mark(RecordParts::Pass);
     APS5_LOG_CHARS_OUT_DEBUG("Pipeline Begin OK");
-    if (drawBindings != nullptr) {
-        const auto set = drawBindings->allocation.set;
+    if (ownSet) {
+        const auto set = kept->bindings.allocation.set;
         context.Resolved(&DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, record.pipeline->Layout(), 0, 1, &set, 0, nullptr);
     } else {
         resources.Bind(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, record.pipeline->Layout());
@@ -1740,7 +1750,9 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     parts.mark(RecordParts::Leave);
     parts.finish(continued);
     timer.phase(PhaseRecord);
-    keepRecordedDraw(*recorder, record.resources, std::move(record.pipeline), std::move(record.framebuffer), inputs, std::move(record.targets), std::move(scratch), std::move(checkRecords), record.listed, record.completion, outcome);
+    // Kept again when a batch was submitted meanwhile: the draw's commands are in the open one.
+    if (recorder->Submissions() != keptBatch) recorder->Keep(kept);
+    keepRecordedDraw(*recorder, std::move(kept), record.resources, std::move(record.pipeline), std::move(record.framebuffer), inputs, std::move(record.targets), std::move(scratch), std::move(checkRecords), record.listed, record.completion, outcome);
     timer.phase(PhaseKeep);
     if (record.waited) {
         // The wait the dispatch path makes for such work (source 3, "address-based"): the
@@ -2259,7 +2271,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     APS5_LOG_CHARS_OUT_DEBUG("SubmitAndWait");
     timer.phase(PhaseRecord);
     if (recorded) {
-        keepRecordedDraw(*recorder, resources, pipeline, framebuffer, inputs, std::move(owners), std::move(scratch), std::move(checkRecords), listed, completion, outcome);
+        keepRecordedDraw(*recorder, nullptr, resources, pipeline, framebuffer, inputs, std::move(owners), std::move(scratch), std::move(checkRecords), listed, completion, outcome);
         timer.phase(PhaseKeep);
         if (outcome.waited) {
             // The wait the dispatch path makes for such work (source 3, "address-based"): the

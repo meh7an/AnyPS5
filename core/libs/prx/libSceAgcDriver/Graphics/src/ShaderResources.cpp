@@ -1004,6 +1004,17 @@ void ShaderResources::buildPrepare(std::span<const CompiledShader> shaders, cons
             Check(context.Function<PFN_vkCreateDescriptorSetLayout>("vkCreateDescriptorSetLayout")(context.device, &info, nullptr, &_layout), "vkCreateDescriptorSetLayout");
             ownsLayout = true;
         }
+        // A draw's own set (PrepareDrawBindings) holds what the layout holds, by type.
+        for (const auto& binding : bindings) {
+            auto* const last = drawSetSizes.data() + drawSetSizeCount;
+            auto* found = std::find_if(drawSetSizes.data(), last, [&](const VkDescriptorPoolSize& entry) { return entry.type == binding.layout.descriptorType; });
+            if (found == last) {
+                Require(drawSetSizeCount < drawSetSizes.size(), "a set uses more descriptor types than expected");
+                *found = {binding.layout.descriptorType, 0};
+                ++drawSetSizeCount;
+            }
+            found->descriptorCount += binding.layout.descriptorCount;
+        }
         if (!bindings.empty()) {
             // The set is sized from the plan: every image element becomes exactly one descriptor
             // when stage B looks it up.
@@ -2935,7 +2946,7 @@ namespace {
 // APS5_PROFILE_DRAW_PHASES: PrepareDrawBindings' parts per call, every 10 s.
 struct BindingParts {
     enum Part { Moved, Snapshots, Checks, Collect, Lookup, Make, Allocate, Copy, Write, Count };
-    static constexpr const char* Names[Count] = {"moved copies", "setup", "checks", "collect", "lookup", "make", "set allocation", "set copy", "set writes+keep"};
+    static constexpr const char* Names[Count] = {"moved copies", "setup", "checks", "collect", "lookup", "make", "set allocation", "set lists", "set update"};
     std::array<double, Count> us{};
     std::uint64_t calls = 0, sets = 0, moved = 0, reused = 0, made = 0, uploaded = 0;
     // Snapshot ranges by size: <=256, <=1K, <=4K, <=16K, <=64K, larger (count and bytes).
@@ -2998,8 +3009,8 @@ std::size_t ShaderResources::DrawUploadLimit() {
     return limit;
 }
 
-std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved) const {
-    if (_set == VK_NULL_HANDLE || usesBda) return {};
+bool ShaderResources::PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved, DrawBindings& result) const {
+    if (_set == VK_NULL_HANDLE || usesBda) return false;
     auto& parts = bindingParts();
     if (parts.enabled) {
         parts.lap = std::chrono::steady_clock::now();
@@ -3012,7 +3023,6 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         }
     } report{parts};
     const auto uploadLimit = DrawUploadLimit();
-    auto result = std::make_shared<DrawBindings>();
     InlineList<std::size_t, 16> selected;
     // A copy the draw reads: a slice of the upload chunk when small enough, else a buffer of its own.
     const auto ownCopy = [&](std::uint64_t address, std::size_t bytes) {
@@ -3023,11 +3033,8 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         }
         return DrawBindings::Snapshot{address, std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT), 0, bytes};
     };
-    // At most one snapshot per allocation: reserved with the first one, not grown push by push.
-    const auto keep = [&](DrawBindings::Snapshot snapshot) {
-        if (result->snapshots.empty()) result->snapshots.reserve(allocations.size());
-        result->snapshots.push_back(std::move(snapshot));
-    };
+    // At most one snapshot per allocation, in `selected`'s order.
+    const auto keep = [&](DrawBindings::Snapshot snapshot) { result.snapshots.push_back(std::move(snapshot)); };
     for (std::size_t index = 0; index < allocations.size(); ++index) {
         const auto& item = allocations[index];
         const auto override = std::find_if(moved.begin(), moved.end(), [&](const MovedBuffer& entry) { return entry.allocation == index; });
@@ -3087,62 +3094,56 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         if (parts.enabled) parts.mark(BindingParts::Make);
     }
     if (parts.enabled) parts.mark(BindingParts::Snapshots);
-    if (selected.empty()) return {};
+    if (selected.empty()) return false;
     Require(context.descriptorCache != nullptr, "draw snapshots require a descriptor cache");
-    // The set's descriptor counts by type (a handful of types; no map per draw).
-    std::array<VkDescriptorPoolSize, 16> sizes{};
-    std::size_t sizeCount = 0;
-    for (const auto& binding : bindings) {
-        auto* const last = sizes.data() + sizeCount;
-        auto* found = std::find_if(sizes.data(), last, [&](const VkDescriptorPoolSize& entry) { return entry.type == binding.layout.descriptorType; });
-        if (found == last) {
-            Require(sizeCount < sizes.size(), "a draw set uses more descriptor types than expected");
-            *found = {binding.layout.descriptorType, 0};
-            ++sizeCount;
-        }
-        found->descriptorCount += binding.layout.descriptorCount;
-    }
-    result->cache = context.descriptorCache;
-    result->allocation = result->cache->AllocateTransient(_layout, std::span<const VkDescriptorPoolSize>(sizes.data(), sizeCount));
-    Require(result->allocation.set != VK_NULL_HANDLE, "draw snapshot descriptor allocation failed");
+    result.cache = context.descriptorCache;
+    result.allocation = result.cache->AllocateTransient(_layout, std::span<const VkDescriptorPoolSize>(drawSetSizes.data(), drawSetSizeCount));
+    Require(result.allocation.set != VK_NULL_HANDLE, "draw snapshot descriptor allocation failed");
     if (parts.enabled) {
         ++parts.sets;
         parts.mark(BindingParts::Allocate);
     }
+    // The copies' buffers, the writes, and the template's descriptors around them: copied in runs
+    // of the elements no copy replaces, so the writes and copies are disjoint and go in one call.
+    InlineList<VkDescriptorBufferInfo, 16> infos;
+    for (const auto& snapshot : result.snapshots) infos.push_back({snapshot.buffer->Handle(), snapshot.offset, snapshot.bytes});
+    InlineList<VkWriteDescriptorSet, 16> writes;
     InlineList<VkCopyDescriptorSet, 16> copies;
-    for (const auto& binding : bindings) {
+    const auto copyRun = [&](const Binding& binding, std::uint32_t first, std::uint32_t end) {
+        if (end <= first) return;
         VkCopyDescriptorSet copy{VK_STRUCTURE_TYPE_COPY_DESCRIPTOR_SET};
         copy.srcSet = _set;
         copy.srcBinding = binding.layout.binding;
-        copy.dstSet = result->allocation.set;
+        copy.srcArrayElement = first;
+        copy.dstSet = result.allocation.set;
         copy.dstBinding = binding.layout.binding;
-        copy.descriptorCount = binding.layout.descriptorCount;
+        copy.dstArrayElement = first;
+        copy.descriptorCount = end - first;
         copies.push_back(copy);
-    }
-    const auto update = context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets");
-    update(context.device, 0, nullptr, static_cast<std::uint32_t>(copies.size()), copies.data());
-    if (parts.enabled) parts.mark(BindingParts::Copy);
-    InlineList<VkDescriptorBufferInfo, 16> infos;
-    for (const auto& snapshot : result->snapshots) infos.push_back({snapshot.buffer->Handle(), snapshot.offset, snapshot.bytes});
-    InlineList<VkWriteDescriptorSet, 16> writes;
+    };
     for (const auto& binding : bindings) {
-        for (std::size_t element = 0; element < binding.allocations.size(); ++element) {
+        std::uint32_t run = 0;
+        for (std::size_t element = 0; element < binding.allocations.size() && element < binding.layout.descriptorCount; ++element) {
             const auto found = std::find(selected.begin(), selected.end(), binding.allocations[element]);
             if (found == selected.end()) continue;
+            const auto at = static_cast<std::uint32_t>(element);
+            copyRun(binding, run, at);
+            run = at + 1;
             VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-            write.dstSet = result->allocation.set;
+            write.dstSet = result.allocation.set;
             write.dstBinding = binding.layout.binding;
-            write.dstArrayElement = static_cast<std::uint32_t>(element);
+            write.dstArrayElement = at;
             write.descriptorCount = 1;
             write.descriptorType = binding.layout.descriptorType;
             write.pBufferInfo = &infos[static_cast<std::size_t>(found - selected.begin())];
             writes.push_back(write);
         }
+        copyRun(binding, run, binding.layout.descriptorCount);
     }
-    update(context.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
-    recorder.Keep(result);
+    if (parts.enabled) parts.mark(BindingParts::Copy);
+    context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets")(context.device, static_cast<std::uint32_t>(writes.size()), writes.data(), static_cast<std::uint32_t>(copies.size()), copies.data());
     if (parts.enabled) parts.mark(BindingParts::Write);
-    return result;
+    return true;
 }
 
 void ShaderResources::Bind(VkCommandBuffer commands, VkPipelineBindPoint bindPoint, VkPipelineLayout layout) const {

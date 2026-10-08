@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BdaResources.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/InlineList.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Sampler.hpp"
 #include "Recompiler.hpp"
@@ -150,7 +151,8 @@ public:
         };
         DescriptorCache* cache = nullptr;
         DescriptorCache::SetAllocation allocation;
-        std::vector<Snapshot> snapshots;
+        // A handful per draw (about five on S3K): inline, no allocation of their own.
+        InlineList<Snapshot, 8> snapshots;
         ~DrawBindings();
     };
     // A data buffer's new words point into the draw's compiled stage (its binding's guest
@@ -161,7 +163,11 @@ public:
         std::size_t size;
         std::span<const std::uint32_t> words;
     };
-    std::shared_ptr<DrawBindings> PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved = {}) const;
+    // A draw that reads copies (snapshots, moved buffers) gets a set of its own: `bindings` (empty,
+    // owned by an object the caller already kept in the recorder's open batch, so that the set and
+    // the copies live until the batch completed) receives it. False when the object's set serves the
+    // draw as it is.
+    bool PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved, DrawBindings& bindings) const;
     // The largest draw snapshot (and moved data buffer) PrepareDrawBindings copies into the
     // recorder's upload chunk on every draw instead of keeping a buffer of its own (see
     // Recorder::DrawUpload); APS5_DRAW_UPLOAD_MAX, default 4096, 0 keeps every copy in its own buffer.
@@ -449,6 +455,10 @@ private:
     VkDescriptorPool pool = VK_NULL_HANDLE;
     // The cache pool the set was allocated from, freed back to it on release.
     VkDescriptorPool cachePool = VK_NULL_HANDLE;
+    // The layout's descriptor counts by type, which a draw's own set is allocated with
+    // (PrepareDrawBindings): taken once with the layout.
+    std::array<VkDescriptorPoolSize, 16> drawSetSizes{};
+    std::size_t drawSetSizeCount = 0;
     std::vector<Allocation> allocations;
     // Guest buffer elements bound read-only: each use of this object skips that many pending-write
     // notes (counted in MarkGpuWrites for the [buffers] line).
