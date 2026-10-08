@@ -21,6 +21,7 @@
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -30,7 +31,9 @@ namespace {
 
 constexpr std::uint64_t UnitBytes = 65536;
 constexpr std::size_t ReasonCount = static_cast<std::size_t>(PublishReason::Count);
-constexpr const char* ReasonNames[ReasonCount] = {"hook", "region", "indirect", "copy-src", "copy-dst", "fill", "fill-clear", "label", "keys", "scanout", "validate", "upload", "tail", "evict", "retire", "teardown"};
+constexpr const char* ReasonNames[ReasonCount] = {"hook", "region", "indirect", "copy-src", "copy-dst", "fill", "fill-clear", "label", "keys", "scanout", "validate", "upload", "tail", "evict", "retire", "teardown", "guard", "unguarded"};
+// GuestArenaGuard's page.
+constexpr std::uint64_t GuardPageBytes = 16384;
 
 std::uint64_t BudgetBytes() {
     static const std::uint64_t budget = [] {
@@ -68,6 +71,9 @@ struct Statistics {
     std::atomic<std::uint64_t> staleDroppedCpu{0}, staleDroppedDriver{0}, skippedInCompletion{0}, evictions{0}, lostOnRetire{0}, droppedOnRetire{0}, slabLost{0}, verified{0}, mismatches{0};
     // Buffer shadows: made (and their bytes), refused, uses bound, seeds recorded, writes marked.
     std::atomic<std::uint64_t> buffersMade{0}, buffersMadeBytes{0}, buffersRefused{0}, bufferUses{0}, bufferSeeds{0}, bufferSeedBytes{0}, bufferWrites{0};
+    // Their guards: armed (and their bytes), refused (the units published at once), host touches of
+    // a live slab's, of a guard its slab left behind, and imports refused over a guard.
+    std::atomic<std::uint64_t> guardsArmed{0}, guardsArmedBytes{0}, guardsRefused{0}, guardTouches{0}, staleTouches{0}, importsGuarded{0};
 };
 
 Statistics& Stats() {
@@ -130,6 +136,11 @@ struct Shadows {
     std::uint32_t liveSlabs = 0;
     // Counted for the [storage] segment: shadows retired and the slab bytes they returned.
     std::uint64_t retired = 0;
+    // The ranges of guarded buffer slabs that left their shadow (evicted, retired, replaced): their
+    // pages stay guarded, since the publish that took their units out may not have landed yet, until
+    // a host touch makes the range current and opens it (shadowTouch). Oldest first, a few dozen at
+    // most: a range dropped from the list opens a page per touch instead.
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> staleGuards;
 };
 
 Shadows& Registry() {
@@ -139,6 +150,36 @@ Shadows& Registry() {
 
 VkDeviceSize SlabBytes(const ShadowSlab& slab) {
     return static_cast<VkDeviceSize>(slab.units) * UnitBytes;
+}
+
+// The import range of a buffer slab's units.
+std::pair<std::uint64_t, std::uint64_t> slabRange(const UnitShadow& shadow, const ShadowSlab& slab) {
+    return {std::max(shadow.UnitBegin(slab.firstUnit), shadow.importBase), std::min(shadow.UnitBegin(slab.firstUnit + slab.units), shadow.ImportEnd())};
+}
+
+// [begin, end) leaves the stale guards (a slab guarding it again holds it). Under the registry mutex.
+void trimStaleGuards(Shadows& registry, std::uint64_t begin, std::uint64_t end) {
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> kept;
+    for (const auto& [from, to] : registry.staleGuards) {
+        if (to <= begin || end <= from) {
+            kept.emplace_back(from, to);
+            continue;
+        }
+        if (from < begin) kept.emplace_back(from, begin);
+        if (end < to) kept.emplace_back(end, to);
+    }
+    registry.staleGuards.swap(kept);
+}
+
+// A guarded buffer slab leaves its shadow: its range joins the stale guards. Under the registry mutex.
+void keepStaleGuard(Shadows& registry, const UnitShadow& shadow, const ShadowSlab& slab) {
+    if (!slab.guarded.load(std::memory_order_relaxed)) return;
+    const auto [begin, end] = slabRange(shadow, slab);
+    if (end <= begin) return;
+    trimStaleGuards(registry, begin, end);
+    constexpr std::size_t MaxStaleGuards = 32;
+    if (registry.staleGuards.size() >= MaxStaleGuards) registry.staleGuards.erase(registry.staleGuards.begin());
+    registry.staleGuards.emplace_back(begin, end);
 }
 
 // A shadow leaves the registry: its slabs (fixed and buffer) no longer count against the budget.
@@ -151,6 +192,7 @@ void forgetSlabs(Shadows& registry, const UnitShadow& shadow) {
             --registry.liveSlabs;
         }
     }
+    for (const auto& slab : shadow.bufferSlabs) keepStaleGuard(registry, shadow, *slab);
 }
 
 // The shadows overlapping [address, end): imports never overlap, so at most a few.
@@ -454,8 +496,12 @@ bool evictOne(Shadows& registry) {
     victim->Recount();
     registry.liveBytes -= SlabBytes(*victimSlab);
     --registry.liveSlabs;
-    if (isBuffer) victim->bufferSlabs.erase(buffer);
-    else victim->slabs[static_cast<std::size_t>(firstUnit / SlabUnits())].reset();
+    if (isBuffer) {
+        keepStaleGuard(registry, *victim, *victimSlab);
+        victim->bufferSlabs.erase(buffer);
+    } else {
+        victim->slabs[static_cast<std::size_t>(firstUnit / SlabUnits())].reset();
+    }
     Stats().evictions.fetch_add(1, std::memory_order_relaxed);
     return true;
 }
@@ -924,6 +970,113 @@ bool BufferShadowEnabled() {
     return enabled;
 }
 
+bool BufferShadowGuarded() {
+#ifdef _WIN32
+    return BufferShadowEnabled();
+#else
+    return false;
+#endif
+}
+
+#ifdef _WIN32
+namespace {
+
+// The guard handler of buffer shadows (armBufferGuard), on the thread whose host access touched a
+// guarded page, under the GpuMutex so that no write is recorded (and guarded) meanwhile.
+//  - A live slab's page: the slab's import range is made current (the flush hook waits for the
+//    recorded writes and publishes; every unit it left, such as a store's whole ones, is published
+//    and waited for here) and opens whole. A unit that could not be published (a store inside a
+//    completion, whose own stamp makes it stale) keeps the slab guarded: the page opens alone.
+//  - A page of a range a guarded slab left behind (staleGuards): the hook waits for the publish
+//    that took the units out, and the range opens.
+//  - Any other guarded page is made current alone, and the arena opens it.
+void shadowTouch(std::uintptr_t address, bool write, std::uintptr_t instruction) {
+    GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Hook);
+    std::lock_guard gpu(GuestMemory::GpuMutex());
+    auto& registry = Registry();
+    std::shared_ptr<ShadowSlab> slab;
+    std::uint64_t begin = 0, end = 0;
+    bool stale = false;
+    {
+        std::lock_guard lock(registry.mutex);
+        anyOverlapping(registry, address, address + 1, [&](const std::shared_ptr<UnitShadow>& shadow) {
+            const auto* held = shadow->BufferSlabOf(shadow->UnitOf(address));
+            if (held == nullptr || !(*held)->guarded.load(std::memory_order_relaxed)) return false;
+            slab = *held;
+            std::tie(begin, end) = slabRange(*shadow, *slab);
+            return true;
+        });
+        if (slab == nullptr) {
+            auto& guards = registry.staleGuards;
+            const auto found = std::find_if(guards.begin(), guards.end(), [&](const auto& range) { return range.first <= address && address < range.second; });
+            if (found != guards.end()) {
+                std::tie(begin, end) = *found;
+                guards.erase(found);
+                stale = true;
+            }
+        }
+    }
+    if (slab == nullptr && !stale) {
+        begin = address & ~(GuardPageBytes - 1);
+        end = begin + GuardPageBytes;
+    }
+    (slab != nullptr ? Stats().guardTouches : Stats().staleTouches).fetch_add(1, std::memory_order_relaxed);
+    static std::atomic<int> reports{0};
+    if (reports.fetch_add(1) < 8) std::fprintf(stderr, "[shadow] host %s of 0x%llx (thread %lu, code 0x%llx): %s 0x%llx+0x%llx made current\n", write ? "write" : "read", static_cast<unsigned long long>(address), GetCurrentThreadId(), static_cast<unsigned long long>(instruction), slab != nullptr ? "buffer slab" : stale ? "stale guard" : "page", static_cast<unsigned long long>(begin), static_cast<unsigned long long>(end - begin));
+    const auto bytes = static_cast<std::size_t>(end - begin);
+    GuestMemory::FlushGpuWrites(begin, bytes);
+    if (slab == nullptr && !stale) return;
+    if (slab != nullptr) {
+        if (PublishShadow(begin, bytes, PublishScope::Whole, PublishReason::Guard) != 0) {
+            if (auto* recorder = Recorder::Active()) {
+                Recorder::CountSync(2);
+                recorder->SyncThrough(begin, bytes, true);
+            }
+        }
+        if (AnyShadowedOverlaps(begin, bytes)) return;
+        slab->guarded.store(false, std::memory_order_relaxed);
+    }
+    GuestArena::GuestArenaUnguard_nid_postfix(reinterpret_cast<void*>(begin), bytes);
+}
+
+// After a write of [begin, end) through a buffer slab, under the GpuMutex: the slab's import pages
+// are guarded, so a host touch makes them current first (shadowTouch). A slab that cannot be guarded
+// (a page neither committed private memory nor a readable view, a range off the guard's page grid)
+// has the written units published at once: in queue order the copy lands before any later label, as
+// the import write it stands for would have.
+void armBufferGuard(const UnitShadow& shadow, const ShadowSlab& slab, std::uint64_t begin, std::uint64_t end) {
+    if (slab.guarded.load(std::memory_order_relaxed)) return;
+    static const bool installed = [] {
+        GuestArena::GuestArenaSetGuardHandler_nid_postfix(&shadowTouch);
+        return true;
+    }();
+    static_cast<void>(installed);
+    const auto [from, to] = slabRange(shadow, slab);
+    const auto bytes = static_cast<std::size_t>(to - from);
+    if (to > from && from % GuardPageBytes == 0 && to % GuardPageBytes == 0 && GuestArena::GuestArenaGuard_nid_postfix(reinterpret_cast<void*>(from), bytes)) {
+        slab.guarded.store(true, std::memory_order_relaxed);
+        {
+            auto& registry = Registry();
+            std::lock_guard lock(registry.mutex);
+            trimStaleGuards(registry, from, to);
+        }
+        Stats().guardsArmed.fetch_add(1, std::memory_order_relaxed);
+        Stats().guardsArmedBytes.fetch_add(bytes, std::memory_order_relaxed);
+        return;
+    }
+    Stats().guardsRefused.fetch_add(1, std::memory_order_relaxed);
+    static std::atomic<int> refusals{0};
+    if (refusals.fetch_add(1) < 4) {
+        MEMORY_BASIC_INFORMATION memory{};
+        VirtualQuery(reinterpret_cast<const void*>(from), &memory, sizeof(memory));
+        std::fprintf(stderr, "[shadow] cannot guard buffer slab 0x%llx+0x%llx (state 0x%lx type 0x%lx protection 0x%lx): its written units are published at once\n", static_cast<unsigned long long>(from), static_cast<unsigned long long>(bytes), memory.State, memory.Type, memory.Protect);
+    }
+    PublishShadow(begin, static_cast<std::size_t>(end - begin), PublishScope::Whole, PublishReason::Unguarded);
+}
+
+}
+#endif
+
 std::uint64_t BufferShadowMinBytes() {
     static const std::uint64_t bytes = [] {
         const char* text = std::getenv("APS5_BUFFER_SHADOW_MIN_MIB");
@@ -1025,10 +1178,11 @@ std::optional<BufferShadowBinding> BufferShadowFor(const Context& context, const
 void MarkBufferShadowWritten(const HostImport& import, const ShadowSlab& slab, std::uint64_t begin, std::uint64_t end, std::uint64_t generation) {
     if (!BufferShadowEnabled() || end <= begin || generation == 0) return;
     auto& registry = Registry();
-    std::uint64_t lost = 0;
+    std::shared_ptr<UnitShadow> shadow;
+    std::uint64_t lost = 0, marked = 0;
     {
         std::lock_guard lock(registry.mutex);
-        const auto shadow = find(registry, import);
+        shadow = find(registry, import);
         if (shadow == nullptr) return;
         const auto from = std::max(begin, shadow->importBase);
         const auto to = std::min(end, shadow->ImportEnd());
@@ -1043,6 +1197,7 @@ void MarkBufferShadowWritten(const HostImport& import, const ShadowSlab& slab, s
             }
             shadow->generation[unit] = generation;
             shadow->published[unit] = 0;
+            ++marked;
         }
         shadow->Recount();
     }
@@ -1055,6 +1210,9 @@ void MarkBufferShadowWritten(const HostImport& import, const ShadowSlab& slab, s
     // Builds reading the range in place see the change through their pending memos (fastRevalidate
     // and Revalidate's epoch gate), as after a retile: they publish it, or rebuild to bind the slab.
     StorageTexture::BumpPendingSerial();
+#ifdef _WIN32
+    if (marked != 0 && BufferShadowGuarded()) armBufferGuard(*shadow, slab, begin, end);
+#endif
 }
 
 bool BufferShadowServes(std::uint64_t begin, std::uint64_t end) {
@@ -1103,6 +1261,10 @@ std::string ShadowReport() {
     line += text;
     if (BufferShadowEnabled()) {
         std::snprintf(text, sizeof(text), ", buffers made %llu/%.1f (refused %llu), uses %llu, seeds %llu/%.1f, writes %llu", take(statistics.buffersMade), mib(take(statistics.buffersMadeBytes)), take(statistics.buffersRefused), take(statistics.bufferUses), take(statistics.bufferSeeds), mib(take(statistics.bufferSeedBytes)), take(statistics.bufferWrites));
+        line += text;
+    }
+    if (BufferShadowGuarded()) {
+        std::snprintf(text, sizeof(text), ", guards armed %llu/%.1f (refused %llu), host touches %llu (stale %llu), imports held %llu", take(statistics.guardsArmed), mib(take(statistics.guardsArmedBytes)), take(statistics.guardsRefused), take(statistics.guardTouches), take(statistics.staleTouches), take(statistics.importsGuarded));
         line += text;
     }
     if (ShadowVerify()) {
@@ -1282,13 +1444,29 @@ void ObserveBufferShadowWrite(std::uint64_t begin, std::uint64_t end) {
 #endif
 }
 
-void OpenShadowGuards(std::uint64_t begin, std::uint64_t end) {
+bool OpenShadowGuards(std::uint64_t begin, std::uint64_t end) {
 #ifdef _WIN32
-    if (!BufferShadowObserved() || end <= begin) return;
-    GuestArena::GuestArenaUnguard_nid_postfix(reinterpret_cast<void*>(begin), static_cast<std::size_t>(end - begin));
+    if (end <= begin) return true;
+    if (BufferShadowObserved()) {
+        GuestArena::GuestArenaUnguard_nid_postfix(reinterpret_cast<void*>(begin), static_cast<std::size_t>(end - begin));
+        return true;
+    }
+    if (!BufferShadowGuarded()) return true;
+    for (auto cursor = begin; cursor < end;) {
+        std::uintptr_t runEnd = 0;
+        std::uint32_t protection = 0;
+        if (GuestArena::GuestArenaGuardRun_nid_postfix(cursor, end, &runEnd, &protection)) {
+            Stats().importsGuarded.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+        if (runEnd <= cursor) break;
+        cursor = runEnd;
+    }
+    return true;
 #else
     static_cast<void>(begin);
     static_cast<void>(end);
+    return true;
 #endif
 }
 

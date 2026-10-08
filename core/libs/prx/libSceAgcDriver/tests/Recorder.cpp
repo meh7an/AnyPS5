@@ -1630,7 +1630,10 @@ void unitShadowTests(const Device& device, Recorder& recorder) {
 // slab; a publish lands the unit, the store's bytes and the seed's; a CPU store makes its unit stale
 // and the next binding seeds it, so a later publish keeps the CPU's byte; a stale unit's results lose
 // to the CPU's; retiles and bindings over part of the shadow are refused; a retire publishes the
-// units still registered. Off (the default), the primitives are inert.
+// units still registered. Guarded (Windows), a written slab's pages are guarded and hold an import
+// back: a host touch (a CPU read or store, a host read) publishes the slab first and opens it whole,
+// so the CPU's store lands over the results instead of beating them, and the guard a retired slab
+// left behind opens once its range is current. Off (the default), the primitives are inert.
 void bufferShadowTests(const Device& device, Recorder& recorder) {
     using namespace AgcDriver::GuestMemory;
     const auto& context = device.GetContext();
@@ -1697,6 +1700,29 @@ void bufferShadowTests(const Device& device, Recorder& recorder) {
         recorder.MarkCovered(VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
         MarkBufferShadowWritten(*import, *binding.slab, begin, begin + length, MarkWritten(begin, static_cast<std::size_t>(length)));
     };
+    const bool guards = BufferShadowGuarded();
+    const auto guardedAt = [](std::uint64_t at) {
+#ifdef _WIN32
+        std::uintptr_t runEnd = 0;
+        std::uint32_t protection = 0;
+        return GuestArena::GuestArenaGuardRun_nid_postfix(static_cast<std::uintptr_t>(at), static_cast<std::uintptr_t>(at + 1), &runEnd, &protection);
+#else
+        static_cast<void>(at);
+        return false;
+#endif
+    };
+    // The import's byte at `offset` as the GPU sees it: a CPU read of a guarded unit would publish
+    // the unit first.
+    const auto importByte = [&](std::uint64_t offset) {
+        recorder.Sync();
+        Buffer host(context, 1, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        CommandBatch batch(context);
+        CopyBuffer(context, batch.Handle(), import->buffer, offset, host.Handle(), 0, 1);
+        RecordMemoryBarrier(context, batch.Handle(), VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+        batch.SubmitAndWait();
+        host.Invalidate();
+        return static_cast<std::uint8_t>(host.Bytes()[0]);
+    };
     auto writer = BufferShadowFor(context, *import, first, end, true);
     Require(writer.has_value() && writer->pin != nullptr && writer->base == first && writer->slab->units == 2, "the writer's binding made no shadow over the range");
     Require(BufferShadowServes(first, end) && BufferShadowServes(first + 100, first + 200) && !BufferShadowServes(address, end), "the shadow does not serve exactly its units");
@@ -1705,8 +1731,8 @@ void bufferShadowTests(const Device& device, Recorder& recorder) {
     store(*writer, first, unit / 2, 0x22);
     writer->pin.reset();
     Require(AnyShadowedOverlaps(first, 1) && AnyShadowedOverlaps(first + unit - 1, 1) && !AnyShadowedOverlaps(first + unit, unit), "the written unit is not shadowed, or its neighbour is");
-    recorder.Sync();
-    Require(words[unit] == 0x11, "the shadowed store reached the import without a publish");
+    Require(guardedAt(first) == guards && guardedAt(first + unit) == guards, "the written slab's guard is wrong");
+    Require(importByte(unit) == 0x11, "the shadowed store reached the import without a publish");
     // A reader takes the same slab, its units current: nothing pinned.
     auto reader = BufferShadowFor(context, *import, first, end, false);
     Require(reader.has_value() && reader->slab == writer->slab && reader->pin == nullptr, "a reader did not take the writer's shadow");
@@ -1717,6 +1743,8 @@ void bufferShadowTests(const Device& device, Recorder& recorder) {
     recorder.Sync();
     Require(words[unit] == 0x22 && words[unit + unit / 2 - 1] == 0x22 && words[unit + unit / 2] == 0x11 && words[2 * unit - 1] == 0x11, "the published bytes are wrong");
     Require(!AnyShadowedOverlaps(first, unit) && UnchangedSince(first, unit, pre), "the publish left the unit shadowed, or stamped it");
+    // Guarded, those reads touched a slab with nothing left to publish: it opened whole.
+    Require(!guardedAt(first) && !guardedAt(first + unit), "the touch did not open the slab");
     // A CPU store into unit 2 makes it stale: the next binding seeds it, so the publish after a
     // later store keeps the CPU's byte.
     cpuStore(2 * unit + 4096, 0x55);
@@ -1727,7 +1755,22 @@ void bufferShadowTests(const Device& device, Recorder& recorder) {
     Require(PublishShadow(first + unit, unit, PublishScope::Whole, PublishReason::Hook) == 1, "the re-written unit was not published");
     recorder.Sync();
     Require(words[2 * unit] == 0x33 && words[2 * unit + 15] == 0x33 && words[2 * unit + 16] == 0x11 && words[2 * unit + 4096] == 0x55, "the CPU's store was not seeded into the shadow before the publish");
-    // Unpublished results of a unit the CPU then writes lose to the CPU's bytes.
+    // A host read of a written unit (WriteFile from it, say): guarded, it publishes the unit first.
+    {
+        auto binding = BufferShadowFor(context, *import, first, end, true);
+        Require(binding.has_value(), "the shadow refused a writer before the host read");
+        store(*binding, first + unit + 32, 16, 0x5a);
+    }
+    if (guards) {
+        Require(guardedAt(first + unit) && importByte(2 * unit + 32) == 0x11, "the unit written before the host read is not guarded, or reached the import");
+        GuestArena::OpenForHostRead(reinterpret_cast<const void*>(first + unit + 32), 16);
+        Require(!guardedAt(first + unit) && !AnyShadowedOverlaps(first + unit, unit) && importByte(2 * unit + 32) == 0x5a, "the host read did not publish the unit and open it");
+    } else {
+        Require(PublishShadow(first + unit, unit, PublishScope::Whole, PublishReason::Hook) == 1, "the unit written before the host read was not published");
+    }
+    // Unpublished results of a unit the CPU then writes: unguarded, they lose to the CPU's bytes;
+    // guarded, the CPU's store is a host touch, so they reach the import first and the store lands
+    // over them, as over a write made in place.
     {
         auto binding = BufferShadowFor(context, *import, first, end, true);
         Require(binding.has_value(), "the shadow refused a writer");
@@ -1737,7 +1780,7 @@ void bufferShadowTests(const Device& device, Recorder& recorder) {
     cpuStore(unit + 8192, 0x66);
     Require(PublishShadow(first, unit, PublishScope::Whole, PublishReason::Hook) == 0, "a stale unit's results were published over the CPU's store");
     recorder.Sync();
-    Require(words[unit] == 0x22 && words[unit + 8192] == 0x66, "the stale unit's publish overwrote the import");
+    Require(words[unit] == (guards ? 0x44 : 0x22) && words[unit + 16] == 0x22 && words[unit + 8192] == 0x66, "the unit's results and the CPU's store are wrong");
     // A retile never lands in a buffer shadow's units; outside them it still does.
     Require(!ShadowDestinationFor(context, *import, first, first + unit / 2).has_value(), "a retile landed in a buffer shadow's units");
     Require(ShadowDestinationFor(context, *import, address + 4 * unit, address + 5 * unit).has_value(), "a retile outside the buffer shadow was refused");
@@ -1751,6 +1794,8 @@ void bufferShadowTests(const Device& device, Recorder& recorder) {
         store(*binding, first + unit, 16, 0x78);
     }
     Require(AnyShadowedOverlaps(first, 1) && AnyShadowedOverlaps(first + unit, 1), "units 1 and 2 are not shadowed before the retire");
+    // Guarded pages hold an import of the range back (its pages must be accessible to pin).
+    Require(OpenShadowGuards(first, end) != guards, "a guarded range was open to an import");
     {
         GuestAllocations::Mutation mutation;
         mutation.Remove(block);
@@ -1760,6 +1805,8 @@ void bufferShadowTests(const Device& device, Recorder& recorder) {
     Require(!AnyShadowedOverlaps(address, bytes) && !BufferShadowServes(first, end), "the retired import's buffer shadow survived");
     recorder.Sync();
     Require(words[unit] == 0x77 && words[unit + 16] == 0x22 && words[unit + 8192] == 0x66, "the retire did not publish the unit still registered");
+    // Guarded, that read touched the guard the retired slab left behind: its whole range opened.
+    Require(!guardedAt(first) && !guardedAt(first + unit), "the retired slab's guard did not open");
     Require(words[2 * unit] == 0x33, "the retire published a unit whose memory is no longer registered");
     std::cout << "buffer shadows verified\n";
 }

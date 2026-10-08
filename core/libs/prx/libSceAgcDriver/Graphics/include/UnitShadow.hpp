@@ -48,7 +48,7 @@ bool UnitShadowEnabled();
 // byte of the range; PartialUnits: a writer of the range (only units it covers partly are published,
 // so the neighbours' results in the rest of the unit reach the import before the write stamps it).
 enum class PublishScope : std::uint8_t { None, Whole, PartialUnits };
-enum class PublishReason : std::uint8_t { Hook, Region, Indirect, CopySource, CopyDestination, Fill, FillClear, Label, Keys, Scanout, Validate, Upload, TailMip, Evict, Retire, Teardown, Count };
+enum class PublishReason : std::uint8_t { Hook, Region, Indirect, CopySource, CopyDestination, Fill, FillClear, Label, Keys, Scanout, Validate, Upload, TailMip, Evict, Retire, Teardown, Guard, Unguarded, Count };
 // The reason for a FlushPending reason string ("memory access" -> Hook, ...).
 PublishReason PublishReasonFor(const char* flushReason);
 
@@ -66,6 +66,9 @@ struct ShadowSlab {
     std::uint64_t lastUse = 0;
     // Destinations handed out for a write-back in progress: such a slab is never evicted.
     std::atomic<std::uint32_t> pins{0};
+    // A buffer slab whose import pages are guarded (BufferShadowGuarded): set when a write's units
+    // are marked, cleared when a host touch made them current and opened them. Under the GpuMutex.
+    mutable std::atomic<bool> guarded{false};
 };
 
 // Holds one pin of a slab (ShadowDestination::pin).
@@ -157,10 +160,13 @@ bool ShadowVerify();
 // crossing PCIe for it. One slab of the import's shadow spans the range whole, and its units follow
 // every rule above: a unit stamped since its generation is seeded from the import before a use, a
 // writer's units hold the newest bytes unpublished, and every host-facing consumer publishes them as
-// it publishes retiled units (image retiles never land in a buffer slab's units). Off by default:
-// the title's own CPU code reads guest memory without the flush hook, so a native read of such a
-// range after the GPU's label would see the import's older bytes.
+// it publishes retiled units (image retiles never land in a buffer slab's units). The title's own
+// CPU code reads guest memory without the flush hook, so on Windows a written slab's import pages
+// are guarded (GuestArenaGuard): a host touch publishes the slab whole, waits for it and opens it,
+// and a slab that cannot be guarded has its written units published at once. Off by default.
 bool BufferShadowEnabled();
+// Whether buffer shadows guard their import pages (Windows, buffer shadows on).
+bool BufferShadowGuarded();
 // The smallest range bound through a buffer shadow (APS5_BUFFER_SHADOW_MIN_MIB, default 8).
 std::uint64_t BufferShadowMinBytes();
 struct BufferShadowBinding {
@@ -193,8 +199,11 @@ bool BufferShadowServes(std::uint64_t begin, std::uint64_t end);
 // host API reading a guarded range (WriteFile from it, say) would fail instead.
 bool BufferShadowObserved();
 void ObserveBufferShadowWrite(std::uint64_t begin, std::uint64_t end);
-// Opens the guarded units of [begin, end): an import pins accessible pages only.
-void OpenShadowGuards(std::uint64_t begin, std::uint64_t end);
+// Before an import of [begin, end), which pins accessible pages only: whether the range is open.
+// Observed guards are opened; a guarded buffer shadow's are not (making the bytes current takes the
+// flush hook, which must not run under the import table's lock), so the import waits until a host
+// touch has made the range current and opened it.
+bool OpenShadowGuards(std::uint64_t begin, std::uint64_t end);
 
 }
 

@@ -367,8 +367,9 @@ const HostImport* importAllocation(const Context& context, HostImports& state, s
     entry.range = leasedRangeOwner(lease, base);
 #ifdef _WIN32
     // Drivers pin imported pages, so every page must be committed and accessible: guarded units
-    // (OpenShadowGuards) open first.
-    OpenShadowGuards(base, base + bytes);
+    // open first, or the import waits for a host touch to open them (OpenShadowGuards). Not a
+    // failure: a later lookup imports the range.
+    if (!OpenShadowGuards(base, base + bytes)) return nullptr;
     bool writable = true;
     bool readOnly = true;
     MEMORY_BASIC_INFORMATION refused{};
