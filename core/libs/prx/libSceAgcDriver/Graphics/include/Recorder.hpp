@@ -49,7 +49,8 @@ struct PassBinding {
 // signals a timeline semaphore with its serial: a thread can then wait for "everything submitted
 // up to serial S" WITHOUT the mutex (WaitSerial), because the monotonic value cannot be reset or
 // recycled the way the pooled batch fences are, and afterwards run the completions under the mutex
-// (FinishUpTo). Without timeline semaphores callers use the locked Sync as before.
+// (FinishUpTo). Without timeline semaphores callers use the locked Sync as before. With them the
+// batches carry no fence: a batch has completed when the timeline reached its serial.
 class Recorder {
 public:
     // `timelineSemaphores`: the device enabled VK_KHR_timeline_semaphore (WaitSerial is usable).
@@ -524,13 +525,15 @@ public:
     std::vector<Completed> CompletedBatches(std::uint64_t afterSerial, std::uint64_t throughSerial, std::size_t& missing) const;
     // The newest submitted serial and its vkQueueSubmit time (ring mutex only).
     std::uint64_t NewestSubmitted(std::chrono::steady_clock::time_point* submittedAt = nullptr) const;
-    // In-flight batches whose fence has not signaled (one status query each); under the mutex.
+    // In-flight batches the GPU has not completed (a fence status query each, or one timeline read);
+    // under the mutex.
     std::size_t UnsignaledBatches() const;
     static bool FlipReadCheck();
 
 private:
     struct Batch {
         VkCommandBuffer commands = VK_NULL_HANDLE;
+        // None when the recorder is fenceless (the timeline tells the batch's completion).
         VkFence fence = VK_NULL_HANDLE;
         std::vector<std::shared_ptr<void>> kept;
         std::size_t keptBytes = 0;
@@ -680,9 +683,11 @@ private:
     std::uint32_t beginTiming(std::uint64_t key);
     // Vulkan entry points resolved once (constructor): the loader's vkGetDeviceProcAddr is a name
     // lookup per call, paid by every reap, store and submit otherwise. APS5_NO_PROC_TABLE=1 leaves
-    // them null and resolves per call as before; vkWaitSemaphoresKHR stays a lazy lookup (timeline
-    // semaphores are optional).
+    // them null and resolves per call as before; the timeline's two are resolved once it exists
+    // (timeline semaphores are optional).
     PFN_vkGetFenceStatus getFenceStatus = nullptr;
+    PFN_vkGetSemaphoreCounterValueKHR getSemaphoreCounterValue = nullptr;
+    PFN_vkWaitSemaphoresKHR waitSemaphores = nullptr;
     PFN_vkResetFences resetFences = nullptr;
     PFN_vkWaitForFences waitForFences = nullptr;
     PFN_vkCmdUpdateBuffer cmdUpdateBuffer = nullptr;
@@ -702,6 +707,11 @@ private:
         return resolved != nullptr ? resolved : context.Function<TFunction>(name);
     }
     VkResult fenceStatus(VkFence fence) const { return function(getFenceStatus, "vkGetFenceStatus")(context.device, fence); }
+    // Whether the GPU completed a submitted batch: the timeline reached its serial (read again only
+    // when the value last read falls short of it), or its fence signaled.
+    bool gpuDone(const Batch& batch) const;
+    // Reads the timeline's value into `reachedSerial` and returns it.
+    std::uint64_t readTimeline() const;
     void recordBarrier(VkCommandBuffer commands, VkPipelineStageFlags sourceStage, VkPipelineStageFlags destinationStage, VkAccessFlags sourceAccess, VkAccessFlags destinationAccess) const;
     // Opens a batch when none is open, without closing a store run (Commands() does both).
     void ensureOpen();
@@ -755,6 +765,12 @@ private:
 
     Context context;
     VkSemaphore timeline = VK_NULL_HANDLE;
+    // The batches signal the timeline alone (APS5_BATCH_FENCES=1 gives each a fence as well, as
+    // without a timeline): one kernel signal less per submit, and one timeline read per Reap in
+    // place of a fence query per batch.
+    bool fenceless = false;
+    // The timeline value last read (under the mutex): the batches up to it completed.
+    mutable std::uint64_t reachedSerial = 0;
     // Identity for a thread that released the mutex around a wait (syncThroughUnlocked): the
     // recorder may have been torn down meanwhile, so it is looked up by this id, not by pointer.
     std::uint64_t id = 0;
@@ -783,8 +799,8 @@ private:
     std::uint64_t submissions = 0;
     std::size_t inFlightKeptBytes = 0;
     std::uint64_t writeNoteCount = 0;
-    // Command buffers and fences of completed batches, reused by later ones (hundreds of batches per
-    // frame would otherwise allocate and free their objects each time).
+    // Command buffers and fences (none when fenceless) of completed batches, reused by later ones
+    // (hundreds of batches per frame would otherwise allocate and free their objects each time).
     std::vector<std::pair<VkCommandBuffer, VkFence>> spare;
     std::vector<VkQueryPool> sparePools;
     mutable AgcDriver::Mutex completedMutex;

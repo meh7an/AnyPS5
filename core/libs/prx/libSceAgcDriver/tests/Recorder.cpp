@@ -181,6 +181,20 @@ public:
                 minLod.pNext = address.pNext;
                 address.pNext = &minLod;
             }
+            // Timeline semaphores when offered, for the fenceless recorder (timelineTests).
+            VkPhysicalDeviceTimelineSemaphoreFeaturesKHR timelineFeatures{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES_KHR};
+            if (hasExtension(VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME)) {
+                VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &timelineFeatures};
+                function<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(context.physical, &features);
+                timeline = timelineFeatures.timelineSemaphore == VK_TRUE;
+            }
+            timelineFeatures = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES_KHR};
+            timelineFeatures.timelineSemaphore = VK_TRUE;
+            if (timeline) {
+                extensionsEnabled.push_back(VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME);
+                timelineFeatures.pNext = address.pNext;
+                address.pNext = &timelineFeatures;
+            }
             VkDeviceCreateInfo device{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &address};
             device.queueCreateInfoCount = 1;
             device.pQueueCreateInfos = &queue;
@@ -207,6 +221,7 @@ public:
 
     ~Device() { release(); }
     const Context& GetContext() const { return context; }
+    bool Timeline() const { return timeline; }
     void WaitQueue() const { Check(context.Function<PFN_vkQueueWaitIdle>("vkQueueWaitIdle")(context.queue), "vkQueueWaitIdle"); }
 
 private:
@@ -232,6 +247,7 @@ private:
     PFN_vkGetInstanceProcAddr instanceProc = nullptr;
     VkInstance instance = VK_NULL_HANDLE;
     Context context{};
+    bool timeline = false;
 };
 
 using Kind = Recorder::ReadKind;
@@ -280,6 +296,43 @@ void writeSettledTests(const Device& device, Recorder& recorder) {
     Require(!recorder.PendingWriteSettled(0x50000, 0x100) && recorder.PendingWriteSettled(0x50000, 0x80), "a later open write over the range still counts as settled");
     recorder.Sync();
     Require(recorder.Idle() && !recorder.PendingWriteOverlaps(0x50000, 0x100), "writes outlived their batches");
+}
+
+// A recorder with a timeline has fenceless batches: a batch completed when the timeline reached its
+// serial, which the settled and signaled queries, Reap, the waits of Sync and FinishUpTo and the
+// pooled command buffers go by.
+void timelineTests(const Device& device) {
+    if (!device.Timeline()) {
+        std::cout << "no timeline semaphores: fenceless batches untested\n";
+        return;
+    }
+    Recorder recorder(device.GetContext(), true);
+    Require(recorder.HasTimeline(), "the recorder made no timeline");
+    recorder.NotePendingWrite(0x60000, 0x100);
+    recorder.Submit();
+    device.WaitQueue();
+    Require(recorder.PendingWriteSettled(0x60000, 0x100) && recorder.UnsignaledBatches() == 0, "a completed fenceless batch is not settled");
+    Require(!recorder.Idle(), "a settled query reaped the fenceless batch");
+    Require(recorder.Reap() && recorder.Idle() && !recorder.PendingWriteOverlaps(0x60000, 0x100), "Reap left a completed fenceless batch in flight");
+    for (std::uint64_t i = 0; i < 3; ++i) {
+        recorder.NotePendingWrite(0x60000 + 0x100 * i, 0x100);
+        recorder.Submit();
+    }
+    recorder.Sync();
+    Require(recorder.Idle() && !recorder.PendingWriteOverlaps(0x60000, 0x300), "Sync left fenceless batches in flight");
+    recorder.NotePendingWrite(0x60000, 0x100);
+    const auto serial = recorder.SubmitAndEpoch();
+    recorder.WaitSerial(serial);
+    recorder.FinishUpTo(serial);
+    Require(recorder.Idle(), "FinishUpTo left a fenceless batch in flight");
+    // A run of batches reuses the pooled command buffers.
+    for (int i = 0; i < 200; ++i) {
+        recorder.NotePendingWrite(0x60000, 0x10);
+        recorder.Submit();
+        recorder.Reap();
+    }
+    recorder.Sync();
+    Require(recorder.Idle() && recorder.Submissions() == 205, "a run of fenceless batches did not complete");
 }
 
 // Completion counting: a write-back completion (OnComplete) is pending until its batch finished;
@@ -3221,6 +3274,7 @@ int main() {
         recorder.Activate();
         readTrackingTests(device, recorder);
         writeSettledTests(device, recorder);
+        timelineTests(device);
         completionCountTests(device, recorder);
         afterRecordedWorkTests(device, recorder);
         batchStampTests(recorder);
