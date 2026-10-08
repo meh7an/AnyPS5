@@ -61,7 +61,14 @@ bool GuestArenaSharedBacking_nid_postfix(std::uintptr_t address, std::size_t byt
 #endif
 bool GuestArenaBeginHostWrite_nid_postfix(void* pointer, std::size_t bytes);
 void GuestArenaEndHostWrite_nid_postfix(void* pointer, std::size_t bytes);
+// Before a host API reads [pointer, pointer + bytes) of guest memory (WriteFile from it, say): it
+// cannot take a guard's fault, so guarded pages become current (the guard handler) and open first.
+void GuestArenaOpenForHostRead_nid_postfix(const void* pointer, std::size_t bytes);
 
+}
+
+inline void OpenForHostRead(const void* pointer, std::size_t bytes) {
+    GuestArenaOpenForHostRead_nid_postfix(pointer, bytes);
 }
 
 class HostWrite {

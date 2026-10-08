@@ -370,6 +370,7 @@ int64_t APS5_VABI pwrite_nid_disambig1_nid_postfix(int d, const void* buf, size_
     if (offset < 0) {
         APS5_INVALID_ARG_EX;
     }
+    GuestArena::OpenForHostRead(buf, nbytes);
     auto n = NativePwrite(d, buf, nbytes, offset);
     if (n < 0) {
         throw std::runtime_error(std::string(__func__) + ": pwrite failed, fd=" + std::to_string(d) + ", errno=" + std::to_string(errno));
@@ -545,6 +546,9 @@ static std::int64_t TransferIovecs(int d, const KernelIovec* iov, int iovcnt, co
     if (offset != nullptr && total > static_cast<std::size_t>(std::numeric_limits<std::int64_t>::max() - *offset)) return SceErrorFromErrno(GUEST_EINVAL);
     std::deque<GuestArena::HostWrite> destinations;
     if (!write && !OpenIovecs(iov, iovcnt, destinations)) return SceErrorFromErrno(GUEST_EFAULT);
+    if (write) {
+        for (int i = 0; i < iovcnt; ++i) GuestArena::OpenForHostRead(iov[i].base, iov[i].length);
+    }
     if (total == 0) {
         char none = 0;
         const auto result = offset != nullptr ? NativePositioned(d, &none, 0, *offset, write) : NativeTransfer(d, &none, 0, write);

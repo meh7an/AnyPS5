@@ -149,7 +149,7 @@ public:
     bool BeginHostWrite(std::uintptr_t address, std::size_t bytes) {
         // A host write (file I/O into guest memory, say) cannot take a guard's fault: guarded pages
         // become current and open first.
-        openForHostWrite(address, bytes);
+        openGuarded(address, bytes, true);
         std::lock_guard lock(mutex);
         const auto first = views.lower_bound(address & ~(pageBytes - 1));
         const auto end = address + bytes;
@@ -325,9 +325,16 @@ public:
         return true;
     }
 
-    // Before a host write into [address, address + bytes) (BeginHostWrite): the handler makes each
-    // guarded page's bytes current, and the page opens.
-    void openForHostWrite(std::uintptr_t address, std::size_t bytes) {
+    // Before a host API reads [address, address + bytes) of guest memory (OpenForHostRead).
+    void OpenForHostRead(std::uintptr_t address, std::size_t bytes) {
+        openGuarded(address, bytes, false);
+    }
+
+    // Before a host access to [address, address + bytes) that cannot take a guard's fault (a host
+    // write, BeginHostWrite, or a host read, OpenForHostRead): the handler makes each guarded page's
+    // bytes current, and the page opens. A page the handler opened along with an earlier one is not
+    // handed to it again.
+    void openGuarded(std::uintptr_t address, std::size_t bytes, bool write) {
         std::vector<std::uintptr_t> guarded;
         {
             std::lock_guard lock(mutex);
@@ -337,7 +344,11 @@ public:
         }
         const auto handler = guardHandler.load(std::memory_order_acquire);
         for (const auto page : guarded) {
-            if (handler != nullptr) handler(std::max(page, address), true, 0);
+            {
+                std::lock_guard lock(mutex);
+                if (!guardedPage(page)) continue;
+            }
+            if (handler != nullptr) handler(std::max(page, address), write, 0);
             std::lock_guard lock(mutex);
             openPage(page);
         }

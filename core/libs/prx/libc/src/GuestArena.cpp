@@ -294,6 +294,17 @@ void GuestArenaEndHostWrite_nid_postfix(void* pointer, std::size_t bytes) {
 #endif
 }
 
+void GuestArenaOpenForHostRead_nid_postfix(const void* pointer, std::size_t bytes) {
+#ifdef _WIN32
+    // Guards live in the arena only.
+    if (!Arena::Get().Contains(pointer, bytes)) return;
+    WindowsMappings::Get().OpenForHostRead(reinterpret_cast<std::uintptr_t>(pointer), bytes);
+#else
+    (void)pointer;
+    (void)bytes;
+#endif
+}
+
 #ifndef _WIN32
 namespace {
 

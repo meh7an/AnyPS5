@@ -10,6 +10,7 @@
 #include <cerrno>
 #endif
 #include "prx/libc/include/general/VabiMacros.hpp"
+#include "prx/libc/include/GuestArena.hpp"
 #include "prx/libkernel/Socket/include/SocketRuntime.hpp"
 #include <algorithm>
 #include <climits>
@@ -288,6 +289,7 @@ std::int64_t APS5_VABI send_nid_postfix(int descriptor, const void* buffer, std:
     if (flags != 0) return Fail(45);
     if (length > INT_MAX) return Fail(40);
     if (!buffer && length) return Fail(14);
+    GuestArena::OpenForHostRead(buffer, static_cast<std::size_t>(length));
     const auto result = ::send(socket->value, static_cast<const char*>(buffer), static_cast<int>(length), 0);
     return result < 0 ? Fail(NativeError()) : result;
 }
@@ -362,6 +364,7 @@ std::int64_t APS5_VABI sendto_nid_postfix(int descriptor, const void* buffer, st
     if (flags != 0) return Fail(45);
     if (length > INT_MAX) return Fail(40);
     if (!buffer && length) return Fail(14);
+    GuestArena::OpenForHostRead(buffer, static_cast<std::size_t>(length));
     int result;
     if (!address) {
         if (addressLength != 0) return Fail(22);

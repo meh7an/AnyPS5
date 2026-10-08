@@ -83,6 +83,7 @@ std::int64_t NativePread(std::int32_t fd, void* buf, std::size_t nbyte, std::int
 }
 
 std::int64_t NativePwrite(std::int32_t fd, const void* buf, std::size_t nbyte, std::int64_t offset) {
+    GuestArena::OpenForHostRead(buf, nbyte);
 #ifdef _WIN32
     if (nbyte > static_cast<std::size_t>(std::numeric_limits<unsigned int>::max())) {
         throw std::runtime_error("sceKernelAioSubmitWriteCommands: nbytes exceeds platform limit");

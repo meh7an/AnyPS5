@@ -64,7 +64,8 @@ bool guarded(std::uintptr_t address, std::uintptr_t* end = nullptr, std::uint32_
 // The guest arena's guards (GuestArenaGuard): a guarded unit reads and writes as before through the
 // fault path, which calls the handler first; the driver's page classification counts a guarded
 // page at its logical protection; a protection change keeps the guard with the new logical
-// protection; a reset drops it.
+// protection; a host read (GuestArenaOpenForHostRead) reaches the handler and opens first; a reset
+// drops it.
 int PageGuardTests() {
     void* block = GuestArena::GuestArenaAllocate_nid_postfix(BlockBytes, Unit);
     GuestArena::GuestArenaCommit_nid_postfix(block, BlockBytes, PAGE_READWRITE, BlockBytes);
@@ -109,6 +110,18 @@ int PageGuardTests() {
     VirtualQuery(reinterpret_cast<const void*>(base + 5 * Unit), &memory, sizeof(memory));
     Require(memory.Protect == PAGE_READONLY, "page guards: the opened unit is not read-only");
     GuestArena::GuestArenaCommit_nid_postfix(reinterpret_cast<void*>(base + 5 * Unit), Unit, PAGE_READWRITE, Unit);
+
+    // A host read over units 2 and 3 (WriteFile from them, say): announced to the handler (no
+    // instruction) before it reads, once per unit while the handler opens whole units (the pages it
+    // opened with the first are not handed to it again), and open after.
+    Require(GuestArena::GuestArenaGuard_nid_postfix(reinterpret_cast<void*>(base + 2 * Unit), 2 * Unit), "page guards: units 2 and 3 were refused again");
+    touches.clear();
+    GuestArena::GuestArenaOpenForHostRead_nid_postfix(reinterpret_cast<const void*>(base + 2 * Unit + 100), 2 * Unit - 200);
+    Require(touches.size() == 2 && !touches[0].write && touches[0].address == base + 2 * Unit + 100 && !touches[1].write && touches[1].address == base + 3 * Unit, "page guards: the host read was not announced once per unit");
+    Require(!guarded(base + 2 * Unit) && !guarded(base + 4 * Unit - 16384) && readByte(base + 3 * Unit + 30000) == 0x5a && touches.size() == 2, "page guards: the host read left a page guarded");
+    // Memory outside the arena has no guards: nothing is announced.
+    GuestArena::GuestArenaOpenForHostRead_nid_postfix(outside.data(), outside.size());
+    Require(touches.size() == 2, "page guards: a host read outside the arena reached the handler");
 
     // Unguard opens; a reset drops what is left.
     Require(GuestArena::GuestArenaGuard_nid_postfix(reinterpret_cast<void*>(base + 6 * Unit), 2 * Unit), "page guards: units 6 and 7 were refused");
