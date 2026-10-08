@@ -16,6 +16,9 @@ struct DrawScratch {
     std::vector<ShaderRecompiler::MemoryRegion> memory;
     std::vector<ShaderRecompiler::LinkedProgram> linked;
     std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>> vertexInfos;
+    // One recompile request per stage, filled in place by compileDrawStage (never cleared: a
+    // request built anew cleared its 1.6 KB first, for every stage of every draw).
+    std::vector<ShaderRecompiler::RecompileRequest> requests;
     std::vector<std::vector<Graphics::DecodeRead>> decodeReads;
     std::vector<std::shared_ptr<const ShaderRecompiler::RecompileResult>> results;
     std::vector<Graphics::CompiledShader> stages;
@@ -226,6 +229,8 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
 
     auto& vertexInfos = scratch->vertexInfos;
     vertexInfos.resize(programs.size());
+    auto& requests = scratch->requests;
+    if (requests.size() < programs.size()) requests.resize(programs.size());
     auto& decodeReads = scratch->decodeReads;
     decodeReads.resize(programs.size());
     const auto decodeVertexInfo = [&](std::size_t i) {
@@ -313,7 +318,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             memory.insert(memory.end(), matchedRegions[i].begin(), matchedRegions[i].end());
         } else {
             resultIndex[i] = results.size();
-            results.push_back(compileDrawStage(i, pushCursorBytes, queue, submission, programs, graphics, pixel, vertexInfos, memory, linked, drawParameters, localDevice, shaderMemory, stageCaptures, recompiled, drawHit, wantRegions, matched, matchedRegions, profile, dumpTarget, dumpSlot1, captures, phaseTiming, phaseMs, rejected));
+            results.push_back(compileDrawStage(i, pushCursorBytes, queue, submission, programs, graphics, pixel, vertexInfos, requests, memory, linked, drawParameters, localDevice, shaderMemory, stageCaptures, recompiled, drawHit, wantRegions, matched, matchedRegions, profile, dumpTarget, dumpSlot1, captures, phaseTiming, phaseMs, rejected));
             if (!rejected.empty()) return DrawVerdict::Rejected;
             programResults[i] = results.back().get();
         }
@@ -435,7 +440,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
                 const auto* previous = result.get();
                 const auto pushBytes = result->pushConstants.size();
                 decodeVertexInfo(programIndex);
-                result = compileDrawStage(programIndex, pushOffsets[programIndex], queue, submission, programs, graphics, pixel, vertexInfos, memory, linked, drawParameters, localDevice, shaderMemory, stageCaptures, recompiled, drawHit, wantRegions, matched, matchedRegions, profile, dumpTarget, dumpSlot1, captures, phaseTiming, phaseMs, rejected);
+                result = compileDrawStage(programIndex, pushOffsets[programIndex], queue, submission, programs, graphics, pixel, vertexInfos, requests, memory, linked, drawParameters, localDevice, shaderMemory, stageCaptures, recompiled, drawHit, wantRegions, matched, matchedRegions, profile, dumpTarget, dumpSlot1, captures, phaseTiming, phaseMs, rejected);
                 if (!rejected.empty()) return DrawVerdict::Rejected;
                 require(result->pushConstants.size() == pushBytes, "patched program changed its push constant layout");
                 // The stages name the program's result by address: repoint them at the new one.

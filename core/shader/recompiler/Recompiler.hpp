@@ -153,13 +153,74 @@ struct ShaderVertexStageInfo {
     bool fetchEmbedded;
 };
 
+// A stage's inputs a request holds, read as an optional: a value of its own, or one borrowed from
+// storage that outlives every use of the request (a draw's decoded vertex inputs while its stages
+// compile), so the request a draw builds for each stage copies none of its kilobyte. A copy always
+// owns its value: a request kept past the draw (a capture, a cache entry) never borrows.
+template<typename T>
+class StageInfo {
+public:
+    StageInfo() = default;
+    StageInfo(std::nullopt_t) {}
+    StageInfo(const T& value) : owned(value) {}
+    StageInfo(const std::optional<T>& value) : owned(value) {}
+    StageInfo(const StageInfo& other) : owned(other.copy()) {}
+    StageInfo& operator=(const StageInfo& other) {
+        if (this != &other) {
+            owned = other.copy();
+            borrowed = nullptr;
+        }
+        return *this;
+    }
+    StageInfo& operator=(const T& value) {
+        owned = value;
+        borrowed = nullptr;
+        return *this;
+    }
+    StageInfo& operator=(const std::optional<T>& value) {
+        owned = value;
+        borrowed = nullptr;
+        return *this;
+    }
+    StageInfo& operator=(std::nullopt_t) {
+        owned.reset();
+        borrowed = nullptr;
+        return *this;
+    }
+    // Refers to `value` (none when null) until the next assignment.
+    void Borrow(const T* value) {
+        owned.reset();
+        borrowed = value;
+    }
+    bool has_value() const { return borrowed != nullptr || owned.has_value(); }
+    explicit operator bool() const { return has_value(); }
+    const T& operator*() const { return borrowed != nullptr ? *borrowed : *owned; }
+    const T* operator->() const { return &**this; }
+    // Writing takes a copy of a borrowed value first.
+    T& operator*() {
+        own();
+        return *owned;
+    }
+    T* operator->() { return &**this; }
+
+private:
+    std::optional<T> copy() const { return has_value() ? std::optional<T>(**this) : std::nullopt; }
+    void own() {
+        if (borrowed == nullptr) return;
+        owned = *borrowed;
+        borrowed = nullptr;
+    }
+    std::optional<T> owned;
+    const T* borrowed = nullptr;
+};
+
 struct GuestContext {
     std::uint32_t waveSize;
     std::uint32_t userDataBaseRegister;
     std::span<const std::uint32_t> userData;
     std::optional<ShaderComputeStageInfo> compute;
     std::optional<ShaderPixelStageInfo> pixel;
-    std::optional<ShaderVertexStageInfo> vertex;
+    StageInfo<ShaderVertexStageInfo> vertex;
     std::span<const MemoryRegion> memory;
 };
 

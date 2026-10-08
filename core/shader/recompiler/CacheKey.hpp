@@ -41,9 +41,9 @@ public:
     // key of a source memo whose owner fixes the code (a registered shader at an offset) and the
     // device itself, and which is bypassed while the probe is active.
     static std::uint64_t ContextHash(const RecompileRequest& request) {
-        struct ContextKeyStorage {};
-        auto& key = HostThreadLocal<std::vector<std::uint64_t>, ContextKeyStorage>();
-        key.clear();
+        // The values are hashed as they come (FNV-1a), not listed first: this runs for every stage
+        // of every draw.
+        HashSink key;
         append(key, request.shader.stage);
         append(key, request.context.waveSize);
         append(key, request.context.userDataBaseRegister);
@@ -52,12 +52,7 @@ public:
         append(key, request.context.pixel);
         append(key, request.context.vertex);
         appendMesh(key, request);
-        std::uint64_t hash = 0xcbf29ce484222325ull;
-        for (const auto value : key) {
-            hash ^= value;
-            hash *= 0x100000001b3ull;
-        }
-        return hash;
+        return key.hash;
     }
 
     // A 64-bit hash of the code, two dwords per step; collisions are resolved by comparing the code.
@@ -74,7 +69,17 @@ public:
     }
 
 private:
-    static void appendMesh(std::vector<std::uint64_t>& key, const RecompileRequest& request) {
+    // Takes the values append gives a key list and folds them into an FNV-1a hash instead.
+    struct HashSink {
+        std::uint64_t hash = 0xcbf29ce484222325ull;
+        void push_back(std::uint64_t value) {
+            hash ^= value;
+            hash *= 0x100000001b3ull;
+        }
+    };
+
+    template<typename TKey>
+    static void appendMesh(TKey& key, const RecompileRequest& request) {
         if (request.shader.stage != ShaderStage::Mesh) return;
         const auto* mesh = request.graphics && request.graphics->mesh ? &*request.graphics->mesh : nullptr;
         append(key, mesh != nullptr);
@@ -82,34 +87,42 @@ private:
         for (const auto value : {mesh->inputPrimitive, mesh->primitivesPerGroup, mesh->verticesPerGroup, mesh->maxVertices, mesh->maxPrimitives, mesh->threadsPerGroup, mesh->ldsSizeDwords, mesh->provokingVertex, mesh->esgsItemSize}) append(key, value);
     }
 
-    template<typename TValue>
-    static void append(std::vector<std::uint64_t>& key, TValue value) requires (std::is_integral_v<TValue> || std::is_enum_v<TValue>) {
+    template<typename TKey, typename TValue>
+    static void append(TKey& key, TValue value) requires (std::is_integral_v<TValue> || std::is_enum_v<TValue>) {
         key.push_back(static_cast<std::uint64_t>(value));
     }
 
-    template<typename TValue, std::size_t TSize>
-    static void append(std::vector<std::uint64_t>& key, const std::array<TValue, TSize>& values) {
+    template<typename TKey, typename TValue, std::size_t TSize>
+    static void append(TKey& key, const std::array<TValue, TSize>& values) {
         for (const auto value : values) append(key, value);
     }
 
-    template<typename TValue>
-    static void append(std::vector<std::uint64_t>& key, std::span<TValue> values) {
+    template<typename TKey, typename TValue>
+    static void append(TKey& key, std::span<TValue> values) {
         append(key, values.size());
         for (const auto value : values) append(key, value);
     }
 
-    template<typename TValue>
-    static void append(std::vector<std::uint64_t>& key, const std::optional<TValue>& value) {
+    template<typename TKey, typename TValue>
+    static void append(TKey& key, const std::optional<TValue>& value) {
         append(key, value.has_value());
         if (value) append(key, *value);
     }
 
-    static void append(std::vector<std::uint64_t>& key, std::string_view value) {
+    template<typename TKey, typename TValue>
+    static void append(TKey& key, const StageInfo<TValue>& value) {
+        append(key, value.has_value());
+        if (value) append(key, *value);
+    }
+
+    template<typename TKey>
+    static void append(TKey& key, std::string_view value) {
         append(key, value.size());
         for (const unsigned char byte : value) append(key, byte);
     }
 
-    static void append(std::vector<std::uint64_t>& key, const ShaderComputeStageInfo& value) {
+    template<typename TKey>
+    static void append(TKey& key, const ShaderComputeStageInfo& value) {
         append(key, value.numThreads);
         append(key, value.ldsSizeDwords);
         append(key, value.groupIdEnable);
@@ -119,7 +132,8 @@ private:
         append(key, value.scratchDwords);
     }
 
-    static void append(std::vector<std::uint64_t>& key, const ShaderPixelStageInfo& value) {
+    template<typename TKey>
+    static void append(TKey& key, const ShaderPixelStageInfo& value) {
         append(key, value.interpolatorCount);
         if (value.interpolatorCount > value.interpolatorSettings.size()) throw std::runtime_error("Shader cache: invalid interpolator count");
         for (std::uint32_t i = 0; i < value.interpolatorCount; ++i) append(key, value.interpolatorSettings[i]);
@@ -147,14 +161,16 @@ private:
         append(key, value.targetExportMapping);
     }
 
-    static void append(std::vector<std::uint64_t>& key, const ShaderVertexResourceDestination& value) {
+    template<typename TKey>
+    static void append(TKey& key, const ShaderVertexResourceDestination& value) {
         append(key, value.registerStart);
         append(key, value.registersNum);
         append(key, value.attrId);
         append(key, value.fetchIndex);
     }
 
-    static void append(std::vector<std::uint64_t>& key, const ShaderVertexStageInfo& value) {
+    template<typename TKey>
+    static void append(TKey& key, const ShaderVertexStageInfo& value) {
         append(key, value.resourcesNum);
         append(key, value.fetchAttribReg);
         append(key, value.fetchBufferReg);
@@ -167,7 +183,8 @@ private:
         }
     }
 
-    static void append(std::vector<std::uint64_t>& key, const MeshTargetLimits& value) {
+    template<typename TKey>
+    static void append(TKey& key, const MeshTargetLimits& value) {
         append(key, value.maxWorkgroupSize);
         append(key, value.maxWorkgroupInvocations);
         append(key, value.maxSharedMemoryBytes);
@@ -179,7 +196,8 @@ private:
         append(key, value.outputPerPrimitiveGranularity);
     }
 
-    static void append(std::vector<std::uint64_t>& key, const TessellationTargetLimits& value) {
+    template<typename TKey>
+    static void append(TKey& key, const TessellationTargetLimits& value) {
         append(key, value.maxPatchSize);
         append(key, value.maxControlPerVertexInputComponents);
         append(key, value.maxControlPerVertexOutputComponents);
@@ -189,7 +207,8 @@ private:
         append(key, value.maxEvaluationOutputComponents);
     }
 
-    static void append(std::vector<std::uint64_t>& key, const SpirvTarget& value) {
+    template<typename TKey>
+    static void append(TKey& key, const SpirvTarget& value) {
         append(key, value.vulkanVersion);
         append(key, value.spirvVersion);
         append(key, value.subgroupSize);
