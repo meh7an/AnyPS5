@@ -5,9 +5,11 @@
 #include <cstddef>
 #include <cstdint>
 #include <initializer_list>
+#include <iterator>
 #include <memory>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <string_view>
 #include <vector>
 
@@ -369,6 +371,94 @@ enum class DescriptorRole {
     ShaderData
 };
 
+// A binding's per-element flags, read as a std::vector<bool> is: inline up to 64 elements (a binding
+// rarely has more), a vector beyond. A result materialized from a capture fills several per binding,
+// for every draw stage the stage memo misses and every dispatch: inline, none of them allocates.
+class ElementFlags {
+public:
+    class const_iterator {
+    public:
+        using iterator_category = std::forward_iterator_tag;
+        using value_type = bool;
+        using difference_type = std::ptrdiff_t;
+        using pointer = void;
+        using reference = bool;
+        const_iterator() = default;
+        const_iterator(const ElementFlags* flags, std::size_t index) : flags(flags), index(index) {}
+        bool operator*() const { return (*flags)[index]; }
+        const_iterator& operator++() {
+            ++index;
+            return *this;
+        }
+        const_iterator operator++(int) {
+            auto previous = *this;
+            ++index;
+            return previous;
+        }
+        bool operator==(const const_iterator& other) const { return index == other.index; }
+        bool operator!=(const const_iterator& other) const { return index != other.index; }
+
+    private:
+        const ElementFlags* flags = nullptr;
+        std::size_t index = 0;
+    };
+
+    ElementFlags() = default;
+    ElementFlags(std::initializer_list<bool> flags) {
+        for (const bool flag : flags) push_back(flag);
+    }
+    std::size_t size() const { return count; }
+    bool empty() const { return count == 0; }
+    bool operator[](std::size_t index) const { return count <= InlineFlags ? ((bits >> index) & 1u) != 0 : spill[index]; }
+    bool at(std::size_t index) const {
+        if (index >= count) throw std::out_of_range("ElementFlags::at");
+        return (*this)[index];
+    }
+    void push_back(bool flag) {
+        if (count < InlineFlags) {
+            if (flag) bits |= std::uint64_t{1} << count;
+            ++count;
+            return;
+        }
+        if (count == InlineFlags) {
+            for (std::size_t index = 0; index < InlineFlags; ++index) spill.push_back(((bits >> index) & 1u) != 0);
+        }
+        spill.push_back(flag);
+        ++count;
+    }
+    void clear() {
+        bits = 0;
+        count = 0;
+        spill.clear();
+    }
+    void assign(std::size_t size, bool flag) {
+        clear();
+        for (std::size_t index = 0; index < size; ++index) push_back(flag);
+    }
+    const_iterator begin() const { return {this, 0}; }
+    const_iterator end() const { return {this, count}; }
+    bool operator==(const ElementFlags& other) const {
+        if (count != other.count) return false;
+        for (std::size_t index = 0; index < count; ++index) {
+            if ((*this)[index] != other[index]) return false;
+        }
+        return true;
+    }
+    bool operator==(const std::vector<bool>& other) const {
+        if (count != other.size()) return false;
+        for (std::size_t index = 0; index < count; ++index) {
+            if ((*this)[index] != other[index]) return false;
+        }
+        return true;
+    }
+
+private:
+    static constexpr std::size_t InlineFlags = 64;
+    std::uint64_t bits = 0;
+    std::size_t count = 0;
+    std::vector<bool> spill;
+};
+
 struct DescriptorBinding {
     DescriptorKind kind;
     DescriptorRole role;
@@ -378,24 +468,24 @@ struct DescriptorBinding {
     std::vector<std::uint32_t> guestDescriptor;
     bool readOnly = false;
     std::optional<DescriptorImageShape> imageShape;
-    std::vector<bool> samplerDepthCompare;
+    ElementFlags samplerDepthCompare;
     // Guest image elements the shader stores to (or updates atomically); the others are only read.
-    std::vector<bool> imageWritten;
-    std::vector<bool> imageDepthCompare;
-    std::vector<bool> imageAtomic;
-    std::vector<bool> imageAtomic64;
+    ElementFlags imageWritten;
+    ElementFlags imageDepthCompare;
+    ElementFlags imageAtomic;
+    ElementFlags imageAtomic64;
     // Guest buffer elements the shader updates atomically (one entry per element of a GuestBuffers
     // binding, empty otherwise). An atomic on a host-imported range is a serialized PCIe round trip
     // (~0.4-0.5 us each on NVIDIA), so a driver may keep these elements in device-local memory.
-    std::vector<bool> bufferAtomic;
+    ElementFlags bufferAtomic;
     // Guest buffer elements the shader may store to through this V# (any store or atomic in the
     // program, whatever its offset), one entry per element of a GuestBuffers binding, empty
     // otherwise. A false entry is proved: every access of that element is a load. A driver may then
     // skip the write-back and the pending-write note for the element; an element beyond the vector
     // (a producer that does not fill it) must be treated as written.
-    std::vector<bool> bufferWritten;
-    std::vector<bool> samplerUnnormalized;
-    std::vector<bool> imageUnnormalized;
+    ElementFlags bufferWritten;
+    ElementFlags samplerUnnormalized;
+    ElementFlags imageUnnormalized;
     std::vector<std::uint32_t> imageSamplers;
 };
 

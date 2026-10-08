@@ -126,6 +126,11 @@ public:
         for (const bool flag : flags) Value(flag);
     }
 
+    void Flags(const ElementFlags& flags) {
+        Value<std::uint64_t>(flags.size());
+        for (const bool flag : flags) Value(flag);
+    }
+
     void Text(const std::string& text) {
         Value<std::uint64_t>(text.size());
         const auto bytes = std::as_bytes(std::span(text.data(), text.size()));
@@ -190,6 +195,12 @@ public:
         const auto count = Count(1);
         flags.assign(count, false);
         for (std::size_t i = 0; i < count; ++i) flags[i] = Get<bool>();
+    }
+
+    void Flags(ElementFlags& flags) {
+        const auto count = Count(1);
+        flags.clear();
+        for (std::size_t i = 0; i < count; ++i) flags.push_back(Get<bool>());
     }
 
     void Text(std::string& text) {

@@ -1229,7 +1229,7 @@ void ShaderResources::AppendContentKey(std::vector<std::uint32_t>& key, const Co
     key.push_back(static_cast<std::uint32_t>(program.variantId));
     key.push_back(static_cast<std::uint32_t>(program.variantId >> 32u));
     key.push_back(static_cast<std::uint32_t>(program.bindings.size()));
-    const auto packBits = [&](const std::vector<bool>& bits) {
+    const auto packBits = [&](const ShaderRecompiler::ElementFlags& bits) {
         key.push_back(static_cast<std::uint32_t>(bits.size()));
         std::uint32_t word = 0;
         for (std::size_t i = 0; i < bits.size(); ++i) {
