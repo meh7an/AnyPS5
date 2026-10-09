@@ -3,8 +3,14 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ThreadScratch.hpp"
+#include <array>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
+#include <iterator>
+#include <list>
+#include <unordered_map>
+#include <utility>
 
 namespace AgcDriver::DriverDetail {
 
@@ -59,6 +65,63 @@ bool DecodeMemoEnabled() {
 bool VerifyDecodeMemo() {
     static const bool verify = std::getenv("APS5_VERIFY_DECODE_MEMO") != nullptr;
     return verify;
+}
+
+// The decode cache: the thread's decodes by the digest of the registers a decode depends on (every
+// context and user-config register, every shader register but the ones a draw reads again: the
+// decode generation's set), reused for a draw with the same shader registry and guest mappings,
+// its user words read again. The decode memo only serves a draw whose registers did not change
+// since the last one, and one changes before nearly every draw (0.3% hits on the S3K menu); a
+// digest finds the same registers again however they changed in between. A decode the draws in
+// flight hold is copied before its user words change, and the entry keeps the copy for later
+// draws. APS5_NO_DECODE_CACHE=1 takes the decode memo instead; APS5_VERIFY_DECODE_CACHE=1 also
+// decodes every hit and compares.
+struct DecodeCacheEntry {
+    std::shared_ptr<const ShaderRegistry> registry;
+    std::uint64_t forgetSerial = 1;
+    std::vector<std::shared_ptr<DrawDecode>> copies;
+    // The copy a full list's next copy replaces, in turn: the list keeps the newest copies, which
+    // the ring's draws give back soon, over ones a draw cache entry keeps until it goes.
+    std::size_t replace = 0;
+    std::list<std::uint64_t>::iterator order;
+};
+
+struct DecodeCache {
+    std::unordered_map<std::uint64_t, DecodeCacheEntry> entries;
+    std::list<std::uint64_t> order;
+    std::uint64_t hits = 0, misses = 0, copied = 0, verified = 0, mismatches = 0;
+};
+
+struct DecodeCacheTag;
+
+// The draw thread's ring holds up to 8 draws (DrawThread::Slots): copies for those and the one
+// being prepared serve a run of draws with the same registers.
+constexpr std::size_t DecodeCacheEntries = 4096;
+constexpr std::size_t DecodeCacheCopies = 10;
+
+bool DecodeCacheEnabled() {
+    static const bool enabled = std::getenv("APS5_NO_DECODE_CACHE") == nullptr;
+    return enabled;
+}
+
+bool VerifyDecodeCache() {
+    static const bool verify = std::getenv("APS5_VERIFY_DECODE_CACHE") != nullptr;
+    return verify;
+}
+
+// The shader registers a draw reads again: the user words of the pixel, vertex/geometry and hull
+// stages and the merged stages' user pointers (Pm4.cpp's perDrawShaderRegister).
+constexpr std::array<std::pair<std::uint32_t, std::uint32_t>, 5> PerDrawShaderRegisters{{{0x0cu, 32u}, {0x8cu, 32u}, {0x10cu, 32u}, {0x82u, 2u}, {0x102u, 2u}}};
+
+std::uint64_t decodeDigest(const QueueState& queue) {
+    auto shader = queue.shader.Digest();
+    for (const auto& [first, count] : PerDrawShaderRegisters) {
+        for (auto offset = first; offset < first + count; ++offset) {
+            if (queue.shader.contains(offset)) shader ^= Registers::EntryDigest(offset, queue.shader.at(offset));
+        }
+    }
+    // Odd multipliers keep an entry of one bank from cancelling the same entry of another.
+    return queue.context.Digest() ^ (shader * 0x9e3779b97f4a7c15ull) ^ (queue.userConfig.Digest() * 0xc2b2ae3d27d4eb4full);
 }
 
 // The banks equal outside the shader registers a draw reads again (decodeGeneration's exclusions).
@@ -175,6 +238,74 @@ std::shared_ptr<DrawDecode> Driver::decodeDraw(const QueueState& queue, const Su
 }
 
 void Driver::resolveDrawDecode(const QueueState& queue, const Submission& submission, std::shared_ptr<const DrawDecode>& decode, bool registerKey, std::uint64_t drawKey, bool profile) {
+    if (decode == nullptr && !verifyDrawRecipe() && DecodeCacheEnabled()) {
+        auto& cache = ThreadScratch<DecodeCache, DecodeCacheTag>();
+        const auto report = [&] {
+            if (!profile && !VerifyDecodeCache()) return;
+            if ((cache.hits + cache.misses) % 500000 != 0) return;
+            std::fprintf(stderr, "[decode-cache] %llu hits (%llu copied first), %llu misses, %zu entries; verified %llu hits: %llu decode mismatches\n", static_cast<unsigned long long>(cache.hits), static_cast<unsigned long long>(cache.copied), static_cast<unsigned long long>(cache.misses), cache.entries.size(), static_cast<unsigned long long>(cache.verified), static_cast<unsigned long long>(cache.mismatches));
+        };
+        const auto serial = GuestMemory::ForgetSerial();
+        const bool settled = (serial & 1u) == 0;
+        const auto key = decodeDigest(queue);
+        const auto found = cache.entries.find(key);
+        if (found != cache.entries.end() && settled && found->second.forgetSerial == serial && found->second.registry == submission.shaders) {
+            auto& entry = found->second;
+            cache.order.splice(cache.order.end(), cache.order, entry.order);
+            std::shared_ptr<DrawDecode> served;
+            // Held by nothing but the entry: no draw uses it any more. use_count reads relaxed:
+            // the fence orders the rewrite after the last holder's release.
+            for (const auto& copy : entry.copies) {
+                if (copy.use_count() != 1) continue;
+                std::atomic_thread_fence(std::memory_order_acquire);
+                served = copy;
+                break;
+            }
+            if (served == nullptr) {
+                served = std::make_shared<DrawDecode>(*entry.copies.front());
+                ++cache.copied;
+                if (entry.copies.size() < DecodeCacheCopies) {
+                    entry.copies.push_back(served);
+                } else {
+                    entry.copies[entry.replace] = served;
+                    entry.replace = (entry.replace + 1) % entry.copies.size();
+                }
+            }
+            for (auto& program : served->programs) rereadUserData(queue, program);
+            ++cache.hits;
+            if (VerifyDecodeCache()) {
+                ++cache.verified;
+                const bool same = sameDecode(*decodeDraw(queue, submission), *served);
+                if (!same && ++cache.mismatches <= 20) std::fprintf(stderr, "[decode-cache] verify: a hit at digest 0x%llx decodes differently\n", static_cast<unsigned long long>(key));
+            }
+            report();
+            decode = std::move(served);
+            return;
+        }
+        auto fresh = decodeDraw(queue, submission);
+        ++cache.misses;
+        if (found != cache.entries.end()) {
+            // The registry or the mappings changed under these registers: the decode is taken again.
+            found->second.registry = submission.shaders;
+            found->second.forgetSerial = settled ? serial : 1;
+            found->second.copies.assign(1, fresh);
+            cache.order.splice(cache.order.end(), cache.order, found->second.order);
+        } else {
+            while (cache.entries.size() >= DecodeCacheEntries && !cache.order.empty()) {
+                cache.entries.erase(cache.order.front());
+                cache.order.pop_front();
+            }
+            auto& entry = cache.entries[key];
+            entry.registry = submission.shaders;
+            entry.forgetSerial = settled ? serial : 1;
+            entry.copies.push_back(fresh);
+            cache.order.push_back(key);
+            entry.order = std::prev(cache.order.end());
+        }
+        report();
+        decode = std::move(fresh);
+        return;
+    }
     if (decode == nullptr && !verifyDrawRecipe() && DecodeMemoEnabled() && queue.decodeGeneration != 0) {
         auto& memo = ThreadScratch<DecodeMemo, DecodeMemoTag>();
         const auto report = [&] {

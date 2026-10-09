@@ -74,27 +74,56 @@ public:
         values.clear();
         present.clear();
         entries = 0;
+        digest = 0;
+        digestStale = false;
     }
     std::pair<const_iterator, bool> emplace(std::uint32_t offset, std::uint32_t value) {
         if (contains(offset)) return {const_iterator{this, offset}, false};
         mark(offset) = value;
+        digest ^= EntryDigest(offset, value);
         return {const_iterator{this, offset}, true};
     }
     std::pair<const_iterator, bool> insert_or_assign(std::uint32_t offset, std::uint32_t value) {
         if (contains(offset)) {
+            digest ^= EntryDigest(offset, values[offset]) ^ EntryDigest(offset, value);
             values[offset] = value;
             return {const_iterator{this, offset}, false};
         }
         mark(offset) = value;
+        digest ^= EntryDigest(offset, value);
         return {const_iterator{this, offset}, true};
     }
+    // The references handed out for writing leave the digest to be taken again.
     std::uint32_t& operator[](std::uint32_t offset) {
+        digestStale = true;
         if (contains(offset)) return values[offset];
         return mark(offset) = 0;
     }
     std::uint32_t& at(std::uint32_t offset) {
         if (!contains(offset)) throw std::out_of_range("register is not set");
+        digestStale = true;
         return values[offset];
+    }
+    // The XOR of EntryDigest over every entry, kept with each change: equal registers have equal
+    // digests (the decode cache's key, DrawDecode.cpp).
+    std::uint64_t Digest() const {
+        if (digestStale) {
+            digest = 0;
+            for (const auto& [offset, value] : *this) digest ^= EntryDigest(offset, value);
+            digestStale = false;
+        }
+        return digest;
+    }
+    // MurmurHash3's 64-bit finalizer over the offset and value: a bijection, so no two entries mix
+    // to the same word.
+    static std::uint64_t EntryDigest(std::uint32_t offset, std::uint32_t value) {
+        auto word = (static_cast<std::uint64_t>(offset) << 32u) | value;
+        word ^= word >> 33u;
+        word *= 0xff51afd7ed558ccdull;
+        word ^= word >> 33u;
+        word *= 0xc4ceb9fe1a85ec53ull;
+        word ^= word >> 33u;
+        return word;
     }
     const std::uint32_t& at(std::uint32_t offset) const {
         if (!contains(offset)) throw std::out_of_range("register is not set");
@@ -102,6 +131,7 @@ public:
     }
     std::size_t erase(std::uint32_t offset) {
         if (!contains(offset)) return 0;
+        digest ^= EntryDigest(offset, values[offset]);
         present[offset / 64] &= ~(std::uint64_t{1} << (offset % 64));
         --entries;
         return 1;
@@ -138,6 +168,8 @@ private:
     std::vector<std::uint32_t> values;
     std::vector<std::uint64_t> present;
     std::size_t entries = 0;
+    mutable std::uint64_t digest = 0;
+    mutable bool digestStale = false;
 };
 
 inline Registers InitialContextRegisters() {

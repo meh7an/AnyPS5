@@ -130,6 +130,36 @@ void testRegisterFile() {
     check(threw, "register file read an unset register");
 }
 
+// The digest the decode cache keys on: equal registers digest equally whatever wrote them, and every
+// change, a write through a reference included, moves it.
+void testRegisterDigest() {
+    AgcDriver::Registers registers{{0x300, 3}, {0x10, 1}, {0x41, 2}};
+    AgcDriver::Registers reordered;
+    reordered.insert_or_assign(0x41, 9);
+    reordered.emplace(0x300, 3);
+    reordered.insert_or_assign(0x10, 1);
+    reordered.insert_or_assign(0x41, 2);
+    check(reordered == registers && reordered.Digest() == registers.Digest(), "register digest depends on the order of the writes");
+    const auto before = registers.Digest();
+    registers.insert_or_assign(0x41, 4);
+    check(registers.Digest() != before, "register digest missed an assignment");
+    registers.insert_or_assign(0x41, 2);
+    check(registers.Digest() == before, "register digest did not come back with the value");
+    registers.emplace(0x7000, 0);
+    check(registers.Digest() != before, "register digest missed a new register");
+    registers.erase(0x7000);
+    check(registers.Digest() == before, "register digest missed an erase");
+    auto written = registers;
+    written[0x10] = 5;
+    check(written.Digest() != before && registers.Digest() == before, "register digest missed a write through a reference");
+    written.at(0x10) = 1;
+    check(written.Digest() == before, "register digest was not taken again after a write through at");
+    AgcDriver::Registers swapped{{0x10, 0x41}, {0x41, 0x10}, {0x300, 3}};
+    check(swapped.Digest() != before, "register digest confused two registers' values");
+    registers.clear();
+    check(registers.Digest() == AgcDriver::Registers{}.Digest(), "register digest survived a clear");
+}
+
 void testContextAndBases() {
     AgcDriver::QueueState state;
     execute(state, makePacket(0x69, {0x10, 17}));
@@ -955,6 +985,7 @@ int main(int argc, char** argv) {
         testWriteChangedKeepsUntouchedBytes();
         testRegisters();
         testRegisterFile();
+        testRegisterDigest();
         testContextAndBases();
         testIndexedDraw();
         testAutoDraw();
