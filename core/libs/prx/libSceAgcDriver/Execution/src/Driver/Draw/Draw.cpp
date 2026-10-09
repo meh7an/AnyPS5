@@ -649,6 +649,7 @@ void Driver::runDrawThread(DrawThread& back) noexcept {
         PinWorkerThread(role);
     }
     GuestMemory::TagGpuLockThread(back.queue);
+    if (back.collectMemo != nullptr) GuestMemory::AdoptCollectMemo(back.collectMemo);
     std::array<double, DrawDriverPhaseCount> phaseMs{};
     std::chrono::steady_clock::time_point phaseLap{};
     DrawPhaseTiming phaseTiming{false, phaseMs, phaseLap};

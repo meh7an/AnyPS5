@@ -97,6 +97,12 @@ void BumpCollectEpoch();
 // thread records each draw in the epoch its worker prepared it in, as the worker would have.
 std::uint64_t ThreadCollectEpoch();
 void AdoptCollectEpoch(std::uint64_t epoch);
+// The worker's collect memo for its draw thread: ShareCollectMemo, on the worker, returns its ring
+// (both threads lock it from then on), AdoptCollectMemo has the calling thread use that ring. The
+// worker's walks then serve the draw thread's checks; separate rings made its draws copy buffers
+// the worker's walks had already found unwritten. The ring lives until the worker exits.
+void* ShareCollectMemo();
+void AdoptCollectMemo(void* memo);
 std::uint64_t CollectEpochBumps();
 std::uint64_t CollectWritesUncached(std::uint64_t address, std::size_t bytes);
 // The tracker's current generation (every collect and MarkWritten bumps it): a stamp taken after

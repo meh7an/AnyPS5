@@ -68,6 +68,8 @@ public:
 
     const std::uint32_t queue;
     std::thread thread;
+    // The worker's collect memo (GuestMemory::ShareCollectMemo), set before the thread starts.
+    void* collectMemo = nullptr;
     // Set by the front while it prepares a draw into Slot().
     bool preparing = false;
 

@@ -49,6 +49,7 @@ void Driver::run(std::uint32_t id) noexcept {
     std::unique_ptr<DrawThread> back;
     if (id == 0 && DrawThread::Enabled()) {
         back = std::make_unique<DrawThread>(id);
+        back->collectMemo = GuestMemory::ShareCollectMemo();
         back->thread = std::thread([this, thread = back.get()] { runDrawThread(*thread); });
         back->AttachFront();
     }
