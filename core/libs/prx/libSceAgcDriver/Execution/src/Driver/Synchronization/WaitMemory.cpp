@@ -76,6 +76,13 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
         }
     } epochPoint;
     GuestMemory::CheckRange(reinterpret_cast<const void*>(awaited), awaitedBytes, awaitedBytes);
+    // A write this worker handed to its draw thread (Driver::ringWrite) lands ahead of whatever the
+    // worker records next, as a recorded one does.
+    if (ringWaitSatisfied(packet, received)) {
+        ++outcomes.fromRecorderSameQueue;
+        epochPoint.bump = false;
+        return;
+    }
     if (Pm4::WaitSatisfiedUnchecked(packet)) {
         ++outcomes.atEntry;
         return;

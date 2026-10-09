@@ -37,6 +37,9 @@ public:
     // APS5_LOCKED_DRAW_PREPARE (a draw prepared under the GPU mutex cannot hand itself over while
     // holding it).
     static bool Enabled();
+    // Stage 4 (APS5_RING_WRITES=1): end-of-pipe labels and small packet stores go through the ring
+    // (Driver::ringWrite), so the worker no longer drains the thread before them.
+    static bool RingWrites();
 
     // The front's side.
     // Whether the front may prepare a draw into Slot(): not while it prepares one there already (a
@@ -48,9 +51,13 @@ public:
     // Hands Slot() over once the slot after it is free (its last record is done); false when the
     // back thread left, and the caller records the draw itself.
     bool Push();
-    // Waits until the back thread recorded every record handed to it.
-    void Drain(Wait why);
+    // Waits until the back thread recorded every record handed to it. A drain before a packet names
+    // its opcode, for the [draw-thread] line's packet breakdown.
+    void Drain(Wait why, std::uint32_t opcode = 0);
     bool Busy() const { return recorded.load(std::memory_order_acquire) != pushed.load(std::memory_order_relaxed) && !abandoned.load(std::memory_order_acquire); }
+    // The records handed over and the records done so far (wrapping counters).
+    std::uint32_t PushedCount() const { return pushed.load(std::memory_order_relaxed); }
+    std::uint32_t RecordedCount() const { return recorded.load(std::memory_order_acquire); }
     // Makes the calling thread the front: its GPU-lock front and its FrontDrawThread().
     void AttachFront();
     // Lets the back thread record what it was handed, stops it and detaches the front.
@@ -79,8 +86,9 @@ public:
 
 private:
     void report();
-    // Waits until `count` records are done (wrapping counters compared as differences).
-    void awaitRecorded(std::uint32_t count, Wait why);
+    // Waits until `count` records are done (wrapping counters compared as differences); the wait
+    // in milliseconds under APS5_PROFILE_DRAW, else 0.
+    double awaitRecorded(std::uint32_t count, Wait why);
 
     std::vector<std::unique_ptr<PreparedDraw>> slots;
     alignas(64) std::atomic<std::uint32_t> pushed{0};
@@ -96,6 +104,9 @@ private:
     std::uint64_t pushes = 0;
     std::array<std::uint64_t, static_cast<std::size_t>(Wait::Count)> waits{};
     std::array<double, static_cast<std::size_t>(Wait::Count)> waitedMs{};
+    // The drains before packets by opcode.
+    std::array<std::uint64_t, 256> packetWaits{};
+    std::array<double, 256> packetWaitedMs{};
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
 };
 

@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawThread.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
@@ -59,7 +60,12 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
     if (!drainAll && !endOfPipeInterrupt && (opcode == 0x49 || opcode == 0x37)) {
         if (const auto label = Pm4::DecodeLabelWrite(packet)) {
             const auto bytes = label->Bytes();
-            if (DeferLabels() && bytes.size() <= DeferredLabel::Capacity && bytes.size() % 4 == 0 && label->address % 4 == 0) {
+            if (bytes.size() % 4 == 0 && ringWrite(submission.queue, label->address, bytes, false)) {
+                wroteOnGpu = true;
+            } else if (DeferLabels() && bytes.size() <= DeferredLabel::Capacity && bytes.size() % 4 == 0 && label->address % 4 == 0) {
+                // The packet loop leaves the draw thread running before a label under
+                // APS5_RING_WRITES: one deferred instead waits for the draws in flight, as before.
+                if (auto* back = FrontDrawThread(); DrawThread::RingWrites() && back != nullptr && back->Busy()) back->Drain(DrawThread::Wait::Packet, opcode);
 
                 auto& deferred = deferredLabels();
                 if (deferred.labels.empty()) deferred.since = std::chrono::steady_clock::now();
@@ -105,6 +111,9 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
             if (bytes.empty()) {
 
                 orderedAlready = true;
+                drained = false;
+            } else if (ringWrite(submission.queue, store->address, bytes, true)) {
+                wroteOnGpu = true;
                 drained = false;
             } else {
 

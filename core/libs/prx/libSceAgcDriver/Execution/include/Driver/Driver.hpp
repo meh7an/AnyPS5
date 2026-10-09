@@ -168,6 +168,19 @@ private:
     void recordPrepared(PreparedDraw& prepared, std::unique_lock<GuestMemory::GpuMutexType>& gpuLock, PerformanceTimer& timing, DrawPhaseTiming& phaseTiming);
     // A queue's draw back thread (DrawThread): records the draws its worker hands over.
     void runDrawThread(DrawThread& back) noexcept;
+    // Stage 4 of the split (APS5_RING_WRITES=1): an end-of-pipe label or a packet store of up to 64
+    // bytes goes to the draw thread as a record of its own while the thread is busy, instead of
+    // being recorded under the GPU mutex after waiting for the draws in flight. False: the caller
+    // records it as before (the thread idle or gone, labels deferred before it, too large). The
+    // worker keeps the writes it handed over until they are recorded: its own WAIT_REG_MEM on one
+    // is satisfied by it (ringWaitSatisfied), and a capture or read over one drains the thread
+    // first (ringWritesOverlap, recordQueuedLabelsBeforeRead). The label tables learn of a write
+    // only when the draw thread records it, so another queue never runs ahead of it.
+    bool ringWrite(std::uint32_t queue, std::uint64_t address, std::span<const std::byte> bytes, bool store);
+    bool ringWaitSatisfied(std::span<const std::uint32_t> packet, std::uint64_t received);
+    bool ringWritesPending();
+    bool ringWritesOverlap(std::span<const ShaderRecompiler::MemoryRegion> regions);
+    void recordRingWrites(PreparedDraw& prepared, std::unique_lock<GuestMemory::GpuMutexType>& gpuLock);
     void addDriverPhases(DispatchClass which, const std::array<double, DriverPhaseCount>& ms, bool hit, bool validated);
     static PendingDispatchPhases& pendingDispatchPhases();
     static std::chrono::steady_clock::time_point& packetStartedAt();

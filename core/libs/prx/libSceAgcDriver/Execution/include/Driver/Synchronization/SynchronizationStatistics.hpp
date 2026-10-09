@@ -16,7 +16,8 @@ extern std::atomic<std::uint64_t> gpuLabels, completionLabels, notImportedLabels
 
 extern std::atomic<std::uint64_t> labelFallbacks[5];
 
-extern std::atomic<std::uint64_t> queuedLabels, labelGroups, immediateLabels;
+// ringWritten: records of labels and stores the draw thread wrote (Driver::ringWrite).
+extern std::atomic<std::uint64_t> queuedLabels, labelGroups, immediateLabels, ringWritten;
 
 extern std::atomic<std::uint64_t> packetLockRecords, packetLockSubmits, packetLockDeferred, packetSubmitDeferred, captureTryRecords, captureRetries, suspendPoints;
 

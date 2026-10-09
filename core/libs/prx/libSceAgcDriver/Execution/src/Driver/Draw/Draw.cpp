@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/PreparedDraw.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/WorkerAffinity.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
@@ -12,7 +13,12 @@
 #include "prx/libc/include/HostThreadSlot.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include <algorithm>
+#include <array>
 #include <cstdlib>
+#include <cstring>
+#include <span>
+#include <string>
+#include <vector>
 
 namespace AgcDriver::DriverDetail {
 
@@ -127,6 +133,11 @@ bool DrawThread::Enabled() {
     return enabled;
 }
 
+bool DrawThread::RingWrites() {
+    static const bool enabled = Enabled() && std::getenv("APS5_RING_WRITES") != nullptr;
+    return enabled;
+}
+
 bool DrawThread::Push() {
     const auto count = pushed.load(std::memory_order_relaxed);
     // The next draw goes into the slot after this one, which record count + 1 - Slots() left.
@@ -142,13 +153,16 @@ bool DrawThread::Push() {
     return true;
 }
 
-void DrawThread::Drain(Wait why) {
+void DrawThread::Drain(Wait why, std::uint32_t opcode) {
     const auto count = pushed.load(std::memory_order_relaxed);
     if (recorded.load(std::memory_order_acquire) == count) return;
-    awaitRecorded(count, why);
+    const auto waited = awaitRecorded(count, why);
+    if (why != Wait::Packet) return;
+    ++packetWaits[opcode & 0xffu];
+    packetWaitedMs[opcode & 0xffu] += waited;
 }
 
-void DrawThread::awaitRecorded(std::uint32_t count, Wait why) {
+double DrawThread::awaitRecorded(std::uint32_t count, Wait why) {
     // The draw thread needs the mutex to record what it waits for.
     require(!GuestMemory::GpuMutex().HeldByThisThread(), "a queue worker waited for its draw thread holding the GPU mutex");
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
@@ -157,7 +171,9 @@ void DrawThread::awaitRecorded(std::uint32_t count, Wait why) {
     awaitWord(recorded, frontSleeping, [&] { return static_cast<std::int32_t>(count - recorded.load(std::memory_order_acquire)) <= 0 || abandoned.load(std::memory_order_acquire); });
     const auto index = static_cast<std::size_t>(why);
     ++waits[index];
-    if (profile) waitedMs[index] += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+    const auto waited = profile ? std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count() : 0.0;
+    waitedMs[index] += waited;
+    return waited;
 }
 
 void DrawThread::AttachFront() {
@@ -195,10 +211,22 @@ void DrawThread::report() {
     const auto seconds = std::chrono::duration<double>(now - lastReport).count();
     lastReport = now;
     const auto at = [&](Wait why) { return static_cast<std::size_t>(why); };
-    std::fprintf(stderr, "[draw-thread] queue 0x%x (%.0f s): %llu draws handed over; the worker waited for the draw thread before a hand-off %llu times (%.0f ms), at its GPU mutex %llu (%.0f ms), before a packet %llu (%.0f ms), after a memory-writing draw %llu (%.0f ms), at the end of a submission %llu (%.0f ms)\n", queue, seconds, static_cast<unsigned long long>(pushes), static_cast<unsigned long long>(waits[at(Wait::Push)]), waitedMs[at(Wait::Push)], static_cast<unsigned long long>(waits[at(Wait::Lock)]), waitedMs[at(Wait::Lock)], static_cast<unsigned long long>(waits[at(Wait::Packet)]), waitedMs[at(Wait::Packet)], static_cast<unsigned long long>(waits[at(Wait::Writer)]), waitedMs[at(Wait::Writer)], static_cast<unsigned long long>(waits[at(Wait::End)]), waitedMs[at(Wait::End)]);
+    // The packets the worker waited before, costliest first.
+    std::array<std::uint32_t, 256> opcodes{};
+    for (std::uint32_t opcode = 0; opcode < opcodes.size(); ++opcode) opcodes[opcode] = opcode;
+    std::sort(opcodes.begin(), opcodes.end(), [&](std::uint32_t a, std::uint32_t b) { return packetWaitedMs[a] > packetWaitedMs[b] || (packetWaitedMs[a] == packetWaitedMs[b] && packetWaits[a] > packetWaits[b]); });
+    std::string packets;
+    for (std::size_t i = 0; i < 6 && packetWaits[opcodes[i]] != 0; ++i) {
+        char text[48];
+        std::snprintf(text, sizeof(text), " 0x%02x %llu (%.0f ms)", opcodes[i], static_cast<unsigned long long>(packetWaits[opcodes[i]]), packetWaitedMs[opcodes[i]]);
+        packets += text;
+    }
+    std::fprintf(stderr, "[draw-thread] queue 0x%x (%.0f s): %llu draws handed over; the worker waited for the draw thread before a hand-off %llu times (%.0f ms), at its GPU mutex %llu (%.0f ms), before a packet %llu (%.0f ms; by opcode:%s), after a memory-writing draw %llu (%.0f ms), at the end of a submission %llu (%.0f ms)\n", queue, seconds, static_cast<unsigned long long>(pushes), static_cast<unsigned long long>(waits[at(Wait::Push)]), waitedMs[at(Wait::Push)], static_cast<unsigned long long>(waits[at(Wait::Lock)]), waitedMs[at(Wait::Lock)], static_cast<unsigned long long>(waits[at(Wait::Packet)]), waitedMs[at(Wait::Packet)], packets.c_str(), static_cast<unsigned long long>(waits[at(Wait::Writer)]), waitedMs[at(Wait::Writer)], static_cast<unsigned long long>(waits[at(Wait::End)]), waitedMs[at(Wait::End)]);
     pushes = 0;
     waits.fill(0);
     waitedMs.fill(0);
+    packetWaits.fill(0);
+    packetWaitedMs.fill(0);
 }
 
 DrawThread* FrontDrawThread() {
@@ -673,7 +701,8 @@ void Driver::runDrawThread(DrawThread& back) noexcept {
             PerformanceTimer timing("Driver.Draw");
             std::unique_lock gpuLock(GuestMemory::GpuMutex(), std::defer_lock);
             try {
-                recordPrepared(prepared, gpuLock, timing, phaseTiming);
+                if (!prepared.writes.empty()) recordRingWrites(prepared, gpuLock);
+                else recordPrepared(prepared, gpuLock, timing, phaseTiming);
             } catch (const std::exception& error) {
                 // The worker's packet has moved on: reported without its register dump.
                 CaptureTrace::Log("draw-error queue=%x reason=%.256s (draw thread)", back.queue, error.what());
@@ -689,6 +718,125 @@ void Driver::runDrawThread(DrawThread& back) noexcept {
     } catch (...) {
         back.Abandon();
     }
+}
+
+namespace {
+
+// A write the worker handed to its draw thread (Driver::ringWrite) that the thread has not
+// recorded yet: the worker's own view of it until then.
+struct PendingRingWrite {
+    std::uint64_t address = 0;
+    std::uint64_t stamp = 0;
+    std::uint32_t size = 0;
+    // The record it went in: recorded once the thread's count passes it.
+    std::uint32_t record = 0;
+    std::array<std::byte, 64> bytes{};
+};
+
+struct PendingRingWritesTag;
+
+// The calling worker's pending writes, those its draw thread recorded since dropped first.
+std::vector<PendingRingWrite>& pendingRingWrites(const DrawThread* back) {
+    auto& pending = ThreadScratch<std::vector<PendingRingWrite>, PendingRingWritesTag>();
+    if (pending.empty()) return pending;
+    if (back == nullptr) {
+        pending.clear();
+        return pending;
+    }
+    const auto recorded = back->RecordedCount();
+    std::erase_if(pending, [&](const PendingRingWrite& write) { return static_cast<std::int32_t>(recorded - write.record) > 0; });
+    return pending;
+}
+
+}
+
+bool Driver::ringWrite(std::uint32_t queue, std::uint64_t address, std::span<const std::byte> bytes, bool store) {
+    if (!DrawThread::RingWrites() || bytes.empty() || bytes.size() > PreparedDraw::Write{}.bytes.size() || address % 4 != 0) return false;
+    auto* back = FrontDrawThread();
+    // With the thread idle there is nothing to wait for; labels deferred before this write are
+    // recorded under the mutex first, as before.
+    if (back == nullptr || !back->FrontReady() || !back->Busy() || !deferredLabels().labels.empty()) return false;
+    const auto localDevice = device.Load();
+    if (localDevice == nullptr) return false;
+    auto& record = back->Slot();
+    record.device = localDevice;
+    record.queue = queue;
+    record.collectEpoch = GuestMemory::ThreadCollectEpoch();
+    auto& write = record.writes.emplace_back();
+    write.address = address;
+    write.stamp = ++eventSerial;
+    write.size = static_cast<std::uint32_t>(bytes.size());
+    write.store = store;
+    std::memcpy(write.bytes.data(), bytes.data(), bytes.size());
+    const auto index = back->PushedCount();
+    if (!back->Push()) {
+        record.Clear();
+        return false;
+    }
+    auto& pending = pendingRingWrites(back).emplace_back();
+    pending.address = address;
+    pending.stamp = write.stamp;
+    pending.size = write.size;
+    pending.record = index;
+    pending.bytes = write.bytes;
+    return true;
+}
+
+bool Driver::ringWaitSatisfied(std::span<const std::uint32_t> packet, std::uint64_t received) {
+    if (!DrawThread::RingWrites() || packet.size() < 4) return false;
+    const auto& pending = pendingRingWrites(FrontDrawThread());
+    if (pending.empty()) return false;
+    const std::uint64_t awaited = packet[2] | (static_cast<std::uint64_t>(packet[3]) << 32u);
+    const auto bytes = Pm4::WaitAwaitedBytes(packet);
+    // The newest write over the awaited bytes decides, as the GPU will see them; one over a part of
+    // them leaves the rest to something older, which is not known here.
+    for (auto it = pending.rbegin(); it != pending.rend(); ++it) {
+        if (awaited >= it->address + it->size || it->address >= awaited + bytes) continue;
+        if (awaited < it->address || awaited + bytes > it->address + it->size || it->stamp <= received) return false;
+        std::uint64_t value = 0;
+        std::memcpy(&value, it->bytes.data() + (awaited - it->address), bytes);
+        return Pm4::WaitComparesValue(packet, value);
+    }
+    return false;
+}
+
+bool Driver::ringWritesPending() {
+    return DrawThread::RingWrites() && !pendingRingWrites(FrontDrawThread()).empty();
+}
+
+bool Driver::ringWritesOverlap(std::span<const ShaderRecompiler::MemoryRegion> regions) {
+    if (!DrawThread::RingWrites()) return false;
+    for (const auto& write : pendingRingWrites(FrontDrawThread())) {
+        for (const auto& region : regions) {
+            if (write.address < region.guestAddress + region.bytes.size() && region.guestAddress < write.address + write.size) return true;
+        }
+    }
+    return false;
+}
+
+void Driver::recordRingWrites(PreparedDraw& prepared, std::unique_lock<GuestMemory::GpuMutexType>& gpuLock) {
+    if (!gpuLock.owns_lock()) {
+        GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Label);
+        gpuLock.lock();
+    }
+    // As the worker records a store or a deferred label group under the mutex: storage images over
+    // a store stored first, then the write on the GPU, or on the CPU when it cannot go there.
+    auto* const localDevice = prepared.device.get();
+    bool first = true;
+    for (const auto& write : prepared.writes) {
+        const auto bytes = std::span<const std::byte>(write.bytes).first(write.size);
+        if (write.store) Graphics::StorageTexture::FlushPending(write.address, write.size, nullptr, "packet store", Graphics::PublishScope::PartialUnits);
+        const int reason = localDevice != nullptr ? localDevice->WriteLabelOnGpu(write.address, bytes, write.stamp, prepared.queue, first) : 4;
+        first = false;
+        countLabelOutcome(reason);
+        if (reason != 0 && reason != 5 && reason != 6) {
+            if (reason != 1 && localDevice != nullptr) localDevice->WaitIdle();
+            GuestMemory::Write(write.address, bytes, write.store ? 1 : 4);
+        }
+        noteLabelStore(write.address, bytes, write.stamp);
+    }
+    ++ringWritten;
+    Graphics::Recorder::CloseLabelGroup(GuestMemory::TrackerGeneration());
 }
 
 }
