@@ -143,6 +143,9 @@ struct Context {
     // VK_KHR_maintenance8: vkCmdCopyImage between a depth aspect and a size-compatible color
     // image (a depth surface and its R32 / R16 storage image, DepthSurface's Transfer).
     bool depthColorCopies = false;
+    // VK_KHR_push_descriptor: DepthSurface's transfer passes push their two views instead of
+    // keeping a set alive for the recorded batch.
+    bool pushDescriptors = false;
     bool pipelineExecutableInfo = false;
     std::uint32_t srgbDecodeFormats = 0;
 

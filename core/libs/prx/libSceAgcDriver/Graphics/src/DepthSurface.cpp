@@ -5,20 +5,278 @@
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
+#include "prx/libSceAgcDriver/Graphics/shaders/DepthToStorage_spv.h"
+#include "prx/libSceAgcDriver/Graphics/shaders/StorageToDepthFrag_spv.h"
+#include "prx/libSceAgcDriver/Graphics/shaders/StorageToDepthVert_spv.h"
 #include "RdnaDecoder/include/RdnaDecoder/RdnaDescriptorFormat.hpp"
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
+#include <set>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <span>
 #include <stdexcept>
 #include <vector>
 
 namespace AgcDriver::Graphics {
 namespace {
+
+// Shader passes between a depth surface's depth plane and a storage image of 32-bit texels
+// (DepthSurface::Transfer): on an RTX 2080 Ti the driver's copy between a depth aspect and a
+// color image (VK_KHR_maintenance8) took 1.43 ms per 4K transfer, these passes 0.13 ms. One per
+// device, made on its first transfer; the views are pushed (VK_KHR_push_descriptor), so a
+// recorded pass holds no descriptor set.
+class DepthTransferPasses {
+public:
+    explicit DepthTransferPasses(const Context& context) : context(context) {
+        this->context.bufferPool.reset();
+        try {
+            pushSet = context.Function<PFN_vkCmdPushDescriptorSetKHR>("vkCmdPushDescriptorSetKHR");
+            Require(pushSet != nullptr, "vkCmdPushDescriptorSetKHR is missing");
+            const std::array<VkDescriptorSetLayoutBinding, 2> computeBindings{{{0, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr}, {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr}}};
+            const VkDescriptorSetLayoutBinding drawBinding{0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
+            computeSetLayout = pushedSetLayout(computeBindings);
+            drawSetLayout = pushedSetLayout({&drawBinding, 1});
+            const VkPushConstantRange extent{VK_SHADER_STAGE_COMPUTE_BIT, 0, 2 * sizeof(std::uint32_t)};
+            computeLayout = pipelineLayout(computeSetLayout, &extent);
+            drawLayout = pipelineLayout(drawSetLayout, nullptr);
+            vertexModule = shaderModule(STORAGE_TO_DEPTH_VERT_SPV);
+            fragmentModule = shaderModule(STORAGE_TO_DEPTH_FRAG_SPV);
+            const auto compute = shaderModule(DEPTH_TO_STORAGE_SPV);
+            VkComputePipelineCreateInfo info{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+            info.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, compute, "main", nullptr};
+            info.layout = computeLayout;
+            const auto created = context.Function<PFN_vkCreateComputePipelines>("vkCreateComputePipelines")(context.device, context.pipelineCache, 1, &info, nullptr, &computePipeline);
+            context.Function<PFN_vkDestroyShaderModule>("vkDestroyShaderModule")(context.device, compute, nullptr);
+            Check(created, "vkCreateComputePipelines depth to storage");
+        } catch (...) {
+            release();
+            throw;
+        }
+    }
+    ~DepthTransferPasses() { release(); }
+    DepthTransferPasses(const DepthTransferPasses&) = delete;
+    DepthTransferPasses& operator=(const DepthTransferPasses&) = delete;
+
+    VkDevice Device() const { return context.device; }
+
+    // The depth plane's bits into the storage image, both in the general layout.
+    void ToStorage(VkCommandBuffer commands, VkImageView depthPlane, VkImageView texels, VkExtent2D extent) const {
+        const VkDescriptorImageInfo depthInfo{VK_NULL_HANDLE, depthPlane, VK_IMAGE_LAYOUT_GENERAL};
+        const VkDescriptorImageInfo texelInfo{VK_NULL_HANDLE, texels, VK_IMAGE_LAYOUT_GENERAL};
+        const std::array<VkWriteDescriptorSet, 2> writes{imageWrite(0, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, depthInfo), imageWrite(1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, texelInfo)};
+        const std::array<std::uint32_t, 2> size{extent.width, extent.height};
+        context.Resolved(&DeviceFunctions::cmdBindPipeline, "vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, computePipeline);
+        pushSet(commands, VK_PIPELINE_BIND_POINT_COMPUTE, computeLayout, 0, static_cast<std::uint32_t>(writes.size()), writes.data());
+        context.Resolved(&DeviceFunctions::cmdPushConstants, "vkCmdPushConstants")(commands, computeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(size), size.data());
+        context.Resolved(&DeviceFunctions::cmdDispatch, "vkCmdDispatch")(commands, (extent.width + 7u) / 8u, (extent.height + 7u) / 8u, 1);
+    }
+
+    // The storage image's texels into the depth plane of the framebuffer's attachment (made for
+    // RenderPass(format)); the stencil plane is kept.
+    void FromStorage(VkCommandBuffer commands, VkFormat format, VkFramebuffer framebuffer, VkImageView texels, VkExtent2D extent) {
+        const auto pass = formatPass(format);
+        VkRenderPassBeginInfo begin{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+        begin.renderPass = pass.renderPass;
+        begin.framebuffer = framebuffer;
+        begin.renderArea = {{0, 0}, extent};
+        const VkViewport viewport{0.0f, 0.0f, static_cast<float>(extent.width), static_cast<float>(extent.height), 0.0f, 1.0f};
+        const VkRect2D scissor{{0, 0}, extent};
+        const VkDescriptorImageInfo texelInfo{VK_NULL_HANDLE, texels, VK_IMAGE_LAYOUT_GENERAL};
+        const auto write = imageWrite(0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, texelInfo);
+        context.Resolved(&DeviceFunctions::cmdBeginRenderPass, "vkCmdBeginRenderPass")(commands, &begin, VK_SUBPASS_CONTENTS_INLINE);
+        context.Resolved(&DeviceFunctions::cmdBindPipeline, "vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, pass.pipeline);
+        context.Resolved(&DeviceFunctions::cmdSetViewport, "vkCmdSetViewport")(commands, 0, 1, &viewport);
+        context.Resolved(&DeviceFunctions::cmdSetScissor, "vkCmdSetScissor")(commands, 0, 1, &scissor);
+        pushSet(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, drawLayout, 0, 1, &write);
+        context.Resolved(&DeviceFunctions::cmdDraw, "vkCmdDraw")(commands, 3, 1, 0, 0);
+        context.Resolved(&DeviceFunctions::cmdEndRenderPass, "vkCmdEndRenderPass")(commands);
+    }
+
+    VkRenderPass RenderPass(VkFormat format) { return formatPass(format).renderPass; }
+
+private:
+    struct FormatPass {
+        VkFormat format = VK_FORMAT_UNDEFINED;
+        VkRenderPass renderPass = VK_NULL_HANDLE;
+        VkPipeline pipeline = VK_NULL_HANDLE;
+    };
+
+    static VkWriteDescriptorSet imageWrite(std::uint32_t binding, VkDescriptorType type, const VkDescriptorImageInfo& info) {
+        VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        write.dstBinding = binding;
+        write.descriptorCount = 1;
+        write.descriptorType = type;
+        write.pImageInfo = &info;
+        return write;
+    }
+
+    VkDescriptorSetLayout pushedSetLayout(std::span<const VkDescriptorSetLayoutBinding> bindings) const {
+        VkDescriptorSetLayoutCreateInfo info{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+        info.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
+        info.bindingCount = static_cast<std::uint32_t>(bindings.size());
+        info.pBindings = bindings.data();
+        VkDescriptorSetLayout layout = VK_NULL_HANDLE;
+        Check(context.Function<PFN_vkCreateDescriptorSetLayout>("vkCreateDescriptorSetLayout")(context.device, &info, nullptr, &layout), "vkCreateDescriptorSetLayout depth transfer");
+        return layout;
+    }
+
+    VkPipelineLayout pipelineLayout(VkDescriptorSetLayout setLayout, const VkPushConstantRange* pushRange) const {
+        VkPipelineLayoutCreateInfo info{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        info.setLayoutCount = 1;
+        info.pSetLayouts = &setLayout;
+        info.pushConstantRangeCount = pushRange != nullptr ? 1u : 0u;
+        info.pPushConstantRanges = pushRange;
+        VkPipelineLayout layout = VK_NULL_HANDLE;
+        Check(context.Function<PFN_vkCreatePipelineLayout>("vkCreatePipelineLayout")(context.device, &info, nullptr, &layout), "vkCreatePipelineLayout depth transfer");
+        return layout;
+    }
+
+    template <std::size_t Words>
+    VkShaderModule shaderModule(const std::uint32_t (&code)[Words]) const {
+        VkShaderModuleCreateInfo info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+        info.codeSize = sizeof(code);
+        info.pCode = code;
+        VkShaderModule module = VK_NULL_HANDLE;
+        Check(context.Function<PFN_vkCreateShaderModule>("vkCreateShaderModule")(context.device, &info, nullptr, &module), "vkCreateShaderModule depth transfer");
+        return module;
+    }
+
+    // The pass and pipeline for an attachment of the format, made on first use. The depth plane
+    // is loaded although every texel is written: an immediate-mode GPU pays nothing for it.
+    FormatPass formatPass(VkFormat format) {
+        for (const auto& pass : formats) {
+            if (pass.format == format) return pass;
+        }
+        const bool stencil = format == VK_FORMAT_D32_SFLOAT_S8_UINT || format == VK_FORMAT_D16_UNORM_S8_UINT;
+        VkAttachmentDescription attachment{};
+        attachment.format = format;
+        attachment.samples = VK_SAMPLE_COUNT_1_BIT;
+        attachment.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+        attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        attachment.stencilLoadOp = stencil ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        attachment.stencilStoreOp = stencil ? VK_ATTACHMENT_STORE_OP_STORE : VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        attachment.initialLayout = VK_IMAGE_LAYOUT_GENERAL;
+        attachment.finalLayout = VK_IMAGE_LAYOUT_GENERAL;
+        const VkAttachmentReference reference{0, VK_IMAGE_LAYOUT_GENERAL};
+        VkSubpassDescription subpass{};
+        subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+        subpass.pDepthStencilAttachment = &reference;
+        VkRenderPassCreateInfo info{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
+        info.attachmentCount = 1;
+        info.pAttachments = &attachment;
+        info.subpassCount = 1;
+        info.pSubpasses = &subpass;
+        FormatPass pass{format};
+        Check(context.Function<PFN_vkCreateRenderPass>("vkCreateRenderPass")(context.device, &info, nullptr, &pass.renderPass), "vkCreateRenderPass depth from storage");
+        try {
+            pass.pipeline = drawPipeline(pass.renderPass);
+        } catch (...) {
+            context.Function<PFN_vkDestroyRenderPass>("vkDestroyRenderPass")(context.device, pass.renderPass, nullptr);
+            throw;
+        }
+        formats.push_back(pass);
+        return pass;
+    }
+
+    VkPipeline drawPipeline(VkRenderPass renderPass) const {
+        const std::array<VkPipelineShaderStageCreateInfo, 2> stages{{{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_VERTEX_BIT, vertexModule, "main", nullptr}, {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_FRAGMENT_BIT, fragmentModule, "main", nullptr}}};
+        const VkPipelineVertexInputStateCreateInfo vertexInput{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+        VkPipelineInputAssemblyStateCreateInfo assembly{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+        assembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+        VkPipelineViewportStateCreateInfo viewport{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+        viewport.viewportCount = 1;
+        viewport.scissorCount = 1;
+        VkPipelineRasterizationStateCreateInfo rasterization{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+        rasterization.polygonMode = VK_POLYGON_MODE_FILL;
+        rasterization.cullMode = VK_CULL_MODE_NONE;
+        rasterization.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+        rasterization.lineWidth = 1.0f;
+        VkPipelineMultisampleStateCreateInfo multisample{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+        multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+        VkPipelineDepthStencilStateCreateInfo depth{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+        depth.depthTestEnable = VK_TRUE;
+        depth.depthWriteEnable = VK_TRUE;
+        depth.depthCompareOp = VK_COMPARE_OP_ALWAYS;
+        const VkPipelineColorBlendStateCreateInfo blend{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+        const std::array<VkDynamicState, 2> dynamicStates{VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+        VkPipelineDynamicStateCreateInfo dynamic{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+        dynamic.dynamicStateCount = static_cast<std::uint32_t>(dynamicStates.size());
+        dynamic.pDynamicStates = dynamicStates.data();
+        VkGraphicsPipelineCreateInfo info{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+        info.stageCount = static_cast<std::uint32_t>(stages.size());
+        info.pStages = stages.data();
+        info.pVertexInputState = &vertexInput;
+        info.pInputAssemblyState = &assembly;
+        info.pViewportState = &viewport;
+        info.pRasterizationState = &rasterization;
+        info.pMultisampleState = &multisample;
+        info.pDepthStencilState = &depth;
+        info.pColorBlendState = &blend;
+        info.pDynamicState = &dynamic;
+        info.layout = drawLayout;
+        info.renderPass = renderPass;
+        VkPipeline pipeline = VK_NULL_HANDLE;
+        Check(context.Function<PFN_vkCreateGraphicsPipelines>("vkCreateGraphicsPipelines")(context.device, context.pipelineCache, 1, &info, nullptr, &pipeline), "vkCreateGraphicsPipelines depth from storage");
+        return pipeline;
+    }
+
+    void release() noexcept {
+        const auto destroyPipeline = context.Function<PFN_vkDestroyPipeline>("vkDestroyPipeline");
+        for (const auto& pass : formats) {
+            destroyPipeline(context.device, pass.pipeline, nullptr);
+            context.Function<PFN_vkDestroyRenderPass>("vkDestroyRenderPass")(context.device, pass.renderPass, nullptr);
+        }
+        formats.clear();
+        destroyPipeline(context.device, computePipeline, nullptr);
+        const auto destroyModule = context.Function<PFN_vkDestroyShaderModule>("vkDestroyShaderModule");
+        destroyModule(context.device, vertexModule, nullptr);
+        destroyModule(context.device, fragmentModule, nullptr);
+        const auto destroyLayout = context.Function<PFN_vkDestroyPipelineLayout>("vkDestroyPipelineLayout");
+        destroyLayout(context.device, computeLayout, nullptr);
+        destroyLayout(context.device, drawLayout, nullptr);
+        const auto destroySetLayout = context.Function<PFN_vkDestroyDescriptorSetLayout>("vkDestroyDescriptorSetLayout");
+        destroySetLayout(context.device, computeSetLayout, nullptr);
+        destroySetLayout(context.device, drawSetLayout, nullptr);
+        computePipeline = VK_NULL_HANDLE;
+        vertexModule = VK_NULL_HANDLE;
+        fragmentModule = VK_NULL_HANDLE;
+        computeLayout = VK_NULL_HANDLE;
+        drawLayout = VK_NULL_HANDLE;
+        computeSetLayout = VK_NULL_HANDLE;
+        drawSetLayout = VK_NULL_HANDLE;
+    }
+
+    Context context;
+    PFN_vkCmdPushDescriptorSetKHR pushSet = nullptr;
+    VkDescriptorSetLayout computeSetLayout = VK_NULL_HANDLE;
+    VkDescriptorSetLayout drawSetLayout = VK_NULL_HANDLE;
+    VkPipelineLayout computeLayout = VK_NULL_HANDLE;
+    VkPipelineLayout drawLayout = VK_NULL_HANDLE;
+    VkPipeline computePipeline = VK_NULL_HANDLE;
+    // The draw's stages, kept for the pipeline of each attachment format.
+    VkShaderModule vertexModule = VK_NULL_HANDLE;
+    VkShaderModule fragmentModule = VK_NULL_HANDLE;
+    std::vector<FormatPass> formats;
+};
+
+// The transfer passes of each device, under surfacesMutex (as every DepthSurface use is).
+std::vector<std::unique_ptr<DepthTransferPasses>>& transferPasses() {
+    static auto* list = new std::vector<std::unique_ptr<DepthTransferPasses>>();
+    return *list;
+}
+
+DepthTransferPasses& transferPassesFor(const Context& context) {
+    auto& list = transferPasses();
+    const auto found = std::find_if(list.begin(), list.end(), [&](const auto& passes) { return passes->Device() == context.device; });
+    if (found != list.end()) return **found;
+    list.push_back(std::make_unique<DepthTransferPasses>(context));
+    return *list.back();
+}
 
 class DepthSurface {
 public:
@@ -165,6 +423,20 @@ public:
                           static_cast<unsigned long long>(target.address), target.extent.width, target.extent.height, static_cast<int>(target.format), resource.width, resource.height, static_cast<int>(format), resource.baseLevel, resource.baseArray);
             throw std::runtime_error(text);
         }
+        // Shader passes (DepthTransferPasses) for 32-bit depth where descriptors can be pushed.
+        // Otherwise one copy between the depth aspect and the color image where the device allows
+        // it (VK_KHR_maintenance8), and through a buffer where not. APS5_NO_DEPTH_TRANSFER_PASS=1
+        // copies; APS5_NO_DEPTH_COLOR_COPY=1 copies through the buffer.
+        static const bool copiesOnly = std::getenv("APS5_NO_DEPTH_TRANSFER_PASS") != nullptr;
+        static const bool viaBuffer = std::getenv("APS5_NO_DEPTH_COLOR_COPY") != nullptr;
+        const bool d32 = target.format == VK_FORMAT_D32_SFLOAT || target.format == VK_FORMAT_D32_SFLOAT_S8_UINT;
+        const bool planar = resource.dimension == TextureDimension::k2D || resource.dimension == TextureDimension::k2DArray;
+        const bool passes = d32 && planar && context.pushDescriptors && !copiesOnly;
+        {
+            // The format pairs transferred, once each.
+            static std::set<std::pair<int, int>> reported;
+            if (reported.insert({static_cast<int>(target.format), static_cast<int>(format)}).second) std::fprintf(stderr, "[depth] storage transfers between depth surface 0x%llx (%ux%u, vk format %d) and a storage image of vk format %d by %s\n", static_cast<unsigned long long>(target.address), target.extent.width, target.extent.height, static_cast<int>(target.format), static_cast<int>(format), passes ? "shader passes" : context.depthColorCopies && !viaBuffer ? "image copies" : "copies through a buffer");
+        }
         auto* recorder = Recorder::Active();
         std::unique_ptr<CommandBatch> batch;
         if (recorder == nullptr) batch = std::make_unique<CommandBatch>(context);
@@ -173,34 +445,47 @@ public:
         // The transfer's [gputime] range (APS5_PROFILE_GPU).
         const auto timing = recorder != nullptr ? recorder->BeginGpuTiming(Recorder::CommandClass::DepthTransfer) : Recorder::NoTiming;
         constexpr VkAccessFlags any = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
-        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, any, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
-        // One copy between the depth aspect and the color image where the device allows it
-        // (VK_KHR_maintenance8); through a buffer otherwise. APS5_NO_DEPTH_COLOR_COPY=1 always
-        // copies through the buffer.
-        static const bool viaBuffer = std::getenv("APS5_NO_DEPTH_COLOR_COPY") != nullptr;
         std::shared_ptr<DeviceBuffer> staged;
-        if (context.depthColorCopies && !viaBuffer) {
-            const VkImageSubresourceLayers depthLayers{VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1};
-            const VkImageSubresourceLayers colorLayers{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-            VkImageCopy region{};
-            region.srcSubresource = intoStorage ? depthLayers : colorLayers;
-            region.dstSubresource = intoStorage ? colorLayers : depthLayers;
-            region.extent = {target.extent.width, target.extent.height, 1};
-            context.Function<PFN_vkCmdCopyImage>("vkCmdCopyImage")(commands, intoStorage ? image : storage.Image(), VK_IMAGE_LAYOUT_GENERAL, intoStorage ? storage.Image() : image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+        if (passes) {
+            auto& transfer = transferPassesFor(context);
+            const auto texels = storage.AtomicView(0, resource.dimension == TextureDimension::k2DArray);
+            if (intoStorage) {
+                RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, any, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+                transfer.ToStorage(commands, depthPlane(), texels, target.extent);
+                RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_SHADER_WRITE_BIT, any);
+            } else {
+                constexpr VkPipelineStageFlags fragmentStages = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+                RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, fragmentStages, any, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT);
+                transfer.FromStorage(commands, target.format, framebufferFor(transfer), texels, target.extent);
+                RecordMemoryBarrier(context, commands, fragmentStages, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT, any);
+            }
         } else {
-            if (transferBuffer == nullptr) transferBuffer = std::make_shared<DeviceBuffer>(context, static_cast<std::size_t>(bytes), VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
-            staged = transferBuffer;
-            const VkBufferImageCopy depthRegion{0, 0, 0, {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1}, {0, 0, 0}, {target.extent.width, target.extent.height, 1}};
-            const VkBufferImageCopy colorRegion{0, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {target.extent.width, target.extent.height, 1}};
-            const auto toBuffer = context.Resolved(&DeviceFunctions::cmdCopyImageToBuffer, "vkCmdCopyImageToBuffer");
-            const auto fromBuffer = context.Resolved(&DeviceFunctions::cmdCopyBufferToImage, "vkCmdCopyBufferToImage");
-            if (intoStorage) toBuffer(commands, image, VK_IMAGE_LAYOUT_GENERAL, staged->Handle(), 1, &depthRegion);
-            else toBuffer(commands, storage.Image(), VK_IMAGE_LAYOUT_GENERAL, staged->Handle(), 1, &colorRegion);
-            RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
-            if (intoStorage) fromBuffer(commands, staged->Handle(), storage.Image(), VK_IMAGE_LAYOUT_GENERAL, 1, &colorRegion);
-            else fromBuffer(commands, staged->Handle(), image, VK_IMAGE_LAYOUT_GENERAL, 1, &depthRegion);
+            RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, any, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+            if (context.depthColorCopies && !viaBuffer) {
+                const VkImageSubresourceLayers depthLayers{VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1};
+                const VkImageSubresourceLayers colorLayers{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+                VkImageCopy region{};
+                region.srcSubresource = intoStorage ? depthLayers : colorLayers;
+                region.dstSubresource = intoStorage ? colorLayers : depthLayers;
+                region.extent = {target.extent.width, target.extent.height, 1};
+                const auto source = intoStorage ? image : storage.Image();
+                const auto destination = intoStorage ? storage.Image() : image;
+                context.Function<PFN_vkCmdCopyImage>("vkCmdCopyImage")(commands, source, VK_IMAGE_LAYOUT_GENERAL, destination, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+            } else {
+                if (transferBuffer == nullptr) transferBuffer = std::make_shared<DeviceBuffer>(context, static_cast<std::size_t>(bytes), VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+                staged = transferBuffer;
+                const VkBufferImageCopy depthRegion{0, 0, 0, {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1}, {0, 0, 0}, {target.extent.width, target.extent.height, 1}};
+                const VkBufferImageCopy colorRegion{0, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {target.extent.width, target.extent.height, 1}};
+                const auto toBuffer = context.Resolved(&DeviceFunctions::cmdCopyImageToBuffer, "vkCmdCopyImageToBuffer");
+                const auto fromBuffer = context.Resolved(&DeviceFunctions::cmdCopyBufferToImage, "vkCmdCopyBufferToImage");
+                if (intoStorage) toBuffer(commands, image, VK_IMAGE_LAYOUT_GENERAL, staged->Handle(), 1, &depthRegion);
+                else toBuffer(commands, storage.Image(), VK_IMAGE_LAYOUT_GENERAL, staged->Handle(), 1, &colorRegion);
+                RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+                if (intoStorage) fromBuffer(commands, staged->Handle(), storage.Image(), VK_IMAGE_LAYOUT_GENERAL, 1, &colorRegion);
+                else fromBuffer(commands, staged->Handle(), image, VK_IMAGE_LAYOUT_GENERAL, 1, &depthRegion);
+            }
+            RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, any);
         }
-        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, any);
         if (batch) {
             batch->SubmitAndWait();
             return;
@@ -269,8 +554,40 @@ private:
     // Transfer's staging between the depth image and a storage image without direct depth/color
     // copies, made once: a fresh one per transfer was a whole surface's allocation (32 MiB at 4K).
     std::shared_ptr<DeviceBuffer> transferBuffer;
+    // Transfer's shader passes: the depth plane the compute pass reads, and the framebuffer the
+    // draw writes it through; both made on first use.
+    VkImageView depthPlaneView = VK_NULL_HANDLE;
+    VkFramebuffer passFramebuffer = VK_NULL_HANDLE;
+
+    VkImageView depthPlane() {
+        if (depthPlaneView != VK_NULL_HANDLE) return depthPlaneView;
+        VkImageViewCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        info.image = image;
+        info.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        info.format = target.format;
+        info.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1};
+        Check(context.Function<PFN_vkCreateImageView>("vkCreateImageView")(context.device, &info, nullptr, &depthPlaneView), "vkCreateImageView depth plane");
+        return depthPlaneView;
+    }
+
+    VkFramebuffer framebufferFor(DepthTransferPasses& passes) {
+        if (passFramebuffer != VK_NULL_HANDLE) return passFramebuffer;
+        VkFramebufferCreateInfo info{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
+        info.renderPass = passes.RenderPass(target.format);
+        info.attachmentCount = 1;
+        info.pAttachments = &view;
+        info.width = target.extent.width;
+        info.height = target.extent.height;
+        info.layers = 1;
+        Check(context.Function<PFN_vkCreateFramebuffer>("vkCreateFramebuffer")(context.device, &info, nullptr, &passFramebuffer), "vkCreateFramebuffer depth from storage");
+        return passFramebuffer;
+    }
 
     void release() noexcept {
+        context.Function<PFN_vkDestroyFramebuffer>("vkDestroyFramebuffer")(context.device, passFramebuffer, nullptr);
+        context.Function<PFN_vkDestroyImageView>("vkDestroyImageView")(context.device, depthPlaneView, nullptr);
+        passFramebuffer = VK_NULL_HANDLE;
+        depthPlaneView = VK_NULL_HANDLE;
         textures.clear();
         layeredTextures.clear();
         if (layeredImage != VK_NULL_HANDLE) retired.push_back({layeredImage, layeredMemory});
@@ -371,6 +688,7 @@ void ClearDepthSurfaces(VkDevice device) {
     std::lock_guard lock(surfacesMutex());
     surfacesGeneration.fetch_add(1, std::memory_order_release);
     std::erase_if(surfaces(), [&](const auto& surface) { return surface->context.device == device; });
+    std::erase_if(transferPasses(), [&](const auto& passes) { return passes->Device() == device; });
 }
 
 std::shared_ptr<Texture> DepthSurfaceTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& resource, VkComponentMapping components) {

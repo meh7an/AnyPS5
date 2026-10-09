@@ -72,6 +72,29 @@ add_custom_command(
         VERBATIM
 )
 
+# A Graphics/shaders source compiled to SPIR-V and embedded as SYMBOL in the generated header
+# prx/libSceAgcDriver/Graphics/shaders/STEM_spv.h; the header joins OUT_LIST.
+function(agc_embedded_shader SOURCE STEM SYMBOL OUT_LIST)
+    set(source "${CMAKE_CURRENT_SOURCE_DIR}/Graphics/shaders/${SOURCE}")
+    set(spv "${agcTextureDetileGeneratedDir}/${STEM}.spv")
+    set(header "${agcTextureDetileGeneratedDir}/${STEM}_spv.h")
+    add_custom_command(
+            OUTPUT "${header}"
+            COMMAND ${CMAKE_COMMAND} -E make_directory "${agcTextureDetileGeneratedDir}"
+            COMMAND "$<TARGET_FILE:glslang-standalone>" -V --target-env vulkan1.1 -o "${spv}" "${source}"
+            COMMAND ${CMAKE_COMMAND} -DINPUT=${spv} -DOUTPUT=${header}
+            -DSYMBOL=${SYMBOL} -P "${CMAKE_CURRENT_SOURCE_DIR}/embed_spirv.cmake"
+            DEPENDS "${source}" glslang-standalone
+            VERBATIM
+    )
+    set(${OUT_LIST} ${${OUT_LIST}} "${header}" PARENT_SCOPE)
+endfunction()
+
+set(agcDepthTransferShaderHeaders)
+agc_embedded_shader(DepthToStorage.comp DepthToStorage DEPTH_TO_STORAGE_SPV agcDepthTransferShaderHeaders)
+agc_embedded_shader(StorageToDepth.vert StorageToDepthVert STORAGE_TO_DEPTH_VERT_SPV agcDepthTransferShaderHeaders)
+agc_embedded_shader(StorageToDepth.frag StorageToDepthFrag STORAGE_TO_DEPTH_FRAG_SPV agcDepthTransferShaderHeaders)
+
 set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Unimplemented.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/DisplayBuffer.cpp
@@ -158,6 +181,7 @@ set(agcDriverSources
         ${agcTextureDetileShaderHeader}
         ${agcMeshArgumentsShaderHeader}
         ${agcSampleCounterShaderHeader}
+        ${agcDepthTransferShaderHeaders}
         ${CMAKE_CURRENT_SOURCE_DIR}/Eq/src/Event.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Eq/src/Query.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Resource/src/Lifecycle.cpp
@@ -475,6 +499,7 @@ add_test_executable(agc_driver_graphics_tests EXCLUDE_FROM_ALL
         ${agcTextureDetileShaderHeader}
         ${agcMeshArgumentsShaderHeader}
         ${agcSampleCounterShaderHeader}
+        ${agcDepthTransferShaderHeaders}
         Execution/src/GuestMemory.cpp
         Execution/src/Pm4.cpp
 )
@@ -627,6 +652,7 @@ if(AGC_BUILD_VISUAL_TEST)
             Graphics/src/UnitShadow.cpp
             Graphics/src/Sampler.cpp
             ${agcTextureDetileShaderHeader}
+            ${agcDepthTransferShaderHeaders}
             ${visualShaders}
     )
 
