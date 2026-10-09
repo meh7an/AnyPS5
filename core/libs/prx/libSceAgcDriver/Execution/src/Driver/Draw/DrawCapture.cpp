@@ -211,7 +211,7 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::compileDrawStag
     phaseTiming.Phase(DrawRowVectors);
     const auto& program = programs[i];
     const auto waveSize = program.binary.stage == Stage::Fragment ? graphics.stages.fragmentWaveSize : graphics.stages.vertexWaveSize;
-    // The stage's request, filled in place (see DrawScratch::requests), the draw's decoded vertex
+    // The stage's request, filled in place (see PreparedDraw::requests), the draw's decoded vertex
     // inputs borrowed rather than copied: vertexInfos outlives every use of it below.
     auto& request = requests[i];
     request.shader = program.binary;

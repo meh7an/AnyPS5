@@ -41,7 +41,17 @@
 #include <utility>
 #include <vector>
 
+namespace AgcDriver {
+class PerformanceTimer;
+}
+
+namespace AgcDriver::GuestMemory {
+class GpuMutexType;
+}
+
 namespace AgcDriver::DriverDetail {
+
+struct PreparedDraw;
 
 class Driver {
 public:
@@ -147,10 +157,20 @@ private:
     static std::uint32_t drawUserWord(const DrawProgram& program, std::int32_t sgpr);
     std::optional<Graphics::IndirectDrawPath> classifyIndirectDraw(const ShaderRecompiler::RecompileResult& result, const Graphics::State& graphics, const DrawProgram& frontProgram, const std::shared_ptr<VulkanDevice>& localDevice, Pm4::DrawParameters& drawParameters, bool traceIndirect);
     DrawVerdict draw(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::string& rejected);
+    // draw's two halves (docs/dev/FRONT_BACK_SPLIT.md). prepareDraw decodes, compiles and resolves
+    // the draw into `prepared` without the GPU mutex (unless APS5_LOCKED_DRAW_PREPARE); it returns
+    // the verdict when nothing is left to record: rejected, nothing to draw, or drawn already (a
+    // CPU-read indirect draw records each of its records itself, and a draw retried after queued
+    // labels draws through a draw() of its own). recordPrepared then records the draw under the
+    // mutex, reading nothing but the record.
+    std::optional<DrawVerdict> prepareDraw(PreparedDraw& prepared, QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::string& rejected, std::unique_lock<GuestMemory::GpuMutexType>& gpuLock, PerformanceTimer& timing, DrawPhaseTiming& phaseTiming, std::uint64_t& captures);
+    void recordPrepared(PreparedDraw& prepared, std::unique_lock<GuestMemory::GpuMutexType>& gpuLock, PerformanceTimer& timing, DrawPhaseTiming& phaseTiming);
     void addDriverPhases(DispatchClass which, const std::array<double, DriverPhaseCount>& ms, bool hit, bool validated);
     static PendingDispatchPhases& pendingDispatchPhases();
     static std::chrono::steady_clock::time_point& packetStartedAt();
     static PendingDrawPhases& pendingDrawPhases();
+    // A draw's Drawn verdict, its phases left for the packet loop to add (APS5_PROFILE_DRAW).
+    static DrawVerdict drawnVerdict(DrawPhaseTiming& phaseTiming, std::uint64_t captures);
     void addDrawPhases(const std::array<double, DrawDriverPhaseCount>& ms, bool drawn, std::uint64_t captures);
     void noteLabelStore(std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t stamp);
     bool storedSince(std::span<const std::uint32_t> packet, std::uint64_t address, std::size_t bytes, std::uint64_t received);
