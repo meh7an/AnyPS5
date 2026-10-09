@@ -15,6 +15,8 @@ struct CompiledShader {
     ShaderRecompiler::ShaderStage stage;
     const ShaderRecompiler::RecompileResult* program;
     std::uint32_t pushConstantOffset;
+    // The guest program's address, for the [gputime] draw breakdown (0 where not known).
+    std::uint64_t codeAddress = 0;
 };
 
 inline VkShaderStageFlagBits VulkanStage(ShaderRecompiler::ShaderStage stage) {

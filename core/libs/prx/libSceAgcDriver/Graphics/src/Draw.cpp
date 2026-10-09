@@ -1617,6 +1617,17 @@ struct RecordParts {
     }
 };
 
+// A draw command's [gputime] range by its programs (APS5_PROFILE_GPU_DRAWS): its first stage's
+// and its pixel stage's.
+std::uint32_t beginDrawProgramTiming(Recorder& recorder, std::span<const CompiledShader> shaders, std::string_view pass) {
+    std::uint64_t vertex = 0, pixel = 0;
+    for (const auto& shader : shaders) {
+        if (shader.stage == ShaderRecompiler::ShaderStage::Fragment) pixel = shader.codeAddress;
+        else if (vertex == 0) vertex = shader.codeAddress;
+    }
+    return recorder.BeginDrawTiming(vertex, pixel, pass);
+}
+
 RecordParts& recordParts() {
     static RecordParts parts;
     return parts;
@@ -1691,15 +1702,24 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     const auto commands = continued ? recorder->CommandsInRenderPass() : recorder->Commands();
     if (capture) captureInputs(context, *recorder, commands, resources, ownSet ? &kept->bindings : nullptr, record.targets.empty() || record.targets.front() == nullptr ? 0 : record.targets.front()->Descriptor().baseAddress);
     // The draw's [gputime] class range: from its first barrier to the pass's trailing barrier (a
-    // continued draw lies inside its pass's range), tagged with the pass's first color target.
+    // continued draw lies inside its pass's range), tagged with the pass's first color target, or
+    // its depth target without one.
     auto drawTiming = Recorder::NoTiming;
     recorder->EndSetupTiming();
-    if (!continued && Recorder::GpuTimingEnabled()) {
+    char passName[64] = "no target";
+    std::uint64_t passTag = 0;
+    if (Recorder::GpuTimingEnabled() && (!continued || Recorder::DrawProgramTiming())) {
         const auto* target = record.targets.empty() || record.targets.front() == nullptr ? nullptr : &record.targets.front()->Descriptor();
-        char name[64] = "no target";
-        if (target != nullptr) std::snprintf(name, sizeof(name), "%ux%u format %u", target->width, target->height, target->format);
-        drawTiming = recorder->BeginGpuTiming(CommandClass::Draw, target != nullptr ? target->baseAddress : 0, name);
+        if (target != nullptr) {
+            std::snprintf(passName, sizeof(passName), "%ux%u format %u", target->width, target->height, target->format);
+            passTag = target->baseAddress;
+        } else if (state.depth.has_value()) {
+            // The low bit keeps a depth surface apart from a color target in the same memory.
+            std::snprintf(passName, sizeof(passName), "depth only, %ux%u vk %d", state.depth->extent.width, state.depth->extent.height, static_cast<int>(state.depth->format));
+            passTag = state.depth->address | 1u;
+        }
     }
+    if (!continued && Recorder::GpuTimingEnabled()) drawTiming = recorder->BeginGpuTiming(CommandClass::Draw, passTag, passName);
     if (!continued && Recorder::BarrierValidate()) {
         auto reads = resources.InPlaceReads();
         if (gpuIndirect) {
@@ -1750,7 +1770,9 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     pushDrawConstants(*record.pipeline, commands, state, draw, shaders, resources, record.pushBytes, record.pushStages, meshArguments != nullptr ? meshArguments->DeviceAddress() : 0);
     parts.mark(RecordParts::Push);
     APS5_LOG_CHARS_OUT_DEBUG("Push constants recorded");
+    const auto programTiming = Recorder::DrawProgramTiming() ? beginDrawProgramTiming(*recorder, shaders, passName) : Recorder::NoTiming;
     recordDrawCommands(context, commands, state, draw, inputs, record.indirect, argumentBuffer, argumentOffset);
+    recorder->EndGpuTiming(programTiming);
     parts.mark(RecordParts::Command);
     if (meshArguments != nullptr) recorder->Keep(meshArguments);
     if (args != nullptr) CountIndirectDraw(record.indirect->path, record.indirect->readMs, rewritten);
@@ -2237,7 +2259,9 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     APS5_LOG_CHARS_OUT_DEBUG("Resources bound");
     pushDrawConstants(*pipeline, commands, state, draw, shaders, *resources, nullptr, 0, meshArguments != nullptr ? meshArguments->DeviceAddress() : 0);
     APS5_LOG_CHARS_OUT_DEBUG("Push constants recorded");
+    const auto programTiming = recorded && Recorder::DrawProgramTiming() ? beginDrawProgramTiming(*recorder, shaders, "full path") : Recorder::NoTiming;
     recordDrawCommands(context, commands, state, draw, inputs, args != nullptr ? &indirect : nullptr, argumentBuffer, argumentOffset);
+    if (recorded) recorder->EndGpuTiming(programTiming);
     if (meshArguments != nullptr && recorded) recorder->Keep(meshArguments);
     if (args != nullptr) CountIndirectDraw(indirect.path, indirect.readMs, rewritten);
     auto checkRecords = indirectRecordCheck(args != nullptr ? &indirect : nullptr);

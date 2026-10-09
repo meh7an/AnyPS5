@@ -478,6 +478,11 @@ public:
     // A range tagged with a guest address for the [gputime] breakdowns: a draw pass's first color
     // target (passes by target, the draws in them), a sampled texture's upload; `name` describes it.
     std::uint32_t BeginGpuTiming(CommandClass which, std::uint64_t tag, std::string_view name);
+    // APS5_PROFILE_GPU_DRAWS=1 (with APS5_PROFILE_GPU): a range around each draw command, keyed by
+    // the draw's vertex and pixel programs, for the [gputime] draws-by-programs line (`pass` names
+    // the pass). It begins inside the open render pass, which it does not end; EndGpuTiming ends it.
+    static bool DrawProgramTiming();
+    std::uint32_t BeginDrawTiming(std::uint64_t vertex, std::uint64_t pixel, std::string_view pass);
     // What a draw or a dispatch records ahead of its own ranges (target refreshes, resource builds,
     // uploads) as one setup range of class DrawSetup or DispatchSetup. A draw's opens only while no
     // render pass is open (opening it then ends none); a dispatch's ends the open pass, as the

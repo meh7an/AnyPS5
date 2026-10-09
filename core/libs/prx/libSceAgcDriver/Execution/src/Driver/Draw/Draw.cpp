@@ -469,7 +469,7 @@ std::optional<DrawVerdict> Driver::prepareDraw(PreparedDraw& prepared, QueueStat
             fold(result, drawParameters);
         }
         require(result.pushConstants.size() <= Graphics::PipelinePushConstantBytes - pushCursorBytes, "stage push constants exceed the pipeline push constant block");
-        stages.push_back({program.binary.stage, &result, result.pushConstants.empty() ? 0u : pushCursorBytes});
+        stages.push_back({program.binary.stage, &result, result.pushConstants.empty() ? 0u : pushCursorBytes, program.binary.codeAddress});
         pushCursorBytes += static_cast<std::uint32_t>(result.pushConstants.size());
     }
 

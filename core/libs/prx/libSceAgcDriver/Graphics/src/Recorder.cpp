@@ -1774,6 +1774,12 @@ std::map<std::uint64_t, PassTotals> timingPasses;
 // Sampled texture uploads (TextureUpload) by texture address, named like the passes.
 std::map<std::uint64_t, TimingTotals> timingUploads;
 std::map<std::uint64_t, std::string> timingPassNames;
+// Draw commands (APS5_PROFILE_GPU_DRAWS) by a mix of their vertex and pixel program addresses, with
+// the programs and the first pass seen; their ranges nest in the pass ranges and enter no other
+// total.
+constexpr std::uint64_t DrawProgramKey = 0x4;
+std::map<std::uint64_t, TimingTotals> timingDrawPrograms;
+std::map<std::uint64_t, std::string> timingDrawNames;
 
 bool DrawOrGpuProfiled() {
     static const bool profiled = std::getenv("APS5_PROFILE_DRAW") != nullptr || Recorder::GpuTimingEnabled();
@@ -1969,6 +1975,27 @@ std::uint32_t Recorder::BeginGpuTiming(CommandClass which, std::uint64_t tag, st
 bool Recorder::SiteProbes() {
     static const bool enabled = GpuTimingEnabled() && std::getenv("APS5_PROFILE_GPU_SITES") != nullptr;
     return enabled;
+}
+
+bool Recorder::DrawProgramTiming() {
+    static const bool enabled = GpuTimingEnabled() && std::getenv("APS5_PROFILE_GPU_DRAWS") != nullptr;
+    return enabled;
+}
+
+std::uint32_t Recorder::BeginDrawTiming(std::uint64_t vertex, std::uint64_t pixel, std::string_view pass) {
+    // The pass's own range made the batch's query pool: a pool's reset cannot be recorded in a pass.
+    if (!DrawProgramTiming() || open == nullptr || open->queries == VK_NULL_HANDLE) return NoTiming;
+    const auto index = beginTiming(DrawProgramKey);
+    if (index == NoTiming) return index;
+    const auto tag = vertex * 0x9e3779b97f4a7c15ull ^ pixel;
+    open->timedTags[index] = tag;
+    std::lock_guard lock(timingMutex);
+    if (!timingDrawNames.contains(tag)) {
+        char name[160];
+        std::snprintf(name, sizeof(name), "vs 0x%llx ps 0x%llx (%.*s)", static_cast<unsigned long long>(vertex), static_cast<unsigned long long>(pixel), static_cast<int>(pass.size()), pass.data());
+        timingDrawNames.emplace(tag, name);
+    }
+    return index;
 }
 
 void Recorder::BeginSetupTiming(CommandClass which) {
@@ -2230,6 +2257,12 @@ void Recorder::readGpuTiming(Batch& batch) {
             timingBatchMs += ns / 1e6;
             continue;
         }
+        if (batch.timedKeys[i] == DrawProgramKey) {
+            auto& draw = timingDrawPrograms[batch.timedTags[i]];
+            ++draw.count;
+            draw.ms += ns / 1e6;
+            continue;
+        }
         const auto key = batch.timedKeys[i];
         auto& totals = timingByKey[key];
         ++totals.count;
@@ -2350,7 +2383,19 @@ void Recorder::readGpuTiming(Batch& batch) {
         std::snprintf(text, sizeof(text), " 0x%llx (%s) x%.1f %.2fms %.1f draws;", static_cast<unsigned long long>(passes[i].first), named != timingPassNames.end() ? named->second.c_str() : "?", static_cast<double>(passes[i].second.count) * perPresent, passes[i].second.ms * perPresent, static_cast<double>(passes[i].second.draws) * perPresent);
         passText += text;
     }
-    AgcDriver::ProfilePrint_nid_no_patch("[gputime] draw passes by first color target, costliest first (per present: passes, GPU time, draws):%s\n", passText.c_str());
+    AgcDriver::ProfilePrint_nid_no_patch("[gputime] draw passes by first color target (the depth target without one), costliest first (per present: passes, GPU time, draws):%s\n", passText.c_str());
+    if (DrawProgramTiming()) {
+        std::vector<std::pair<std::uint64_t, TimingTotals>> draws(timingDrawPrograms.begin(), timingDrawPrograms.end());
+        std::sort(draws.begin(), draws.end(), [](const auto& a, const auto& b) { return a.second.ms > b.second.ms; });
+        std::string drawText;
+        for (std::size_t i = 0; i < draws.size() && i < 20; ++i) {
+            const auto named = timingDrawNames.find(draws[i].first);
+            char text[224];
+            std::snprintf(text, sizeof(text), " %s x%.1f %.3fms;", named != timingDrawNames.end() ? named->second.c_str() : "?", static_cast<double>(draws[i].second.count) * perPresent, draws[i].second.ms * perPresent);
+            drawText += text;
+        }
+        AgcDriver::ProfilePrint_nid_no_patch("[gputime] draws by vertex and pixel program, costliest first (per present: draws, GPU time):%s\n", drawText.c_str());
+    }
     std::vector<std::pair<std::uint64_t, TimingTotals>> uploads(timingUploads.begin(), timingUploads.end());
     std::sort(uploads.begin(), uploads.end(), [](const auto& a, const auto& b) { return a.second.ms > b.second.ms; });
     std::string uploadText;
@@ -2364,6 +2409,7 @@ void Recorder::readGpuTiming(Batch& batch) {
     timingGaps.clear();
     timingPasses.clear();
     timingUploads.clear();
+    timingDrawPrograms.clear();
     timingByKey.clear();
     timingProgramMs = timingClassMs = timingUnionMs = timingBatchMs = 0;
     timingBatches = 0;
