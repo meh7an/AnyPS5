@@ -45,7 +45,7 @@ void Driver::run(std::uint32_t id) noexcept {
 
     GuestMemory::TagGpuLockThread(id);
     if (id == 0) StartWorkerSampler();
-    // Queue 0's draw back thread (APS5_DRAW_THREAD=1) records the draws this worker prepares.
+    // Queue 0's draw back thread records the draws this worker prepares (APS5_NO_DRAW_THREAD=1: none).
     std::unique_ptr<DrawThread> back;
     if (id == 0 && DrawThread::Enabled()) {
         back = std::make_unique<DrawThread>(id);

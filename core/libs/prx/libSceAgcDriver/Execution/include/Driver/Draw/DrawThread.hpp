@@ -13,14 +13,14 @@ namespace AgcDriver::DriverDetail {
 
 struct PreparedDraw;
 
-// A queue's draw back thread (docs/dev/FRONT_BACK_SPLIT.md, stage 2; APS5_DRAW_THREAD=1, queue 0).
-// The queue worker, the front, prepares each draw into Slot() and hands it over with Push; the back
-// thread (Driver::runDrawThread) records the records in order, each under GuestMemory::GpuMutex,
-// and empties them. One record is in flight at most: the front prepares the next draw while the
-// back records the last one. The front drains the back (waits until it recorded every record)
-// before whatever must land after those draws: its own GpuMutex acquisitions (the GPU-lock front,
-// GuestMemory::SetGpuLockFront), packets with effects outside the queue state, a draw that writes
-// guest memory, and the end of a submission.
+// A queue's draw back thread (docs/dev/FRONT_BACK_SPLIT.md, stage 2), queue 0's unless
+// APS5_NO_DRAW_THREAD=1. The queue worker, the front, prepares each draw into Slot() and hands it
+// over with Push; the back thread (Driver::runDrawThread) records the records in order, each under
+// GuestMemory::GpuMutex, and empties them. One record is in flight at most: the front prepares the
+// next draw while the back records the last one. The front drains the back (waits until it recorded
+// every record) before whatever must land after those draws: its own GpuMutex acquisitions (the
+// GPU-lock front, GuestMemory::SetGpuLockFront), packets with effects outside the queue state, a
+// draw that writes guest memory, and the end of a submission.
 class DrawThread {
 public:
     // Why the front waited for the back thread, for the [draw-thread] line (APS5_PROFILE_DRAW).
@@ -31,8 +31,9 @@ public:
     DrawThread(const DrawThread&) = delete;
     DrawThread& operator=(const DrawThread&) = delete;
 
-    // APS5_DRAW_THREAD=1, unless APS5_LOCKED_DRAW_PREPARE (a draw prepared under the GPU mutex
-    // cannot hand itself over while holding it).
+    // On unless APS5_NO_DRAW_THREAD=1 (the worker records its draws itself, as before) or
+    // APS5_LOCKED_DRAW_PREPARE (a draw prepared under the GPU mutex cannot hand itself over while
+    // holding it).
     static bool Enabled();
 
     // The front's side.

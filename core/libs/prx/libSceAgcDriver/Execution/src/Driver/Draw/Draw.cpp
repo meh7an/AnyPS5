@@ -116,10 +116,7 @@ DrawThread::DrawThread(std::uint32_t queue) : queue(queue) {
 DrawThread::~DrawThread() = default;
 
 bool DrawThread::Enabled() {
-    static const bool enabled = [] {
-        const char* text = std::getenv("APS5_DRAW_THREAD");
-        return text != nullptr && std::strtol(text, nullptr, 10) != 0 && std::getenv("APS5_LOCKED_DRAW_PREPARE") == nullptr;
-    }();
+    static const bool enabled = std::getenv("APS5_NO_DRAW_THREAD") == nullptr && std::getenv("APS5_LOCKED_DRAW_PREPARE") == nullptr;
     return enabled;
 }
 
