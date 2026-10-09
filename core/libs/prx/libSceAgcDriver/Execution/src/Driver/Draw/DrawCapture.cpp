@@ -64,6 +64,16 @@ bool VerifyStageMemo() {
     return verify;
 }
 
+// The served copies a memo slot keeps (StageMemoSlot::served): APS5_STAGE_MEMO_COPIES, 1 to 8.
+std::size_t StageMemoCopies() {
+    static const std::size_t copies = [] {
+        const char* text = std::getenv("APS5_STAGE_MEMO_COPIES");
+        const auto value = text != nullptr ? std::strtoull(text, nullptr, 10) : 8ull;
+        return static_cast<std::size_t>(std::clamp<unsigned long long>(value, 1ull, 8ull));
+    }();
+    return copies;
+}
+
 std::size_t StageMemoCapacity() {
     static const std::size_t capacity = [] {
         const char* text = std::getenv("APS5_STAGE_MEMO_ENTRIES");
@@ -293,9 +303,11 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::compileDrawStag
                 // Held by nothing but the slot: no draw is using it any more.
                 // use_count reads relaxed: the fence orders the patch after the last holder's
                 // release (a draw thread's record drops its reference there).
-                if (slot.served != nullptr && slot.served.use_count() == 1) {
+                for (std::size_t copy = 0; copy < StageMemoCopies(); ++copy) {
+                    if (slot.served[copy] == nullptr || slot.served[copy].use_count() != 1) continue;
                     std::atomic_thread_fence(std::memory_order_acquire);
-                    served = slot.served;
+                    served = slot.served[copy];
+                    break;
                 }
             } else {
                 ++slot.misses;
@@ -352,7 +364,13 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::compileDrawStag
             if (fresh) {
                 std::lock_guard lock(stageMemoMutex);
                 auto* found = stageMemo.find(memoHash);
-                if (found != nullptr && found->entry == entry && (found->served == nullptr || found->served.use_count() > 1)) found->served = served;
+                // The copy takes an empty place, else one whose result a draw still holds.
+                if (found != nullptr && found->entry == entry) {
+                    const auto copies = std::span(found->served).first(StageMemoCopies());
+                    auto place = std::find(copies.begin(), copies.end(), nullptr);
+                    if (place == copies.end()) place = std::find_if(copies.begin(), copies.end(), [](const auto& copy) { return copy.use_count() > 1; });
+                    if (place != copies.end()) *place = served;
+                }
             }
             memoResult = served;
             if (!VerifyStageMemo()) {
@@ -518,7 +536,7 @@ void Driver::insertStageMemo(std::uint64_t hash, const std::shared_ptr<const Sha
     slot->entry = std::move(entry);
     slot->source = handle->source.get();
     slot->pushOffset = pushOffset;
-    slot->served.reset();
+    slot->served = {};
     slot->generation = generation;
     // Eviction moves entries in the map: `slot` is not used past this point.
     while (stageMemo.size() > StageMemoCapacity() && !stageMemoOrder.empty()) {

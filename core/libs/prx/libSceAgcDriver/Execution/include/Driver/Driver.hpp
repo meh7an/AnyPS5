@@ -333,10 +333,12 @@ private:
         const void* source = nullptr;
         std::uint32_t pushOffset = 0;
         std::list<std::uint64_t>::iterator order;
-        // The result the slot last served, patched in place by the next hit while no draw holds it
-        // (a copy of the entry's result per hit cost a few dozen allocations). A hit that finds it
-        // held (the draw cache's variants keep theirs until evicted) copies, and the copy replaces it.
-        std::shared_ptr<ShaderRecompiler::RecompileResult> served;
+        // The results the slot served, each patched in place by a later hit while no draw holds it
+        // (a copy of the entry's result per hit cost a few dozen allocations). Several, because the
+        // draws in the draw thread's ring hold theirs (as the draw cache's variants do until
+        // evicted): a hit that finds all of them held copies, and the copy joins them
+        // (APS5_STAGE_MEMO_COPIES, 1 to 8, 8 by default).
+        std::array<std::shared_ptr<ShaderRecompiler::RecompileResult>, 8> served;
         // The entry's misses in a row (its words changed): a key whose words keep changing is
         // validated and stored again only at powers of two of them, then every 64th.
         std::uint32_t misses = 0;
