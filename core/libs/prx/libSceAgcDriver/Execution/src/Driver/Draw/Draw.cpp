@@ -1,16 +1,78 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawThread.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/PreparedDraw.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Queues/WorkerAffinity.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
+#include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ThreadScratch.hpp"
+#include "prx/libc/include/HostThreadSlot.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include <cstdlib>
 
 namespace AgcDriver::DriverDetail {
 
 namespace {
+
+struct FrontDrawThreadTag;
+
+// Waits until `ready()`: spins about 50 us first, as the other thread usually answers within a few,
+// then sleeps on `word` with `sleeping` set, which has the other thread wake it after its next
+// change of `word` (set before `word` is read, so one of the two always sees the other).
+template<typename TReady>
+void awaitWord(const std::atomic<std::uint32_t>& word, std::atomic<bool>& sleeping, TReady&& ready) {
+    if (ready()) return;
+    const auto start = std::chrono::steady_clock::now();
+    for (std::uint32_t spin = 1;; ++spin) {
+#if defined(__x86_64__) || defined(__i386__)
+        __builtin_ia32_pause();
+#endif
+        if (ready()) return;
+        if ((spin & 63u) == 0 && std::chrono::steady_clock::now() - start > std::chrono::microseconds(50)) break;
+    }
+    for (;;) {
+        sleeping.store(true, std::memory_order_seq_cst);
+        const auto seen = word.load(std::memory_order_seq_cst);
+        if (ready()) break;
+        WaitWhile(word, seen);
+    }
+    sleeping.store(false, std::memory_order_relaxed);
+}
+
+// Whether a draw's stages may write guest memory besides its render targets: a buffer element not
+// proved read-only, a written or atomic storage image, GDS, or an address-based (BDA) binding. A
+// worker waits for such a draw on its draw thread before it prepares the next one, whose captures
+// and validation read what recording it registers (pending writes, write stamps, pending images).
+bool writesGuestMemory(std::span<const Graphics::CompiledShader> stages) {
+    using Role = ShaderRecompiler::DescriptorRole;
+    const auto any = [](const ShaderRecompiler::ElementFlags& flags) {
+        for (const bool flag : flags) {
+            if (flag) return true;
+        }
+        return false;
+    };
+    for (const auto& stage : stages) {
+        for (const auto& binding : stage.program->bindings) {
+            switch (binding.role) {
+                case Role::GuestBuffers:
+                    if (binding.bufferWritten.size() < binding.count || any(binding.bufferWritten)) return true;
+                    break;
+                case Role::GuestImages:
+                    if (binding.kind == ShaderRecompiler::DescriptorKind::StorageImage && (binding.imageWritten.size() < binding.count || any(binding.imageWritten) || any(binding.imageAtomic))) return true;
+                    break;
+                case Role::Gds:
+                case Role::BdaPagetable:
+                    return true;
+                default:
+                    break;
+            }
+        }
+    }
+    return false;
+}
 
 struct PreparedDrawTag;
 
@@ -47,6 +109,92 @@ private:
 
 }
 
+DrawThread::DrawThread(std::uint32_t queue) : queue(queue) {
+    for (auto& slot : slots) slot = std::make_unique<PreparedDraw>();
+}
+
+DrawThread::~DrawThread() = default;
+
+bool DrawThread::Enabled() {
+    static const bool enabled = [] {
+        const char* text = std::getenv("APS5_DRAW_THREAD");
+        return text != nullptr && std::strtol(text, nullptr, 10) != 0 && std::getenv("APS5_LOCKED_DRAW_PREPARE") == nullptr;
+    }();
+    return enabled;
+}
+
+bool DrawThread::Push() {
+    const auto count = pushed.load(std::memory_order_relaxed);
+    if (recorded.load(std::memory_order_acquire) != count) Drain(Wait::Push);
+    if (abandoned.load(std::memory_order_acquire)) return false;
+    pushed.store(count + 1, std::memory_order_seq_cst);
+    doorbell.fetch_add(1, std::memory_order_seq_cst);
+    if (backSleeping.load(std::memory_order_seq_cst)) WakeAll(doorbell);
+    ++pushes;
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    if (profile) report();
+    return true;
+}
+
+void DrawThread::Drain(Wait why) {
+    const auto count = pushed.load(std::memory_order_relaxed);
+    if (recorded.load(std::memory_order_acquire) == count) return;
+    // The draw thread needs the mutex to record what it waits for.
+    require(!GuestMemory::GpuMutex().HeldByThisThread(), "a queue worker waited for its draw thread holding the GPU mutex");
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    // A draw thread that left early records nothing more.
+    awaitWord(recorded, frontSleeping, [&] { return recorded.load(std::memory_order_acquire) == count || abandoned.load(std::memory_order_acquire); });
+    const auto index = static_cast<std::size_t>(why);
+    ++waits[index];
+    if (profile) waitedMs[index] += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+}
+
+void DrawThread::AttachFront() {
+    GuestMemory::SetGpuLockFront(CurrentThreadToken(), [](void* back) { return static_cast<DrawThread*>(back)->Busy(); }, [](void* back) { static_cast<DrawThread*>(back)->Drain(Wait::Lock); }, this);
+    HostThreadSlot<DrawThread*, FrontDrawThreadTag>::Set(this);
+}
+
+void DrawThread::Stop() {
+    stopping.store(true, std::memory_order_seq_cst);
+    doorbell.fetch_add(1, std::memory_order_seq_cst);
+    WakeAll(doorbell);
+    if (thread.joinable()) thread.join();
+    GuestMemory::SetGpuLockFront(nullptr, nullptr, nullptr, nullptr);
+    HostThreadSlot<DrawThread*, FrontDrawThreadTag>::Set(nullptr);
+}
+
+bool DrawThread::AwaitRecord(std::uint32_t taken) {
+    awaitWord(doorbell, backSleeping, [&] { return pushed.load(std::memory_order_acquire) != taken || stopping.load(std::memory_order_acquire); });
+    return pushed.load(std::memory_order_acquire) != taken;
+}
+
+void DrawThread::Recorded(std::uint32_t count) {
+    recorded.store(count, std::memory_order_seq_cst);
+    if (frontSleeping.load(std::memory_order_seq_cst)) WakeAll(recorded);
+}
+
+void DrawThread::Abandon() {
+    abandoned.store(true, std::memory_order_seq_cst);
+    Recorded(pushed.load(std::memory_order_acquire));
+}
+
+void DrawThread::report() {
+    const auto now = std::chrono::steady_clock::now();
+    if (now - lastReport < std::chrono::seconds(10)) return;
+    const auto seconds = std::chrono::duration<double>(now - lastReport).count();
+    lastReport = now;
+    const auto at = [&](Wait why) { return static_cast<std::size_t>(why); };
+    std::fprintf(stderr, "[draw-thread] queue 0x%x (%.0f s): %llu draws handed over; the worker waited for the draw thread before a hand-off %llu times (%.0f ms), at its GPU mutex %llu (%.0f ms), before a packet %llu (%.0f ms), after a memory-writing draw %llu (%.0f ms), at the end of a submission %llu (%.0f ms)\n", queue, seconds, static_cast<unsigned long long>(pushes), static_cast<unsigned long long>(waits[at(Wait::Push)]), waitedMs[at(Wait::Push)], static_cast<unsigned long long>(waits[at(Wait::Lock)]), waitedMs[at(Wait::Lock)], static_cast<unsigned long long>(waits[at(Wait::Packet)]), waitedMs[at(Wait::Packet)], static_cast<unsigned long long>(waits[at(Wait::Writer)]), waitedMs[at(Wait::Writer)], static_cast<unsigned long long>(waits[at(Wait::End)]), waitedMs[at(Wait::End)]);
+    pushes = 0;
+    waits.fill(0);
+    waitedMs.fill(0);
+}
+
+DrawThread* FrontDrawThread() {
+    return HostThreadSlot<DrawThread*, FrontDrawThreadTag>::Get();
+}
+
 DrawVerdict Driver::drawnVerdict(DrawPhaseTiming& phaseTiming, std::uint64_t captures) {
     phaseTiming.Phase(DrawRowVectors);
     if (!phaseTiming.profile) return DrawVerdict::Drawn;
@@ -68,6 +216,34 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     if (profile && packetStartedAt() != std::chrono::steady_clock::time_point{}) phaseMs[DrawRowPrologue] = std::chrono::duration<double, std::milli>(phaseLap - packetStartedAt()).count();
     // Once taken, held until the draw returns: the record is emptied under it.
     std::unique_lock gpuLock(GuestMemory::GpuMutex(), std::defer_lock);
+    if (auto* back = FrontDrawThread(); back != nullptr && back->FrontReady()) {
+        auto& slot = back->Slot();
+        // Emptied here unless handed over: the draw thread empties what it records.
+        struct Preparing {
+            DrawThread& back;
+            PreparedDraw& slot;
+            bool handed = false;
+            ~Preparing() {
+                if (!handed) slot.Clear();
+                back.preparing = false;
+            }
+        } preparing{*back, slot};
+        back->preparing = true;
+        if (const auto verdict = prepareDraw(slot, queue, packet, submission, rejected, gpuLock, timing, phaseTiming, captures)) return *verdict;
+        // The worker's deferred labels come before this draw in the stream: recorded now, as the
+        // serial draw's own lock records them (the draw thread's sees only its own, empty list).
+        if (!deferredLabels().labels.empty()) {
+            GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
+            std::lock_guard labelLock(GuestMemory::GpuMutex());
+            recordLabelsForPacket(slot.device.get(), submission.queue);
+        }
+        const bool writes = writesGuestMemory(slot.stages);
+        slot.collectEpoch = GuestMemory::ThreadCollectEpoch();
+        preparing.handed = back->Push();
+        if (!preparing.handed) recordPrepared(slot, gpuLock, timing, phaseTiming);
+        else if (writes) back->Drain(DrawThread::Wait::Writer);
+        return drawnVerdict(phaseTiming, captures);
+    }
     const PreparedDrawLease prepared;
     if (const auto verdict = prepareDraw(*prepared, queue, packet, submission, rejected, gpuLock, timing, phaseTiming, captures)) return *verdict;
     recordPrepared(*prepared, gpuLock, timing, phaseTiming);
@@ -466,6 +642,42 @@ void Driver::recordPrepared(PreparedDraw& prepared, std::unique_lock<GuestMemory
     phaseTiming.Phase(DrawRowGraphics);
     if (built != nullptr) attachDrawRecipe(prepared.drawKey, prepared.recipeStages, std::move(built));
     timing.Mark("draw_and_resource_release");
+}
+
+void Driver::runDrawThread(DrawThread& back) noexcept {
+    onWorkerThread() = true;
+    {
+        char role[32];
+        std::snprintf(role, sizeof role, "draw thread 0x%x", back.queue);
+        PinWorkerThread(role);
+    }
+    GuestMemory::TagGpuLockThread(back.queue);
+    std::array<double, DrawDriverPhaseCount> phaseMs{};
+    std::chrono::steady_clock::time_point phaseLap{};
+    DrawPhaseTiming phaseTiming{false, phaseMs, phaseLap};
+    try {
+        for (std::uint32_t taken = 0; back.AwaitRecord(taken); ++taken) {
+            auto& prepared = back.Record(taken);
+            GuestMemory::AdoptCollectEpoch(prepared.collectEpoch);
+            PerformanceTimer timing("Driver.Draw");
+            std::unique_lock gpuLock(GuestMemory::GpuMutex(), std::defer_lock);
+            try {
+                recordPrepared(prepared, gpuLock, timing, phaseTiming);
+            } catch (const std::exception& error) {
+                // The worker's packet has moved on: reported without its register dump.
+                CaptureTrace::Log("draw-error queue=%x reason=%.256s (draw thread)", back.queue, error.what());
+                reportSkip("draw", std::string(error.what()) + " [draw thread]");
+            }
+            // Emptied under the mutex, as draw() empties its record: the last reference to a device
+            // ends its recorder, which needs it.
+            if (!gpuLock.owns_lock()) gpuLock.lock();
+            prepared.Clear();
+            gpuLock.unlock();
+            back.Recorded(taken + 1);
+        }
+    } catch (...) {
+        back.Abandon();
+    }
 }
 
 }

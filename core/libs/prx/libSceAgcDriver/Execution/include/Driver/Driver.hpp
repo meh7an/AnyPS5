@@ -52,6 +52,7 @@ class GpuMutexType;
 namespace AgcDriver::DriverDetail {
 
 struct PreparedDraw;
+class DrawThread;
 
 class Driver {
 public:
@@ -165,6 +166,8 @@ private:
     // mutex, reading nothing but the record.
     std::optional<DrawVerdict> prepareDraw(PreparedDraw& prepared, QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::string& rejected, std::unique_lock<GuestMemory::GpuMutexType>& gpuLock, PerformanceTimer& timing, DrawPhaseTiming& phaseTiming, std::uint64_t& captures);
     void recordPrepared(PreparedDraw& prepared, std::unique_lock<GuestMemory::GpuMutexType>& gpuLock, PerformanceTimer& timing, DrawPhaseTiming& phaseTiming);
+    // A queue's draw back thread (DrawThread): records the draws its worker hands over.
+    void runDrawThread(DrawThread& back) noexcept;
     void addDriverPhases(DispatchClass which, const std::array<double, DriverPhaseCount>& ms, bool hit, bool validated);
     static PendingDispatchPhases& pendingDispatchPhases();
     static std::chrono::steady_clock::time_point& packetStartedAt();

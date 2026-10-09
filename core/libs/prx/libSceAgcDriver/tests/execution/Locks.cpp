@@ -1,13 +1,15 @@
-// The driver's locks: Mutex, the device use gate and the recursive GPU mutex, under contention, and
-// the queue mutex's hand-over from the GPU mutex; and the thread slots that stand in for
-// thread_local on the hot paths.
+// The driver's locks: Mutex, the device use gate and the recursive GPU mutex, under contention, the
+// queue mutex's hand-over from the GPU mutex, the GPU-lock front and a draw thread's hand-off; and the
+// thread slots that stand in for thread_local on the hot paths.
 #include "prx/libSceAgcDriver/Execution/include/Driver/DeviceAccess.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawThread.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include "prx/libc/include/HostThreadSlot.hpp"
 #ifdef _WIN32
 #include <windows.h>
 #endif
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -188,6 +190,83 @@ void QueueMutexHandOver() {
     Check(submitted, "the queue call goes ahead once the queue is released");
 }
 
+// The GPU-lock front (a worker with a draw thread): its outermost lock() drains first, a nested one
+// and other threads' do not, and its tries fail while a draw is in flight.
+void GpuLockFront() {
+    auto& gpu = AgcDriver::GuestMemory::GpuMutex();
+    struct Fake {
+        bool busy = false;
+        int drains = 0;
+    } fake;
+    AgcDriver::GuestMemory::SetGpuLockFront(AgcDriver::CurrentThreadToken(), [](void* context) { return static_cast<Fake*>(context)->busy; }, [](void* context) {
+        auto& self = *static_cast<Fake*>(context);
+        ++self.drains;
+        self.busy = false;
+    }, &fake);
+    fake.busy = true;
+    Check(!gpu.try_lock(), "the front's try fails while its draw thread is busy");
+    gpu.lock();
+    Check(fake.drains == 1 && !fake.busy, "the front's lock drains its draw thread first");
+    fake.busy = true;
+    gpu.lock();
+    Check(fake.drains == 1, "a nested lock does not drain");
+    gpu.unlock();
+    gpu.unlock();
+    std::thread other([&] {
+        std::lock_guard lock(gpu);
+    });
+    other.join();
+    Check(fake.drains == 1, "another thread's lock does not drain the front's draw thread");
+    fake.busy = false;
+    Check(gpu.try_lock(), "the front's try succeeds once its draw thread is idle");
+    gpu.unlock();
+    AgcDriver::GuestMemory::SetGpuLockFront(nullptr, nullptr, nullptr, nullptr);
+}
+
+// A draw thread's hand-off: records reach the back thread in order, a slot is free again whenever
+// the front gets it, Drain leaves nothing in flight, and the front's GPU lock drains. Pauses on
+// either side make the other sleep, so a lost wake-up would hang here.
+void DrawThreadHandOff() {
+    using AgcDriver::DriverDetail::DrawThread;
+    DrawThread back(0);
+    // What each of the two slots holds: written by the front before a Push, cleared by the back.
+    std::array<std::uint32_t, 2> sequence{};
+    std::atomic<bool> ordered{true};
+    back.thread = std::thread([&] {
+        for (std::uint32_t taken = 0; back.AwaitRecord(taken); ++taken) {
+            if (&back.Record(taken) != &back.Record(taken + 2) || sequence[taken % 2] != taken + 1) ordered = false;
+            if (taken % 7919 == 0) std::this_thread::sleep_for(std::chrono::microseconds(300));
+            sequence[taken % 2] = 0;
+            back.Recorded(taken + 1);
+        }
+    });
+    back.AttachFront();
+    Check(AgcDriver::DriverDetail::FrontDrawThread() == &back, "the attached worker finds its draw thread");
+    bool reused = false;
+    bool drained = true;
+    bool locked = true;
+    for (std::uint32_t i = 1; i <= 100000; ++i) {
+        if (&back.Slot() != &back.Record(i - 1) || sequence[(i - 1) % 2] != 0) reused = true;
+        sequence[(i - 1) % 2] = i;
+        if (!back.Push()) reused = true;
+        if (i % 4999 == 0) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        if (i % 1000 == 0) {
+            back.Drain(DrawThread::Wait::End);
+            drained = drained && !back.Busy();
+        }
+        if (i % 3001 == 0) {
+            std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+            locked = locked && !back.Busy();
+        }
+    }
+    back.Stop();
+    Check(ordered, "the draw thread records the records in order");
+    Check(!reused, "the front's slot is empty whenever it gets it");
+    Check(drained, "Drain leaves no record in flight");
+    Check(locked, "the front's GPU lock waits for the record in flight");
+    Check(AgcDriver::DriverDetail::FrontDrawThread() == nullptr, "a stopped draw thread detaches its worker");
+}
+
 template<typename TTag>
 void SlotIsolation(const char* what) {
     using Slot = HostThreadSlot<std::uint64_t, TTag>;
@@ -252,6 +331,8 @@ int main() {
     DeviceGate();
     GpuMutexRecursion();
     QueueMutexHandOver();
+    GpuLockFront();
+    DrawThreadHandOff();
     ThreadSlots();
     if (failures != 0) {
         std::fprintf(stderr, "%d lock check(s) failed\n", failures);

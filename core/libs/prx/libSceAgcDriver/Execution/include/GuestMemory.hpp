@@ -93,6 +93,10 @@ bool StoredOver(std::uint64_t address, std::size_t bytes, std::uint64_t generati
 // for every collect: nothing is reused without an ordering point. APS5_PACKET_EPOCH=1 makes the
 // workers bump before every packet as before. CollectEpochBumps counts the bumps ([guestmem] line).
 void BumpCollectEpoch();
+// The calling thread's epoch (0 if it never bumped), and taking a given one: a queue's draw back
+// thread records each draw in the epoch its worker prepared it in, as the worker would have.
+std::uint64_t ThreadCollectEpoch();
+void AdoptCollectEpoch(std::uint64_t epoch);
 std::uint64_t CollectEpochBumps();
 std::uint64_t CollectWritesUncached(std::uint64_t address, std::size_t bytes);
 // The tracker's current generation (every collect and MarkWritten bumps it): a stamp taken after
@@ -183,6 +187,11 @@ QueueMutexType& QueueMutex();
 // work the hold deferred to run without it (the recorder's release of the objects completed batches
 // kept). One hook, set once; it must not take GpuMutex itself.
 void SetGpuUnlockHook(void (*hook)());
+// A queue worker whose draws a back thread records (the driver's DrawThread): before it takes
+// GpuMutex (outermost acquisitions only) `drain` waits until the back thread has recorded every
+// draw handed to it, so nothing the worker records lands ahead of them, and its tries fail while
+// `busy` says a draw is still in flight. One such thread at a time; a null `thread` clears it.
+void SetGpuLockFront(const void* thread, bool (*busy)(void*), void (*drain)(void*), void* context);
 // Debug aid (APS5_ASSERT_GPU_LOCK=1): aborts with a [lock] line naming `where` when the calling
 // thread does not hold GpuMutex. Recording, submits, command batches and the detiler's pools must
 // only be reached under it (a resource build's stage A runs without it, see ShaderResources).

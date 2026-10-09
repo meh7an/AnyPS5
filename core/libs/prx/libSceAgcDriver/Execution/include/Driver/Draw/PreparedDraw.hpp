@@ -42,6 +42,8 @@ struct PreparedDraw {
     // What recordPrepared reads.
     std::shared_ptr<VulkanDevice> device;
     std::uint32_t queue = 0;
+    // The preparing worker's collect epoch, which a draw thread records the draw in.
+    std::uint64_t collectEpoch = 0;
     std::shared_ptr<const DrawDecode> decode;
     Pm4::DrawParameters parameters{};
     std::vector<Graphics::CompiledShader> stages;
@@ -74,6 +76,7 @@ struct PreparedDraw {
         pushOffsets.clear();
         resultIndex.clear();
         device.reset();
+        collectEpoch = 0;
         decode.reset();
         stages.clear();
         snapshots.clear();

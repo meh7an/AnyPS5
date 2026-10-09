@@ -291,7 +291,12 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::compileDrawStag
             if (miss == StageMemoMiss::None) {
                 slot.misses = 0;
                 // Held by nothing but the slot: no draw is using it any more.
-                if (slot.served != nullptr && slot.served.use_count() == 1) served = slot.served;
+                // use_count reads relaxed: the fence orders the patch after the last holder's
+                // release (a draw thread's record drops its reference there).
+                if (slot.served != nullptr && slot.served.use_count() == 1) {
+                    std::atomic_thread_fence(std::memory_order_acquire);
+                    served = slot.served;
+                }
             } else {
                 ++slot.misses;
                 memoStore = stageMemoTried(slot.misses);

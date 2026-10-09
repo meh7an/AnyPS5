@@ -1183,6 +1183,14 @@ void BumpCollectEpoch() {
     if (MemoryProfiled()) collectEpochBumps.fetch_add(1, std::memory_order_relaxed);
 }
 
+std::uint64_t ThreadCollectEpoch() {
+    return HostThreadSlot<std::uint64_t, CollectEpochSlot>::Get();
+}
+
+void AdoptCollectEpoch(std::uint64_t epoch) {
+    HostThreadSlot<std::uint64_t, CollectEpochSlot>::Set(epoch);
+}
+
 std::uint64_t CollectEpochBumps() {
     return collectEpochBumps.load(std::memory_order_relaxed);
 }
@@ -1540,13 +1548,36 @@ std::string WaitedBehindReport(const HolderMatrixValues& waited) {
 
 }
 
+namespace {
+// SetGpuLockFront's thread, published after its calls (only that thread reads the calls).
+std::atomic<const void*> lockFrontThread{nullptr};
+bool (*lockFrontBusy)(void*) = nullptr;
+void (*lockFrontDrain)(void*) = nullptr;
+void* lockFrontContext = nullptr;
+
+bool atLockFront() {
+    return lockFrontThread.load(std::memory_order_acquire) == CurrentThreadToken();
+}
+}
+
+void SetGpuLockFront(const void* thread, bool (*busy)(void*), void (*drain)(void*), void* context) {
+    lockFrontThread.store(nullptr, std::memory_order_release);
+    if (thread == nullptr) return;
+    lockFrontBusy = busy;
+    lockFrontDrain = drain;
+    lockFrontContext = context;
+    lockFrontThread.store(thread, std::memory_order_release);
+}
+
 // The owner token: CurrentThreadToken, unique per live thread and one instruction to read.
 void GpuMutexType::enter() {
     if (!HeldByThisThread()) mutex.lock();
 }
 
 bool GpuMutexType::tryEnter() {
-    return HeldByThisThread() || mutex.try_lock();
+    if (HeldByThisThread()) return true;
+    if (atLockFront() && lockFrontBusy(lockFrontContext)) return false;
+    return mutex.try_lock();
 }
 
 void GpuMutexType::acquired() {
@@ -1610,6 +1641,7 @@ void AssertGpuLockHeld(const char* where) {
 }
 
 void GpuMutexType::lock() {
+    if (atLockFront() && !HeldByThisThread()) lockFrontDrain(lockFrontContext);
     if (!GpuLockProfiled()) {
         enter();
         acquired();
