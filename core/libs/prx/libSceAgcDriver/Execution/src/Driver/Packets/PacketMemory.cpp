@@ -64,7 +64,7 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
                 wroteOnGpu = true;
             } else if (DeferLabels() && bytes.size() <= DeferredLabel::Capacity && bytes.size() % 4 == 0 && label->address % 4 == 0) {
                 // The packet loop leaves the draw thread running before a label under
-                // APS5_RING_WRITES: one deferred instead waits for the draws in flight, as before.
+                // ring writes (DrawThread::RingWrites): one deferred instead waits for the draws in flight.
                 if (auto* back = FrontDrawThread(); DrawThread::RingWrites() && back != nullptr && back->Busy()) back->Drain(DrawThread::Wait::Packet, opcode);
 
                 auto& deferred = deferredLabels();

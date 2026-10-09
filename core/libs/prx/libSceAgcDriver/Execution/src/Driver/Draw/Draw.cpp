@@ -134,7 +134,7 @@ bool DrawThread::Enabled() {
 }
 
 bool DrawThread::RingWrites() {
-    static const bool enabled = Enabled() && std::getenv("APS5_RING_WRITES") != nullptr;
+    static const bool enabled = Enabled() && std::getenv("APS5_NO_RING_WRITES") == nullptr;
     return enabled;
 }
 

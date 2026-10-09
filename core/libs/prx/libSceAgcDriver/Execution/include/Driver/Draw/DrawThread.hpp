@@ -37,7 +37,7 @@ public:
     // APS5_LOCKED_DRAW_PREPARE (a draw prepared under the GPU mutex cannot hand itself over while
     // holding it).
     static bool Enabled();
-    // Stage 4 (APS5_RING_WRITES=1): end-of-pipe labels and small packet stores go through the ring
+    // Stage 4 (on unless APS5_NO_RING_WRITES=1): end-of-pipe labels and small packet stores go through the ring
     // (Driver::ringWrite), so the worker no longer drains the thread before them.
     static bool RingWrites();
 

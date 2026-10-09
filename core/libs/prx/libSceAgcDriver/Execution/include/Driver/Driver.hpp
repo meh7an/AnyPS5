@@ -168,7 +168,7 @@ private:
     void recordPrepared(PreparedDraw& prepared, std::unique_lock<GuestMemory::GpuMutexType>& gpuLock, PerformanceTimer& timing, DrawPhaseTiming& phaseTiming);
     // A queue's draw back thread (DrawThread): records the draws its worker hands over.
     void runDrawThread(DrawThread& back) noexcept;
-    // Stage 4 of the split (APS5_RING_WRITES=1): an end-of-pipe label or a packet store of up to 64
+    // Stage 4 of the split (APS5_NO_RING_WRITES=1 turns it off): an end-of-pipe label or a packet store of up to 64
     // bytes goes to the draw thread as a record of its own while the thread is busy, instead of
     // being recorded under the GPU mutex after waiting for the draws in flight. False: the caller
     // records it as before (the thread idle or gone, labels deferred before it, too large). The

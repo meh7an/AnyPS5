@@ -154,7 +154,7 @@ void Driver::execute(const Submission& submission) {
         auto nextCursor = cursor + count;
         // The draw thread may still be recording the last draw: any other packet with effects
         // outside the queue state, or a predicated one (its predicate is read), waits for it.
-        // Under APS5_RING_WRITES a label or a packet store goes to the draw thread as a record when
+        // With ring writes (DrawThread::RingWrites) a label or a packet store goes to the draw thread as a record when
         // it can (Driver::ringWrite); one that cannot takes the GPU mutex, whose front drains, or
         // drains on its own (a deferred label). A wait that a pending or recorded write satisfies
         // at once passes over too.
