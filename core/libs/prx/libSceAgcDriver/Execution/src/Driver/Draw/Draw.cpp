@@ -11,6 +11,7 @@
 #include "prx/libSceAgcDriver/Execution/include/ThreadScratch.hpp"
 #include "prx/libc/include/HostThreadSlot.hpp"
 #include "Optimization/ResourceProgram.hpp"
+#include <algorithm>
 #include <cstdlib>
 
 namespace AgcDriver::DriverDetail {
@@ -110,6 +111,12 @@ private:
 }
 
 DrawThread::DrawThread(std::uint32_t queue) : queue(queue) {
+    static const std::size_t ring = [] {
+        const char* text = std::getenv("APS5_DRAW_RING");
+        const auto value = text != nullptr ? std::strtoull(text, nullptr, 10) : 8ull;
+        return static_cast<std::size_t>(std::clamp<unsigned long long>(value, 2ull, 64ull));
+    }();
+    slots.resize(ring);
     for (auto& slot : slots) slot = std::make_unique<PreparedDraw>();
 }
 
@@ -122,7 +129,9 @@ bool DrawThread::Enabled() {
 
 bool DrawThread::Push() {
     const auto count = pushed.load(std::memory_order_relaxed);
-    if (recorded.load(std::memory_order_acquire) != count) Drain(Wait::Push);
+    // The next draw goes into the slot after this one, which record count + 1 - Slots() left.
+    const auto freed = count + 2u - static_cast<std::uint32_t>(slots.size());
+    if (static_cast<std::int32_t>(freed - recorded.load(std::memory_order_acquire)) > 0) awaitRecorded(freed, Wait::Push);
     if (abandoned.load(std::memory_order_acquire)) return false;
     pushed.store(count + 1, std::memory_order_seq_cst);
     doorbell.fetch_add(1, std::memory_order_seq_cst);
@@ -136,12 +145,16 @@ bool DrawThread::Push() {
 void DrawThread::Drain(Wait why) {
     const auto count = pushed.load(std::memory_order_relaxed);
     if (recorded.load(std::memory_order_acquire) == count) return;
+    awaitRecorded(count, why);
+}
+
+void DrawThread::awaitRecorded(std::uint32_t count, Wait why) {
     // The draw thread needs the mutex to record what it waits for.
     require(!GuestMemory::GpuMutex().HeldByThisThread(), "a queue worker waited for its draw thread holding the GPU mutex");
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     // A draw thread that left early records nothing more.
-    awaitWord(recorded, frontSleeping, [&] { return recorded.load(std::memory_order_acquire) == count || abandoned.load(std::memory_order_acquire); });
+    awaitWord(recorded, frontSleeping, [&] { return static_cast<std::int32_t>(count - recorded.load(std::memory_order_acquire)) <= 0 || abandoned.load(std::memory_order_acquire); });
     const auto index = static_cast<std::size_t>(why);
     ++waits[index];
     if (profile) waitedMs[index] += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
