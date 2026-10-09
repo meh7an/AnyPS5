@@ -115,8 +115,13 @@ public:
     // The kept snapshot of the range while it is current. `rewritten` (when given) is set when a kept
     // snapshot or sighting of the range was found stale: the range was written since its last copy.
     // `sighted` (when given) is set when the range's sighting is current: unchanged since a copy the
-    // cache did not keep (see KeepDrawSnapshot).
+    // cache did not keep (see KeepDrawSnapshot). A vertex or index snapshot comes back as its
+    // device-local mirror, made by a copy recorded at its first reuse: kept snapshots live in host
+    // memory, which vertex fetch reads over the bus on every draw (16 us for a 5,000-vertex shadow
+    // caster on an RTX 2080 Ti). Past DrawInputMirrorBudget, and with APS5_NO_INPUT_MIRRORS=1, the
+    // host snapshot itself comes back.
     std::shared_ptr<Buffer> ReusableDrawSnapshot(std::uint64_t address, std::size_t bytes, SnapshotUse use = SnapshotUse::Storage, std::uint32_t* derived = nullptr, bool* rewritten = nullptr, bool* sighted = nullptr);
+    static constexpr std::size_t DrawInputMirrorBudget = std::size_t{512} << 20u;
     // Keeps `buffer` as the range's snapshot. A null `buffer` notes a sighting instead: the range was
     // copied at `generation` into a buffer that dies with its batch. A sighting takes an entry but
     // none of the pool's bytes.
@@ -472,7 +477,7 @@ public:
     // or APS5_PROFILE_GPU). A class range covers the command with its own barriers (a dispatch's
     // barriers are classes of their own, its program range stays keyed by the program), so the
     // union of every range of a batch and the batch span differ by what no class times ('untimed').
-    enum class CommandClass : std::uint8_t { DispatchLeading = 0, DispatchTrailing, IndirectArguments, LabelRun, Fill, FillClear, Copy, StagingIn, StagingOut, Draw, StorageUpload, StorageWriteBack, DccClear, DccKeyStore, PresentBlit, ShadowPublish, TemplateDataRefresh, DrawSetup, DispatchSetup, MetadataPass, DepthClearPass, TextureUpload, DispatchResources, DispatchPipeline, DepthTransfer, Count };
+    enum class CommandClass : std::uint8_t { DispatchLeading = 0, DispatchTrailing, IndirectArguments, LabelRun, Fill, FillClear, Copy, StagingIn, StagingOut, Draw, StorageUpload, StorageWriteBack, DccClear, DccKeyStore, PresentBlit, ShadowPublish, TemplateDataRefresh, DrawSetup, DispatchSetup, MetadataPass, DepthClearPass, TextureUpload, DispatchResources, DispatchPipeline, DepthTransfer, InputMirror, Count };
     static constexpr std::uint64_t ClassKey(CommandClass which) { return 0x10 + static_cast<std::uint64_t>(which); }
     std::uint32_t BeginGpuTiming(CommandClass which) { return BeginGpuTiming(ClassKey(which)); }
     // A range tagged with a guest address for the [gputime] breakdowns: a draw pass's first color
@@ -854,6 +859,8 @@ private:
         std::list<DrawSnapshotKey>::iterator recent;
         std::shared_ptr<Buffer> buffer;
         std::uint32_t derived;
+        // A vertex or index snapshot's device-local mirror (see ReusableDrawSnapshot).
+        std::shared_ptr<Buffer> device;
     };
     struct DrawSnapshotPool {
         std::list<DrawSnapshotKey> recency;
@@ -864,6 +871,9 @@ private:
     std::unordered_map<DrawSnapshotKey, DrawSnapshot, DrawSnapshotKeyHash> exactSnapshots;
     std::map<DrawSnapshotKey, DrawSnapshot> vertexSnapshots;
     std::array<DrawSnapshotPool, 2> drawSnapshotPools;
+    // The bytes of the kept snapshots' device-local mirrors.
+    std::size_t drawInputMirrorBytes = 0;
+    std::shared_ptr<Buffer> mirrorDrawInput(const std::shared_ptr<Buffer>& host, std::size_t bytes);
     // The draw upload chunk being filled and its bytes in use (see DrawUpload).
     std::shared_ptr<Buffer> drawUpload;
     VkDeviceSize drawUploadUsed = 0;

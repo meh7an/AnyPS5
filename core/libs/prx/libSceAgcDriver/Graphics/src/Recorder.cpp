@@ -1737,7 +1737,7 @@ namespace {
 
 constexpr std::uint32_t MaxTimedRanges = 2048;
 constexpr std::size_t CommandClasses = static_cast<std::size_t>(Recorder::CommandClass::Count);
-constexpr const char* CommandClassNames[CommandClasses] = {"dispatch-lead", "dispatch-trail", "indirect-args", "label-run", "fill", "fill-clear", "copy", "staging-in", "staging-out", "draw", "storage-upload", "storage-writeback", "dcc-clear", "dcc-keys", "present-blit", "shadow-publish", "template-refresh", "draw-setup", "dispatch-setup", "metadata-pass", "depth-clear-pass", "texture-upload", "dispatch-resources", "dispatch-pipeline", "depth-transfer"};
+constexpr const char* CommandClassNames[CommandClasses] = {"dispatch-lead", "dispatch-trail", "indirect-args", "label-run", "fill", "fill-clear", "copy", "staging-in", "staging-out", "draw", "storage-upload", "storage-writeback", "dcc-clear", "dcc-keys", "present-blit", "shadow-publish", "template-refresh", "draw-setup", "dispatch-setup", "metadata-pass", "depth-clear-pass", "texture-upload", "dispatch-resources", "dispatch-pipeline", "depth-transfer", "input-mirror"};
 // [barriers] counters by class (relaxed: only reported) and the [gputime] totals, which the
 // presenter's thread adds to without the GPU mutex (AddGpuTiming).
 std::atomic<std::uint64_t> classBarriers[CommandClasses]{};
@@ -2472,6 +2472,7 @@ template <typename Entries>
 void Recorder::eraseDrawSnapshot(Entries& entries, typename Entries::iterator entry) {
     auto& pool = drawSnapshotPools[SnapshotPool(std::get<1>(entry->first))];
     if (entry->second.buffer != nullptr) pool.bytes -= std::get<2>(entry->first);
+    if (entry->second.device != nullptr) drawInputMirrorBytes -= std::get<2>(entry->first);
     pool.recency.erase(entry->second.recent);
     entries.erase(entry);
 }
@@ -2490,7 +2491,10 @@ std::shared_ptr<Buffer> Recorder::ReusableDrawSnapshot(std::uint64_t address, st
         auto& recency = drawSnapshotPools[SnapshotPool(use)].recency;
         recency.splice(recency.end(), recency, found->second.recent);
         if (derived != nullptr) *derived = found->second.derived;
-        return found->second.buffer;
+        static const bool mirrors = std::getenv("APS5_NO_INPUT_MIRRORS") == nullptr;
+        if (use == SnapshotUse::Storage || !mirrors) return found->second.buffer;
+        if (found->second.device == nullptr) found->second.device = mirrorDrawInput(found->second.buffer, std::get<2>(found->first));
+        return found->second.device != nullptr ? found->second.device : found->second.buffer;
     };
     if (use == SnapshotUse::Vertex) {
         const auto found = vertexSnapshots.lower_bound({address, use, bytes});
@@ -2529,6 +2533,23 @@ void Recorder::KeepDrawSnapshot(std::uint64_t address, std::size_t bytes, std::u
         throw;
     }
     pool.bytes += keptBytes;
+}
+
+std::shared_ptr<Buffer> Recorder::mirrorDrawInput(const std::shared_ptr<Buffer>& host, std::size_t bytes) {
+    if (drawInputMirrorBytes + bytes > DrawInputMirrorBudget) return nullptr;
+    auto device = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    // Recording ends an open render pass: the draw begins its own, whose leading barrier covers
+    // vertex and index reads, but the copy's barrier is its own for any later reader.
+    const auto timing = BeginGpuTiming(CommandClass::InputMirror);
+    const auto commands = Commands();
+    CopyBuffer(context, commands, host->Handle(), 0, device->Handle(), 0, bytes);
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_VERTEX_INPUT_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_INDEX_READ_BIT);
+    CountBarriers(CommandClass::InputMirror);
+    EndGpuTiming(timing, bytes);
+    // The snapshot may leave the cache before the copy runs.
+    Keep(host);
+    drawInputMirrorBytes += bytes;
+    return device;
 }
 
 std::pair<std::size_t, std::size_t> Recorder::DrawSnapshotPoolUse(SnapshotUse use) const {

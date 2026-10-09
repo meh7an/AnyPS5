@@ -1411,7 +1411,9 @@ void drawSnapshotEvictionTests(const Device& device) {
     const auto generation = CollectWrites(address, 4096);
     Require(generation != 0, "the watched block has no generation");
     constexpr auto cap = Recorder::DrawSnapshotEntries;
-    cache.KeepDrawSnapshot(address, 16, generation, registry, buffer, Recorder::SnapshotUse::Vertex);
+    // A kept vertex snapshot is the source of its device-local mirror.
+    const auto vertices = std::make_shared<Buffer>(device.GetContext(), 16, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+    cache.KeepDrawSnapshot(address, 16, generation, registry, vertices, Recorder::SnapshotUse::Vertex);
     for (std::size_t size = 1; size <= cap; ++size) cache.KeepDrawSnapshot(address, size, generation, registry, buffer);
     Require(cache.ReusableDrawSnapshot(address, 1) == buffer, "a kept snapshot is not reusable");
     cache.KeepDrawSnapshot(address, cap + 1, generation, registry, buffer);
@@ -1419,7 +1421,11 @@ void drawSnapshotEvictionTests(const Device& device) {
     Require(cache.ReusableDrawSnapshot(address, 1) == buffer && cache.ReusableDrawSnapshot(address, 3) == buffer && cache.ReusableDrawSnapshot(address, cap + 1) == buffer, "eviction dropped a more recently used snapshot");
     cache.KeepDrawSnapshot(address, cap + 2, generation, registry, buffer);
     Require(cache.ReusableDrawSnapshot(address, 4) == nullptr && cache.ReusableDrawSnapshot(address, 1) == buffer, "the second eviction did not take the next oldest");
-    Require(cache.ReusableDrawSnapshot(address, 16, Recorder::SnapshotUse::Vertex) == buffer, "storage snapshots evicted a vertex snapshot");
+    // Reused, it comes back as the mirror its first reuse made, never as the host copy.
+    const auto mirror = cache.ReusableDrawSnapshot(address, 16, Recorder::SnapshotUse::Vertex);
+    Require(mirror != nullptr, "storage snapshots evicted a vertex snapshot");
+    Require(mirror != vertices && !mirror->Mapped(), "a reused vertex snapshot came back without its device-local mirror");
+    Require(cache.ReusableDrawSnapshot(address, 16, Recorder::SnapshotUse::Vertex) == mirror, "a vertex snapshot's mirror was made again");
     cache.KeepDrawSnapshot(address, 1, generation, registry, buffer);
     Require(cache.ReusableDrawSnapshot(address, 1) == buffer && cache.ReusableDrawSnapshot(address, 5) == buffer, "replacing a kept snapshot evicted another");
     cache.KeepDrawSnapshot(address + 8192, Recorder::DrawSnapshotBudget, generation, registry, buffer);
@@ -1455,13 +1461,16 @@ void drawInputReuseTests(const Device& device, Recorder& recorder) {
     const auto first = CopyDrawInput(context, &recorder, address, size, 4, Use::Index32);
     Require(!first.reused && first.generation != 0 && equalsGuest(first), "the first draw input copy is wrong");
     KeepDrawInput(&recorder, address, first, Use::Index32, 189);
+    // Reused, an input comes back as the device-local mirror its first reuse made.
     const auto second = CopyDrawInput(context, &recorder, address, size, 4, Use::Index32);
-    Require(second.reused && second.buffer == first.buffer && second.derived == 189, "an unchanged draw input was copied again");
+    Require(second.reused && second.buffer != nullptr && second.buffer != first.buffer && !second.buffer->Mapped() && second.derived == 189, "an unchanged draw input was copied again");
+    Require(CopyDrawInput(context, &recorder, address, size, 4, Use::Index32).buffer == second.buffer, "a draw input's mirror was made again");
     const auto vertex = CopyDrawInput(context, &recorder, address, size, 1, Use::Vertex);
     const auto narrow = CopyDrawInput(context, &recorder, address, size, 2, Use::Index16);
     Require(!vertex.reused && !narrow.reused && equalsGuest(vertex) && equalsGuest(narrow), "a draw input reused another use's copy");
     KeepDrawInput(&recorder, address, vertex, Use::Vertex, 0);
-    Require(CopyDrawInput(context, &recorder, address, size, 1, Use::Vertex).buffer == vertex.buffer && CopyDrawInput(context, &recorder, address, size, 4, Use::Index32).buffer == first.buffer, "the uses' copies displaced each other");
+    const auto vertexMirror = CopyDrawInput(context, &recorder, address, size, 1, Use::Vertex).buffer;
+    Require(vertexMirror != nullptr && !vertexMirror->Mapped() && vertexMirror != second.buffer && CopyDrawInput(context, &recorder, address, size, 4, Use::Index32).buffer == second.buffer, "the uses' copies displaced each other");
     Require(!CopyDrawInput(context, nullptr, address, size, 4, Use::Index32).reused, "a draw input was reused without a recorder");
     words[5] = 0xdead;
     const auto stored = CopyDrawInput(context, &recorder, address, size, 4, Use::Index32);
@@ -1488,7 +1497,7 @@ void drawInputReuseTests(const Device& device, Recorder& recorder) {
     Require(!whole.reused && std::memcmp(whole.buffer->Bytes().data(), reinterpret_cast<const void*>(pool), 12288) == 0, "the vertex pool copy is wrong");
     KeepDrawInput(&recorder, pool, whole, Use::Vertex, 0);
     const auto prefix = CopyDrawInput(context, &recorder, pool, 4096, 1, Use::Vertex);
-    Require(prefix.reused && prefix.buffer == whole.buffer, "a shorter vertex read did not reuse the longer snapshot");
+    Require(prefix.reused && prefix.buffer != nullptr && !prefix.buffer->Mapped() && CopyDrawInput(context, &recorder, pool, 8192, 1, Use::Vertex).buffer == prefix.buffer, "a shorter vertex read did not reuse the longer snapshot");
     Require(!CopyDrawInput(context, &recorder, pool, 16384, 1, Use::Vertex).reused, "a longer vertex read reused a shorter snapshot");
     Require(!CopyDrawInput(context, &recorder, pool + 4, 4096, 1, Use::Vertex).reused, "a vertex read at another address reused the snapshot");
     Require(!CopyDrawInput(context, &recorder, pool, 4096, 4, Use::Index32).reused, "an index read reused a longer vertex snapshot");
@@ -1496,13 +1505,14 @@ void drawInputReuseTests(const Device& device, Recorder& recorder) {
     KeepDrawInput(&recorder, pool, shorter, Use::Index32, 3);
     Require(!CopyDrawInput(context, &recorder, pool, 4096, 4, Use::Index32).reused, "an index read reused a longer index snapshot");
     words[(8192 + 8192 + 16) / 4] = 0xbeef;
+    // The store lies past the shorter read: a reuse is the mirror made before it, a copy the bytes.
     const auto prefixAfter = CopyDrawInput(context, &recorder, pool, 4096, 1, Use::Vertex);
-    Require(std::memcmp(prefixAfter.buffer->Bytes().data(), reinterpret_cast<const void*>(pool), 4096) == 0, "a shorter vertex read after a store got other bytes");
+    Require(prefixAfter.reused ? prefixAfter.buffer == prefix.buffer : std::memcmp(prefixAfter.buffer->Bytes().data(), reinterpret_cast<const void*>(pool), 4096) == 0, "a shorter vertex read after a store got other bytes");
     const auto after = CopyDrawInput(context, &recorder, pool, 12288, 1, Use::Vertex);
     Require(!after.reused && std::memcmp(after.buffer->Bytes().data(), reinterpret_cast<const void*>(pool), 12288) == 0, "a vertex read over the store reused the old bytes");
     KeepDrawInput(&recorder, pool, after, Use::Vertex, 0);
     const auto small = CopyDrawInput(context, &recorder, pool, 4096, 1, Use::Vertex);
-    Require(small.reused && small.buffer == after.buffer, "the new vertex snapshot does not serve shorter reads");
+    Require(small.reused && small.buffer != nullptr && !small.buffer->Mapped() && small.buffer != prefix.buffer, "the new vertex snapshot does not serve shorter reads");
     // With `sighting`: an unproven range is copied into the upload chunk and only noted; the copy
     // that finds it unchanged since is kept and then reused; a store sends it back to the chunk.
     const auto ring = address + 32768;
@@ -1515,7 +1525,7 @@ void drawInputReuseTests(const Device& device, Recorder& recorder) {
     Require(!proven.uploaded && !proven.reused && proven.offset == 0 && equalsRing(proven), "a range unchanged since its sighting got no copy of its own");
     KeepDrawInput(&recorder, ring, proven, Use::Vertex, 0);
     const auto again = CopyDrawInput(context, &recorder, ring, ringBytes, 1, Use::Vertex, true);
-    Require(again.reused && again.buffer == proven.buffer, "the copy made after the sighting was not kept");
+    Require(again.reused && again.buffer != nullptr && again.buffer != proven.buffer && !again.buffer->Mapped(), "the copy made after the sighting was not kept");
     words[(32768 + 64) / 4] = 0x5157;
     const auto changed = CopyDrawInput(context, &recorder, ring, ringBytes, 1, Use::Vertex, true);
     Require(changed.uploaded && changed.rewritten && equalsRing(changed), "a rewritten range did not go back to the upload chunk");
