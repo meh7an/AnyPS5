@@ -2176,6 +2176,16 @@ bool VulkanDevice::PresentDisplayBuffer(const DisplayBuffer& buffer) {
         const auto channel = [&](std::size_t index) { return static_cast<float>(std::to_integer<unsigned>((*cleared)[index])) / 255.0f; };
         uniform = {{channel(2), channel(1), channel(0), channel(3)}};
     }
+    {
+        // Each display path once: which one a title's frames take.
+        static std::set<std::tuple<std::uint64_t, int, int>> reported;
+        const int path = cleared ? 0 : resident == nullptr ? 1 : convert ? 2 : 3;
+        const int storage = resident != nullptr ? static_cast<int>(Graphics::StorageFormatForGuest(graphicsContext(), resident->Descriptor().format)) : -1;
+        if (reported.insert({buffer.pixelFormat, storage, path}).second) {
+            static const char* const names[] = {"a fast-cleared buffer", "guest memory", "the resident image, converted", "the resident image, blitted"};
+            std::fprintf(stderr, "[present] display %ux%u pixel format 0x%llx presents from %s (storage vk format %d)\n", buffer.width, buffer.height, static_cast<unsigned long long>(buffer.pixelFormat), names[path], storage);
+        }
+    }
     if (!present(buffer.width, buffer.height, true, {}, cleared ? nullptr : &buffer, resident, filter, dumpFrame, convert, cleared ? &uniform : nullptr)) {
         // A dropped frame (swapchain out of date) keeps the dump numbering contiguous.
         if (dumpFrame) --dumps.dumped;
@@ -2320,8 +2330,16 @@ bool VulkanDevice::present(std::uint32_t width, std::uint32_t height, bool opaqu
             pipelineBarrier(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &residentBarrier);
             Graphics::Recorder::CountBarriers(CommandClass::PresentBlit);
             if (residentConvert) {
-                state->colorTransfer->DetileImage(commands, resident->Image(), VK_IMAGE_LAYOUT_GENERAL, width, height, Graphics::ColorTileMode::RenderTarget, DisplayRedLow(display->pixelFormat), DisplayTenBit(display->pixelFormat));
-                state->scaler->RecordUpload(commands, state->colorTransfer->LinearBuffer());
+                // Bytes already in the source's order (no red/blue swap, no 10-bit narrowing) are
+                // copied as they are: the conversion pass would move them through a buffer and back
+                // unchanged. APS5_PRESENT_CONVERT_PASS=1 always runs the pass.
+                static const bool convertPass = std::getenv("APS5_PRESENT_CONVERT_PASS") != nullptr;
+                if (!convertPass && !DisplayRedLow(display->pixelFormat) && !DisplayTenBit(display->pixelFormat)) {
+                    state->scaler->RecordCopyFrom(commands, resident->Image(), VK_IMAGE_LAYOUT_GENERAL);
+                } else {
+                    state->colorTransfer->DetileImage(commands, resident->Image(), VK_IMAGE_LAYOUT_GENERAL, width, height, Graphics::ColorTileMode::RenderTarget, DisplayRedLow(display->pixelFormat), DisplayTenBit(display->pixelFormat));
+                    state->scaler->RecordUpload(commands, state->colorTransfer->LinearBuffer());
+                }
             }
         } else {
             if (display != nullptr) {
