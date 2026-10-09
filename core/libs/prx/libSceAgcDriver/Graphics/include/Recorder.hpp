@@ -17,6 +17,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <string_view>
 #include <tuple>
 #include <unordered_map>
 #include <utility>
@@ -471,9 +472,25 @@ public:
     // or APS5_PROFILE_GPU). A class range covers the command with its own barriers (a dispatch's
     // barriers are classes of their own, its program range stays keyed by the program), so the
     // union of every range of a batch and the batch span differ by what no class times ('untimed').
-    enum class CommandClass : std::uint8_t { DispatchLeading = 0, DispatchTrailing, IndirectArguments, LabelRun, Fill, FillClear, Copy, StagingIn, StagingOut, Draw, StorageUpload, StorageWriteBack, DccClear, DccKeyStore, PresentBlit, ShadowPublish, TemplateDataRefresh, Count };
+    enum class CommandClass : std::uint8_t { DispatchLeading = 0, DispatchTrailing, IndirectArguments, LabelRun, Fill, FillClear, Copy, StagingIn, StagingOut, Draw, StorageUpload, StorageWriteBack, DccClear, DccKeyStore, PresentBlit, ShadowPublish, TemplateDataRefresh, DrawSetup, DispatchSetup, MetadataPass, DepthClearPass, TextureUpload, DispatchResources, DispatchPipeline, DepthTransfer, Count };
     static constexpr std::uint64_t ClassKey(CommandClass which) { return 0x10 + static_cast<std::uint64_t>(which); }
     std::uint32_t BeginGpuTiming(CommandClass which) { return BeginGpuTiming(ClassKey(which)); }
+    // A range tagged with a guest address for the [gputime] breakdowns: a draw pass's first color
+    // target (passes by target, the draws in them), a sampled texture's upload; `name` describes it.
+    std::uint32_t BeginGpuTiming(CommandClass which, std::uint64_t tag, std::string_view name);
+    // What a draw or a dispatch records ahead of its own ranges (target refreshes, resource builds,
+    // uploads) as one setup range of class DrawSetup or DispatchSetup. A draw's opens only while no
+    // render pass is open (opening it then ends none); a dispatch's ends the open pass, as the
+    // dispatch would. Closed by EndSetupTiming, by the next setup range, or before the batch is
+    // submitted.
+    void BeginSetupTiming(CommandClass which);
+    void EndSetupTiming();
+    // APS5_PROFILE_GPU_SITES=1 (with APS5_PROFILE_GPU): a probe range from every Commands() call to
+    // the next, keyed SiteKeyBase | the caller's address, so the [gputime] program list ranks the
+    // code that records commands by GPU time (the line gives SiteProbes' own address to map the
+    // addresses to the module, for nm).
+    static constexpr std::uint64_t SiteKeyBase = 0xc000000000000000ull;
+    static bool SiteProbes();
     static void CountBarriers(CommandClass which, std::uint32_t count = 1);
     // A leading barrier a command left out because the previous trailing barrier covered its
     // accesses (see Commands), on the [barriers] line as 'merged'. Debug aid: APS5_FULL_BARRIERS=1
@@ -566,6 +583,14 @@ private:
         bool samplesDrawn = false;
         std::vector<std::uint64_t> timedKeys;
         std::vector<std::uint64_t> timedBytes;
+        // Per range: its tag (a draw pass's first color target) and the draws it holds, for the
+        // [gputime] pass breakdown.
+        std::vector<std::uint64_t> timedTags;
+        std::vector<std::uint32_t> timedDraws;
+        // The open setup range (BeginSetupTiming), if any.
+        std::uint32_t setupTiming = NoTiming;
+        // The open site probe (APS5_PROFILE_GPU_SITES), if any.
+        std::uint32_t siteTiming = NoTiming;
         // The whole-batch timed range (BatchTimingKey) and its stamps once read (see Completed).
         std::uint32_t batchTiming = NoTiming;
         double gpuStartNs = 0;

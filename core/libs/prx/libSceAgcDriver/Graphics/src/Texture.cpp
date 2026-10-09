@@ -325,12 +325,21 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
             auto* recorder = dumpWanted || syncUploads ? nullptr : Recorder::Active();
             std::unique_ptr<CommandBatch> batch;
             VkCommandBuffer commands = VK_NULL_HANDLE;
+            // The upload's [gputime] range (APS5_PROFILE_GPU), tagged with the texture.
+            auto uploadTiming = Recorder::NoTiming;
             if (recorder != nullptr) {
                 commands = recorder->Commands();
                 recorder->Keep(staging, static_cast<std::size_t>(guestBytes));
                 recorder->Keep(tiled, static_cast<std::size_t>(guestBytes));
                 recorder->Keep(linear, static_cast<std::size_t>(linearBytes));
                 recorder->Keep(owned);
+                // After the keeps, which may submit: the range stays in one batch.
+                if (Recorder::GpuTimingEnabled()) {
+                    char name[96];
+                    std::snprintf(name, sizeof(name), "%ux%u format %u, %u mips, %u layers, tile %u", descriptor.width, descriptor.height, descriptor.format, descriptor.mipCount, arrayLayers, static_cast<unsigned>(descriptor.tileMode));
+                    uploadTiming = recorder->BeginGpuTiming(Recorder::CommandClass::TextureUpload, descriptor.baseAddress, name);
+                    commands = recorder->Commands();
+                }
             } else {
                 batch = std::make_unique<CommandBatch>(context);
                 commands = batch->Handle();
@@ -406,6 +415,7 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
             toShaderRead.image = image;
             toShaderRead.subresourceRange = toTransferDst.subresourceRange;
             context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &toShaderRead);
+            if (recorder != nullptr) recorder->EndGpuTiming(uploadTiming, guestBytes);
 
             if (batch) batch->SubmitAndWait();
             else ++Profile().recordedUploads;

@@ -1266,6 +1266,21 @@ void VulkanDevice::WaitIdle() {
 
 namespace {
 
+// APS5_PROFILE_GPU: one recorder setup range for a scope (Recorder::BeginSetupTiming): what a
+// dispatch records ahead of its own ranges (its resource build's uploads and conversions), closed
+// by recordDispatch or when the dispatch returns; a CB metadata or depth clear pass, whole.
+struct SetupTiming {
+    SetupTiming(Graphics::Recorder* recorder, Graphics::Recorder::CommandClass which) : recorder(Graphics::Recorder::GpuTimingEnabled() ? recorder : nullptr) {
+        if (this->recorder != nullptr) this->recorder->BeginSetupTiming(which);
+    }
+    ~SetupTiming() {
+        if (recorder != nullptr) recorder->EndSetupTiming();
+    }
+    SetupTiming(const SetupTiming&) = delete;
+    SetupTiming& operator=(const SetupTiming&) = delete;
+    Graphics::Recorder* recorder;
+};
+
 bool OpportunisticReap() {
     static const bool enabled = std::getenv("APS5_NO_OPPORTUNISTIC_REAP") == nullptr;
     return enabled;
@@ -2614,10 +2629,12 @@ std::optional<std::string> VulkanDevice::KnownDrawRejection(const Graphics::Stat
 }
 
 void VulkanDevice::ColorMetadataPass(const Graphics::ColorMetadataPass& pass) {
+    const SetupTiming timing(state->recorder.get(), Graphics::Recorder::CommandClass::MetadataPass);
     Graphics::RunColorMetadataPass(graphicsContext(), pass);
 }
 
 void VulkanDevice::DepthClearPass(const Graphics::DepthClearPass& pass) {
+    const SetupTiming timing(state->recorder.get(), Graphics::Recorder::CommandClass::DepthClearPass);
     Graphics::ClearDepthSurface(graphicsContext(), pass.target, pass.depth, pass.stencil);
 }
 
@@ -3360,6 +3377,7 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
         recordStep(PhaseRecordDataRefresh);
     }
     using CommandClass = Graphics::Recorder::CommandClass;
+    recorder.EndSetupTiming();
     if (Graphics::Recorder::BarrierValidate()) {
         if (argumentImport != nullptr) {
             const std::pair<std::uint64_t, std::uint64_t> argumentRange{arguments, arguments + 12};
@@ -3427,6 +3445,7 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
 
 VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::RecompileResult& shader, std::uint32_t x, std::uint32_t y, std::uint32_t z, std::uint64_t arguments, std::span<const Graphics::GuestMemorySnapshot> snapshots, std::uint64_t programAddress, std::shared_ptr<PreparedDispatch> prepared, std::shared_ptr<const Recipe>* recipeOut) {
     PerformanceTimer timing("Vulkan.Dispatch");
+    const SetupTiming setupTiming(state->recorder.get(), Graphics::Recorder::CommandClass::DispatchSetup);
     if (recipeOut != nullptr) *recipeOut = nullptr;
     // Group counts for the trace lines; an indirect dispatch does not know them.
     char groupsText[40];
@@ -3480,6 +3499,8 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
         ReapRecorded(prepared->presyncSerial);
         timer.phase(PhaseReap);
     }
+    // APS5_PROFILE_GPU: the setup range goes on as dispatch-resources (the build or the proof).
+    if (Graphics::Recorder::GpuTimingEnabled()) state->recorder->BeginSetupTiming(Graphics::Recorder::CommandClass::DispatchResources);
     // The 'resources' phase below, split (APS5_PROFILE_DRAW) into what runs under the mutex: the
     // sub-phases are extra rows named "resources: ..." in the [dispatch] totals and the [indirect]
     // line, so the hold's biggest part (stage B's image lookups, the whole build of an address-based
@@ -3594,6 +3615,8 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
     }
     timing.Mark("shader_resources");
     timer.phase(PhaseResources);
+    // APS5_PROFILE_GPU: and as dispatch-pipeline (the pipeline objects, the record's own setup).
+    if (Graphics::Recorder::GpuTimingEnabled()) state->recorder->BeginSetupTiming(Graphics::Recorder::CommandClass::DispatchPipeline);
     if (objects == nullptr) {
         objects = std::make_shared<ComputePipelineObjects>();
         objects->device = state->device;
@@ -3716,6 +3739,7 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
 
 RecipeOutcome VulkanDevice::DispatchRecipe(const ShaderRecompiler::RecompileResult& shader, std::uint32_t x, std::uint32_t y, std::uint32_t z, std::uint64_t arguments, std::uint64_t programAddress, const std::shared_ptr<RecipeHit>& hit, IndirectOutcome& outcome, const std::shared_ptr<PreparedDispatch>& verify, bool refreshByWords) {
     PerformanceTimer timing("Vulkan.DispatchRecipe");
+    const SetupTiming setupTiming(state->recorder.get(), Graphics::Recorder::CommandClass::DispatchSetup);
     outcome = {0, 0};
     char groupsText[40];
     if (arguments != 0) std::snprintf(groupsText, sizeof(groupsText), "indirect");
@@ -3749,6 +3773,7 @@ RecipeOutcome VulkanDevice::DispatchRecipe(const ShaderRecompiler::RecompileResu
         ReapRecorded(hit->presyncSerial);
         timer.phase(PhaseReap);
     }
+    if (Graphics::Recorder::GpuTimingEnabled()) state->recorder->BeginSetupTiming(Graphics::Recorder::CommandClass::DispatchResources);
     if (verify != nullptr) {
         // APS5_VERIFY_RECIPE=1: the ordinary path's answers beside the recipe's. The found object
         // is the cache's under the content key (PrepareDispatch's Find), the pipeline objects the

@@ -1622,6 +1622,21 @@ RecordParts& recordParts() {
     return parts;
 }
 
+// APS5_PROFILE_GPU: what a draw records ahead of its pass, as one draw-setup range, closed by
+// recordDraw before the pass's own range or when the draw returns.
+struct DrawSetupTiming {
+    DrawSetupTiming() {
+        if (!Recorder::GpuTimingEnabled()) return;
+        if (auto* recorder = Recorder::Active()) recorder->BeginSetupTiming(Recorder::CommandClass::DrawSetup);
+    }
+    ~DrawSetupTiming() {
+        if (!Recorder::GpuTimingEnabled()) return;
+        if (auto* recorder = Recorder::Active()) recorder->EndSetupTiming();
+    }
+    DrawSetupTiming(const DrawSetupTiming&) = delete;
+    DrawSetupTiming& operator=(const DrawSetupTiming&) = delete;
+};
+
 void recordDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawInputs& inputs, RecordedDraw& record, DrawOutcome& outcome, DrawTimer& timer, double& ownWaitedMs) {
     auto& parts = recordParts();
     parts.start();
@@ -1676,8 +1691,15 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     const auto commands = continued ? recorder->CommandsInRenderPass() : recorder->Commands();
     if (capture) captureInputs(context, *recorder, commands, resources, ownSet ? &kept->bindings : nullptr, record.targets.empty() || record.targets.front() == nullptr ? 0 : record.targets.front()->Descriptor().baseAddress);
     // The draw's [gputime] class range: from its first barrier to the pass's trailing barrier (a
-    // continued draw lies inside its pass's range).
-    const auto drawTiming = !continued ? recorder->BeginGpuTiming(CommandClass::Draw) : Recorder::NoTiming;
+    // continued draw lies inside its pass's range), tagged with the pass's first color target.
+    auto drawTiming = Recorder::NoTiming;
+    recorder->EndSetupTiming();
+    if (!continued && Recorder::GpuTimingEnabled()) {
+        const auto* target = record.targets.empty() || record.targets.front() == nullptr ? nullptr : &record.targets.front()->Descriptor();
+        char name[64] = "no target";
+        if (target != nullptr) std::snprintf(name, sizeof(name), "%ux%u format %u", target->width, target->height, target->format);
+        drawTiming = recorder->BeginGpuTiming(CommandClass::Draw, target != nullptr ? target->baseAddress : 0, name);
+    }
     if (!continued && Recorder::BarrierValidate()) {
         auto reads = resources.InPlaceReads();
         if (gpuIndirect) {
@@ -1810,6 +1832,7 @@ std::optional<std::string> KnownValidationFailure(const Context& context, std::s
 
 void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipeOut) {
     PerformanceTimer timing("Graphics.Draw");
+    const DrawSetupTiming setupTiming;
     // APS5_PROFILE_DRAW prints the time of each phase of the draw (microseconds) and the [draws] totals.
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr || std::getenv("APS5_PROFILE_DRAW_PHASES") != nullptr;
     DrawTimer timer(profile);
@@ -2359,6 +2382,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
 DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, const DrawRecipe& recipe) {
     static_cast<void>(snapshots);
     PerformanceTimer timing("Graphics.DrawWithRecipe");
+    const DrawSetupTiming setupTiming;
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr || std::getenv("APS5_PROFILE_DRAW_PHASES") != nullptr;
     DrawTimer timer(profile);
     DrawRecipeOutcome result;
