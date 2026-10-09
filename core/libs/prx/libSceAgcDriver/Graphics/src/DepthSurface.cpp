@@ -10,6 +10,7 @@
 #include <array>
 #include <atomic>
 #include <cstdio>
+#include <cstdlib>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -169,25 +170,44 @@ public:
         if (recorder == nullptr) batch = std::make_unique<CommandBatch>(context);
         const auto commands = recorder != nullptr ? recorder->Commands() : batch->Handle();
         const VkDeviceSize bytes = static_cast<VkDeviceSize>(target.extent.width) * target.extent.height * (d16 ? 2u : 4u);
-        auto buffer = std::make_shared<DeviceBuffer>(context, static_cast<std::size_t>(bytes), VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
-        const VkBufferImageCopy depthRegion{0, 0, 0, {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1}, {0, 0, 0}, {target.extent.width, target.extent.height, 1}};
-        const VkBufferImageCopy colorRegion{0, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {target.extent.width, target.extent.height, 1}};
-        const auto toBuffer = context.Resolved(&DeviceFunctions::cmdCopyImageToBuffer, "vkCmdCopyImageToBuffer");
-        const auto fromBuffer = context.Resolved(&DeviceFunctions::cmdCopyBufferToImage, "vkCmdCopyBufferToImage");
+        // The transfer's [gputime] range (APS5_PROFILE_GPU).
+        const auto timing = recorder != nullptr ? recorder->BeginGpuTiming(Recorder::CommandClass::DepthTransfer) : Recorder::NoTiming;
         constexpr VkAccessFlags any = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
         RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, any, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
-        if (intoStorage) toBuffer(commands, image, VK_IMAGE_LAYOUT_GENERAL, buffer->Handle(), 1, &depthRegion);
-        else toBuffer(commands, storage.Image(), VK_IMAGE_LAYOUT_GENERAL, buffer->Handle(), 1, &colorRegion);
-        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
-        if (intoStorage) fromBuffer(commands, buffer->Handle(), storage.Image(), VK_IMAGE_LAYOUT_GENERAL, 1, &colorRegion);
-        else fromBuffer(commands, buffer->Handle(), image, VK_IMAGE_LAYOUT_GENERAL, 1, &depthRegion);
+        // One copy between the depth aspect and the color image where the device allows it
+        // (VK_KHR_maintenance8); through a buffer otherwise. APS5_NO_DEPTH_COLOR_COPY=1 always
+        // copies through the buffer.
+        static const bool viaBuffer = std::getenv("APS5_NO_DEPTH_COLOR_COPY") != nullptr;
+        std::shared_ptr<DeviceBuffer> staged;
+        if (context.depthColorCopies && !viaBuffer) {
+            const VkImageSubresourceLayers depthLayers{VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1};
+            const VkImageSubresourceLayers colorLayers{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            VkImageCopy region{};
+            region.srcSubresource = intoStorage ? depthLayers : colorLayers;
+            region.dstSubresource = intoStorage ? colorLayers : depthLayers;
+            region.extent = {target.extent.width, target.extent.height, 1};
+            context.Function<PFN_vkCmdCopyImage>("vkCmdCopyImage")(commands, intoStorage ? image : storage.Image(), VK_IMAGE_LAYOUT_GENERAL, intoStorage ? storage.Image() : image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+        } else {
+            if (transferBuffer == nullptr) transferBuffer = std::make_shared<DeviceBuffer>(context, static_cast<std::size_t>(bytes), VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+            staged = transferBuffer;
+            const VkBufferImageCopy depthRegion{0, 0, 0, {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1}, {0, 0, 0}, {target.extent.width, target.extent.height, 1}};
+            const VkBufferImageCopy colorRegion{0, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {target.extent.width, target.extent.height, 1}};
+            const auto toBuffer = context.Resolved(&DeviceFunctions::cmdCopyImageToBuffer, "vkCmdCopyImageToBuffer");
+            const auto fromBuffer = context.Resolved(&DeviceFunctions::cmdCopyBufferToImage, "vkCmdCopyBufferToImage");
+            if (intoStorage) toBuffer(commands, image, VK_IMAGE_LAYOUT_GENERAL, staged->Handle(), 1, &depthRegion);
+            else toBuffer(commands, storage.Image(), VK_IMAGE_LAYOUT_GENERAL, staged->Handle(), 1, &colorRegion);
+            RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+            if (intoStorage) fromBuffer(commands, staged->Handle(), storage.Image(), VK_IMAGE_LAYOUT_GENERAL, 1, &colorRegion);
+            else fromBuffer(commands, staged->Handle(), image, VK_IMAGE_LAYOUT_GENERAL, 1, &depthRegion);
+        }
         RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, any);
         if (batch) {
             batch->SubmitAndWait();
             return;
         }
-        recorder->Keep(buffer);
-        Recorder::CountBarriers(Recorder::CommandClass::Draw, 3);
+        recorder->EndGpuTiming(timing, staged != nullptr ? bytes * 2 : bytes);
+        if (staged != nullptr) recorder->Keep(staged);
+        Recorder::CountBarriers(Recorder::CommandClass::Draw, staged != nullptr ? 3 : 2);
     }
 
     void Clear(const DepthTarget& values, VkImageAspectFlags aspects) {
@@ -246,6 +266,9 @@ private:
     VkDeviceMemory layeredMemory = VK_NULL_HANDLE;
     std::uint32_t layeredLayers = 0;
     std::vector<std::pair<VkImage, VkDeviceMemory>> retired;
+    // Transfer's staging between the depth image and a storage image without direct depth/color
+    // copies, made once: a fresh one per transfer was a whole surface's allocation (32 MiB at 4K).
+    std::shared_ptr<DeviceBuffer> transferBuffer;
 
     void release() noexcept {
         textures.clear();

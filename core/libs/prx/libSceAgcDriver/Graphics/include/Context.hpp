@@ -140,6 +140,9 @@ struct Context {
     bool sampleRateShading = false;
     bool primitiveListRestart = false;
     bool imageViewMinLod = false;
+    // VK_KHR_maintenance8: vkCmdCopyImage between a depth aspect and a size-compatible color
+    // image (a depth surface and its R32 / R16 storage image, DepthSurface's Transfer).
+    bool depthColorCopies = false;
     bool pipelineExecutableInfo = false;
     std::uint32_t srgbDecodeFormats = 0;
 

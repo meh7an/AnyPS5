@@ -2614,6 +2614,7 @@ Graphics::Context VulkanDevice::buildContext() const {
     context.sampleRateShading = state->sampleRateShading;
     context.primitiveListRestart = state->primitiveListRestart;
     context.imageViewMinLod = state->imageViewMinLod;
+    context.depthColorCopies = state->maintenance8;
     context.pipelineExecutableInfo = state->pipelineExecutableInfo;
     context.srgbDecodeFormats = state->srgbDecodeFormats;
     return context;
