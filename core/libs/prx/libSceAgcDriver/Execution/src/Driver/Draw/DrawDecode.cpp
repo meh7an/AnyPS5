@@ -110,14 +110,18 @@ bool VerifyDecodeCache() {
 }
 
 // The shader registers a draw reads again: the user words of the pixel, vertex/geometry and hull
-// stages and the merged stages' user pointers (Pm4.cpp's perDrawShaderRegister).
+// stages and the merged stages' user pointers (PerDrawShaderRegister, QueueState.hpp).
 constexpr std::array<std::pair<std::uint32_t, std::uint32_t>, 5> PerDrawShaderRegisters{{{0x0cu, 32u}, {0x8cu, 32u}, {0x10cu, 32u}, {0x82u, 2u}, {0x102u, 2u}}};
 
 std::uint64_t decodeDigest(const QueueState& queue) {
+    // A queue's shader bank keeps the per-draw registers out of its digest already
+    // (Registers::ExcludePerDrawWords); a bank that kept them has them taken out here.
     auto shader = queue.shader.Digest();
-    for (const auto& [first, count] : PerDrawShaderRegisters) {
-        for (auto offset = first; offset < first + count; ++offset) {
-            if (queue.shader.contains(offset)) shader ^= Registers::EntryDigest(offset, queue.shader.at(offset));
+    if (!queue.shader.PerDrawWordsExcluded()) {
+        for (const auto& [first, count] : PerDrawShaderRegisters) {
+            for (auto offset = first; offset < first + count; ++offset) {
+                if (queue.shader.contains(offset)) shader ^= Registers::EntryDigest(offset, queue.shader.at(offset));
+            }
         }
     }
     // Odd multipliers keep an entry of one bank from cancelling the same entry of another.
@@ -126,7 +130,7 @@ std::uint64_t decodeDigest(const QueueState& queue) {
 
 // The banks equal outside the shader registers a draw reads again (decodeGeneration's exclusions).
 bool sameDecodeRegisters(const Registers& a, const Registers& b, bool shader) {
-    const auto skip = [&](std::uint32_t offset) { return shader && (offset - 0x0cu < 32u || offset - 0x8cu < 32u || offset - 0x10cu < 32u || offset - 0x82u < 2u || offset - 0x102u < 2u); };
+    const auto skip = [&](std::uint32_t offset) { return shader && PerDrawShaderRegister(offset); };
     auto x = a.begin();
     auto y = b.begin();
     while (true) {
