@@ -47,7 +47,7 @@ void reportStageTimes() {
 // The stage memo (StageMemoEntry). APS5_NO_STAGE_MEMO=1 captures and recompiles every stage;
 // APS5_VERIFY_STAGE_MEMO=1 captures and recompiles the stages it would serve too and compares the
 // results (a difference is reported, and the capture's result used); APS5_STAGE_MEMO_ENTRIES caps
-// the entries (default 8192, the least recently used go first); APS5_NO_STAGE_MEMO_VALUES=1 takes
+// the entries (default 32768, the least recently used go first); APS5_NO_STAGE_MEMO_VALUES=1 takes
 // a write stamp over an entry's words as a miss without comparing them.
 bool StageMemoEnabled() {
     static const bool enabled = std::getenv("APS5_NO_STAGE_MEMO") == nullptr;
@@ -77,7 +77,8 @@ std::size_t StageMemoCopies() {
 std::size_t StageMemoCapacity() {
     static const std::size_t capacity = [] {
         const char* text = std::getenv("APS5_STAGE_MEMO_ENTRIES");
-        const auto value = text != nullptr ? std::strtoull(text, nullptr, 10) : 8192ull;
+        // 8192 thrashed on the S2 menu page (about 104k evictions per 10 s).
+        const auto value = text != nullptr ? std::strtoull(text, nullptr, 10) : 32768ull;
         return static_cast<std::size_t>(std::max<unsigned long long>(value, 1ull));
     }();
     return capacity;
