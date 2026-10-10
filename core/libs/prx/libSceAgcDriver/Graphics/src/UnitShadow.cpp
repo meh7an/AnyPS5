@@ -5,6 +5,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ThreadScratch.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #ifdef _WIN32
 #include <windows.h>
@@ -82,6 +83,11 @@ Statistics& Stats() {
     return statistics;
 }
 
+// Bumped when a shadow gains its first live unit or loses its last (Recount) and when one leaves the
+// registry: while it holds still, the shadows with live units are those a snapshot saw
+// (shadowsMayOverlap).
+std::atomic<std::uint64_t> liveSerial{0};
+
 struct UnitShadow {
     Context context;
     // The import's range and buffer (taken at creation: a publish under the import table's mutex
@@ -133,7 +139,9 @@ struct UnitShadow {
     void Recount() {
         std::uint32_t live = 0;
         for (std::uint64_t unit = 0; unit < Units(); ++unit) live += Live(unit) ? 1u : 0u;
+        const bool flipped = (live == 0) != (liveUnits == 0);
         liveUnits = live;
+        if (flipped) liveSerial.fetch_add(1, std::memory_order_release);
     }
 };
 
@@ -241,6 +249,7 @@ std::shared_ptr<UnitShadow> findOrCreate(Shadows& registry, const Context& conte
     if (const auto found = registry.byBase.find(import.base); found != registry.byBase.end()) {
         forgetSlabs(registry, *found->second);
         registry.byBase.erase(found);
+        liveSerial.fetch_add(1, std::memory_order_release);
     }
     auto shadow = std::make_shared<UnitShadow>();
     shadow->context = context;
@@ -647,11 +656,30 @@ std::size_t PublishShadow(std::uint64_t address, std::size_t bytes, PublishScope
     return units;
 }
 
-bool AnyShadowedOverlaps(std::uint64_t address, std::size_t bytes) {
-    if (!UnitShadowEnabled() || bytes == 0) return false;
-    const auto end = bytes > std::numeric_limits<std::uint64_t>::max() - address ? std::numeric_limits<std::uint64_t>::max() : address + bytes;
-    auto& registry = Registry();
-    std::lock_guard lock(registry.mutex);
+namespace {
+
+// APS5_NO_REGISTRY_SNAPSHOTS=1: every shadow query takes the registry's mutex, as before
+// (shadowsMayOverlap); APS5_VERIFY_REGISTRY_SNAPSHOTS=1 checks each answer a snapshot gave against
+// the registry under its mutex.
+bool LiveSnapshots() {
+    static const bool enabled = std::getenv("APS5_NO_REGISTRY_SNAPSHOTS") == nullptr;
+    return enabled;
+}
+
+bool VerifyLiveSnapshots() {
+    static const bool verify = std::getenv("APS5_VERIFY_REGISTRY_SNAPSHOTS") != nullptr;
+    return verify;
+}
+
+// A thread's copy of the import ranges of the shadows with live units, merged and sorted, and the
+// liveSerial it was copied under.
+struct LiveSnapshot {
+    std::uint64_t serial = ~std::uint64_t{0};
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+};
+
+// Whether a shadow with live units overlaps [address, end): its units' scan, under the mutex.
+bool liveUnitsOverlap(const Shadows& registry, std::uint64_t address, std::uint64_t end) {
     return anyOverlapping(registry, address, end, [&](const std::shared_ptr<UnitShadow>& shadow) {
         if (shadow->liveUnits == 0) return false;
         const auto begin = std::max(address, shadow->importBase);
@@ -661,6 +689,51 @@ bool AnyShadowedOverlaps(std::uint64_t address, std::size_t bytes) {
         }
         return false;
     });
+}
+
+// Whether a shadow with live units may overlap [address, end), answered from the calling thread's
+// snapshot without the registry's mutex while liveSerial has not moved (a copy is taken under the
+// mutex when it has). False is final; true leaves the answer to the unit scan under the mutex.
+bool shadowsMayOverlap(std::uint64_t address, std::uint64_t end) {
+    if (!LiveSnapshots()) return true;
+    struct SnapshotTag {};
+    auto& snapshot = ThreadScratch<LiveSnapshot, SnapshotTag>();
+    if (snapshot.serial != liveSerial.load(std::memory_order_acquire)) {
+        auto& registry = Registry();
+        std::lock_guard lock(registry.mutex);
+        snapshot.ranges.clear();
+        // byBase is ordered by import base, so the ranges come sorted by their begin.
+        for (const auto& [base, shadow] : registry.byBase) {
+            if (shadow->liveUnits == 0) continue;
+            if (!snapshot.ranges.empty() && shadow->importBase <= snapshot.ranges.back().second) snapshot.ranges.back().second = std::max(snapshot.ranges.back().second, shadow->ImportEnd());
+            else snapshot.ranges.emplace_back(shadow->importBase, shadow->ImportEnd());
+        }
+        snapshot.serial = liveSerial.load(std::memory_order_relaxed);
+    }
+    const auto it = std::upper_bound(snapshot.ranges.begin(), snapshot.ranges.end(), address, [](std::uint64_t value, const std::pair<std::uint64_t, std::uint64_t>& range) { return value < range.second; });
+    const bool may = it != snapshot.ranges.end() && it->first < end;
+    if (!may && VerifyLiveSnapshots()) {
+        auto& registry = Registry();
+        std::lock_guard lock(registry.mutex);
+        // Only a registry the serial says is the snapshot's: one that moved since may differ.
+        if (liveSerial.load(std::memory_order_relaxed) == snapshot.serial && liveUnitsOverlap(registry, address, end)) {
+            std::fprintf(stderr, "[shadow] APS5_VERIFY_REGISTRY_SNAPSHOTS: the live snapshot misses a shadow over 0x%llx..0x%llx\n", static_cast<unsigned long long>(address), static_cast<unsigned long long>(end));
+            std::fflush(stderr);
+            std::abort();
+        }
+    }
+    return may;
+}
+
+}
+
+bool AnyShadowedOverlaps(std::uint64_t address, std::size_t bytes) {
+    if (!UnitShadowEnabled() || bytes == 0) return false;
+    const auto end = bytes > std::numeric_limits<std::uint64_t>::max() - address ? std::numeric_limits<std::uint64_t>::max() : address + bytes;
+    if (!shadowsMayOverlap(address, end)) return false;
+    auto& registry = Registry();
+    std::lock_guard lock(registry.mutex);
+    return liveUnitsOverlap(registry, address, end);
 }
 
 bool AnyShadowedOverlaps(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) {
@@ -948,6 +1021,7 @@ void RetireShadow(const Context& context, const HostImport& import, const std::f
     ++registry.retired;
     if (TraceEnabled()) std::fprintf(stderr, "[shadow] retire import 0x%llx+0x%llx: %zu units published, %llu dropped (memory no longer registered)\n", static_cast<unsigned long long>(import.base), static_cast<unsigned long long>(import.bytes), published, static_cast<unsigned long long>(dropped));
     registry.byBase.erase(found);
+    liveSerial.fetch_add(1, std::memory_order_release);
 }
 
 void PublishAllShadows(const Context& context, PublishReason reason) {
@@ -974,6 +1048,7 @@ void DestroyShadows(VkDevice device) {
         forgetSlabs(registry, *it->second);
         it = registry.byBase.erase(it);
     }
+    liveSerial.fetch_add(1, std::memory_order_release);
 }
 
 bool BufferShadowEnabled() {
