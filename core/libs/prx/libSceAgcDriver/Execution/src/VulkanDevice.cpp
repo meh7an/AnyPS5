@@ -2581,9 +2581,13 @@ Graphics::Context VulkanDevice::graphicsContext() const {
 }
 
 const Graphics::Context& VulkanDevice::graphicsContext(std::optional<Graphics::Context>& storage) const {
-    static const bool noCache = std::getenv("APS5_NO_CONTEXT_CACHE") != nullptr;
-    if (state->contextReady && !noCache) return state->context;
+    if (const auto* cached = cachedContext()) return *cached;
     return storage.emplace(buildContext());
+}
+
+const Graphics::Context* VulkanDevice::cachedContext() const {
+    static const bool noCache = std::getenv("APS5_NO_CONTEXT_CACHE") != nullptr;
+    return state->contextReady && !noCache ? &state->context : nullptr;
 }
 
 Graphics::Context VulkanDevice::buildContext() const {
@@ -2647,8 +2651,8 @@ VulkanDevice::IndirectDrawSupport VulkanDevice::DrawIndirectSupport() const {
 }
 
 std::optional<std::string> VulkanDevice::KnownDrawRejection(const Graphics::State& graphics, std::span<const Graphics::CompiledShader> shaders) const {
-    std::optional<Graphics::Context> contextStorage;
-    return Graphics::KnownValidationFailure(graphicsContext(contextStorage), shaders, graphics);
+    if (const auto* context = cachedContext()) return Graphics::KnownValidationFailure(*context, shaders, graphics);
+    return Graphics::KnownValidationFailure(graphicsContext(), shaders, graphics);
 }
 
 void VulkanDevice::ColorMetadataPass(const Graphics::ColorMetadataPass& pass) {
@@ -2666,9 +2670,8 @@ void VulkanDevice::Draw(const Graphics::State& graphics, const Pm4::DrawParamete
     // GPU mutex); APS5_TRACE_DRAWS=1 restores them.
     static const bool trace = std::getenv("APS5_TRACE_DRAWS") != nullptr;
     if (trace) APS5_LOG_OUT("VulkanDevice::Draw indices=%u instances=%u indexSize=%u address=0x%llx shaders=%zu colorTarget=%u", draw.indexCount, draw.instanceCount, draw.indexSize, static_cast<unsigned long long>(draw.indexAddress), shaders.size(), static_cast<unsigned>(graphics.hasColorTarget));
-    std::optional<Graphics::Context> contextStorage;
-    const auto& context = graphicsContext(contextStorage);
-    Graphics::Draw(context, graphics, draw, shaders, snapshots, recipe);
+    if (const auto* context = cachedContext()) Graphics::Draw(*context, graphics, draw, shaders, snapshots, recipe);
+    else Graphics::Draw(graphicsContext(), graphics, draw, shaders, snapshots, recipe);
     if (trace) APS5_LOG_CHARS_OUT("VulkanDevice::Draw complete");
 }
 

@@ -718,7 +718,10 @@ void traceVerify(std::uintptr_t address, std::size_t bytes, const void* caller) 
 void CheckRange(const void* pointer, std::size_t bytes, std::size_t alignment, bool writable) {
     require(alignment != 0, "zero guest memory alignment");
     const auto address = reinterpret_cast<std::uintptr_t>(pointer);
-    require(address != 0 && address % alignment == 0, "null or misaligned address");
+    // A mask for the power-of-two alignments every hot caller passes: the 64-bit divide cost more
+    // than the rest of the check.
+    const bool aligned = (alignment & (alignment - 1)) == 0 ? (address & (alignment - 1)) == 0 : address % alignment == 0;
+    require(address != 0 && aligned, "null or misaligned address");
     require(bytes <= std::numeric_limits<std::uintptr_t>::max() - address, "address range overflow");
     static const bool trace = std::getenv("APS5_TRACE_VERIFY") != nullptr;
     if (trace) traceVerify(address, bytes, __builtin_return_address(0));
