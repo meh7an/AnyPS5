@@ -484,6 +484,8 @@ private:
     std::vector<bool> storageFirstLayer;
     std::vector<bool> storageArrayView;
     std::vector<bool> storageWritten;
+    // Whether any storage image is written: kept as they are added, for WritesMemory at every draw.
+    bool anyStorageWritten = false;
     std::vector<bool> storageAtomic;
     std::vector<bool> storageAtomic64;
     std::vector<std::shared_ptr<Sampler>> samplers;

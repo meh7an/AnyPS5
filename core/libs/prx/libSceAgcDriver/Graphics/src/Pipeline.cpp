@@ -296,9 +296,10 @@ std::shared_ptr<Framebuffer> Pipeline::AcquireFramebuffer(std::span<const VkImag
         const auto matches = [&](const CachedFramebuffer& entry) {
             if (entry.extent.width != extent.width || entry.extent.height != extent.height || !std::equal(entry.views.begin(), entry.views.end(), targets.begin(), targets.end())) return false;
             // View handles are recycled once a StorageTexture is destroyed, so the owners must be the
-            // very objects the views were made for.
+            // very objects the views were made for: the same control block as the live owner (no
+            // lock, whose two locked reference count changes were most of the check).
             for (std::size_t i = 0; i < owners.size(); ++i) {
-                if (entry.owners[i].lock().get() != owners[i].get()) return false;
+                if (entry.owners[i].owner_before(owners[i]) || owners[i].owner_before(entry.owners[i])) return false;
             }
             return true;
         };
@@ -583,7 +584,9 @@ std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& st
     struct LastTag {};
     auto& last = ThreadScratch<LastPipeline, LastTag>();
     if (!key.empty() && last.uses < 64 && last.device == context.device && last.key == key) {
-        if (auto pipeline = last.pipeline.lock(); pipeline != nullptr && (context.bufferPool == nullptr || last.pool.lock() == context.bufferPool)) {
+        // The pool by its control block: the live pool shares the remembered one's only while it
+        // is that pool.
+        if (auto pipeline = last.pipeline.lock(); pipeline != nullptr && (context.bufferPool == nullptr || (!last.pool.owner_before(context.bufferPool) && !context.bufferPool.owner_before(last.pool)))) {
             ++last.uses;
             store.lastHits.fetch_add(1, std::memory_order_relaxed);
             return pipeline;

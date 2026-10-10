@@ -2945,6 +2945,7 @@ void ShaderResources::resolveImageBinding(const ShaderRecompiler::DescriptorBind
         storageArrayView.push_back(useArray);
         // Images the shader only reads have nothing to store back.
         storageWritten.push_back(element >= binding.imageWritten.size() || binding.imageWritten[element]);
+        anyStorageWritten = anyStorageWritten || storageWritten.back();
         storageAtomic.push_back(element < binding.imageAtomic.size() && binding.imageAtomic[element]);
         storageAtomic64.push_back(element < binding.imageAtomic64.size() && binding.imageAtomic64[element]);
         describedRanges.push_back({"storage", resource.baseAddress, guestBytes, resource.width, resource.height, resource.format, static_cast<int>(resource.tileMode), resource.dccAddress});
@@ -3354,7 +3355,7 @@ void ShaderResources::WriteBackBuffers() {
 }
 
 bool ShaderResources::WritesMemory() const {
-    return HoldsLease() || NeedsCompletion() || !guestMemory.Writes().empty() || std::any_of(storageWritten.begin(), storageWritten.end(), [](bool written) { return written; });
+    return HoldsLease() || NeedsCompletion() || !guestMemory.Writes().empty() || anyStorageWritten;
 }
 
 bool ShaderResources::ReadsOverlap(std::uint64_t address, std::size_t bytes) const {

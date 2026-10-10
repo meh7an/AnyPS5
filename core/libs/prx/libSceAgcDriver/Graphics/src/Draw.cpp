@@ -544,11 +544,35 @@ std::uint32_t CachedFragmentOutputs(const Context& context, std::span<const Comp
     auto& key = validationKeyScratch();
     const bool keyed = ValidationKey(context, shaders, state, key);
     static std::map<std::vector<std::uint64_t>, std::uint32_t> memo;
+    // The calling thread's last key and its outputs, ahead of the shared memo: consecutive draws
+    // mostly repeat their shape (the pipeline cache reuses its last pipeline about 94% of the time
+    // on the S2 menu page), and the memo's mutex and map walk cost more than the rest of the call.
+    // A key's outputs never change, so the copy stays right when the memo drops its entries.
+    // APS5_NO_LAST_FRAGMENT_OUTPUTS=1 asks the memo every time.
+    struct LastOutputs {
+        std::vector<std::uint64_t> key;
+        std::uint32_t outputs = 0;
+        bool valid = false;
+    };
+    struct LastOutputsTag {};
+    static const bool lastEnabled = std::getenv("APS5_NO_LAST_FRAGMENT_OUTPUTS") == nullptr;
+    auto& last = ThreadScratch<LastOutputs, LastOutputsTag>();
+    const auto remember = [&](std::uint32_t outputs) {
+        if (!lastEnabled) return;
+        last.key = key;
+        last.outputs = outputs;
+        last.valid = true;
+    };
     if (keyed) {
         memoized = true;
+        if (lastEnabled && last.valid && last.key == key) {
+            hit = true;
+            return last.outputs;
+        }
         std::lock_guard lock(validationMutex());
         if (const auto found = memo.find(key); found != memo.end()) {
             hit = true;
+            remember(found->second);
             return found->second;
         }
     }
@@ -569,10 +593,13 @@ std::uint32_t CachedFragmentOutputs(const Context& context, std::span<const Comp
         throw;
     }
     if (keyed) {
-        std::lock_guard lock(validationMutex());
-        // A handful of configurations recur; a runaway key space is dropped wholesale.
-        if (memo.size() >= 1024) memo.clear();
-        memo.emplace(key, outputs);
+        {
+            std::lock_guard lock(validationMutex());
+            // A handful of configurations recur; a runaway key space is dropped wholesale.
+            if (memo.size() >= 1024) memo.clear();
+            memo.emplace(key, outputs);
+        }
+        remember(outputs);
     }
     return outputs;
 }
@@ -1677,12 +1704,15 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     const bool readsTarget = std::any_of(record.targets.begin(), record.targets.end(), [&](const std::shared_ptr<StorageTexture>& target) { return resources.ReadsImage(target.get()); });
     // A queued DCC key store over memory the draw writes or reads in place (unknown for an
     // address-based build), or over its GPU-side records, lands before it, as before a dispatch
-    // (VulkanDevice::dispatch); the flush ends an open pass, so it comes before the decision.
-    const auto touches = [&](std::uint64_t begin, std::uint64_t end) {
+    // (VulkanDevice::dispatch); the flush ends an open pass, so it comes before the decision. The
+    // check captures the record alone: a std::function holds one pointer in place, where three
+    // captures took a heap allocation at each check.
+    const auto touches = [&record](std::uint64_t begin, std::uint64_t end) {
         const auto bytes = static_cast<std::size_t>(end - begin);
-        if (resources.WritesOverlap(begin, bytes) || resources.ReadsOverlap(begin, bytes)) return true;
-        if (!gpuIndirect) return false;
-        return (begin < args->arguments + args->RangeBytes() && args->arguments < end) || (args->countIndirect && begin < args->countAddress + 4 && args->countAddress < end);
+        if (record.resources->WritesOverlap(begin, bytes) || record.resources->ReadsOverlap(begin, bytes)) return true;
+        const auto* gpuArgs = record.indirect != nullptr && record.indirect->path == IndirectDrawPath::Gpu ? record.indirect->args : nullptr;
+        if (gpuArgs == nullptr) return false;
+        return (begin < gpuArgs->arguments + gpuArgs->RangeBytes() && gpuArgs->arguments < end) || (gpuArgs->countIndirect && begin < gpuArgs->countAddress + 4 && gpuArgs->countAddress < end);
     };
     if (recorder->HasQueuedKeyStores() && (resources.HoldsLease() || recorder->AnyQueuedKeyStore(touches))) recorder->FlushKeyStores();
     // A queued label store over such memory likewise (Recorder::RecordStore).
