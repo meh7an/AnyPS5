@@ -84,11 +84,24 @@ std::size_t StageMemoCapacity() {
     return capacity;
 }
 
+// Whether a draw cache variant keeps its own copy of a result the stage memo served
+// (cacheDrawStages); APS5_NO_VARIANT_RESULT_COPIES=1 holds the memo's, as before.
+bool VariantResultCopies() {
+    static const bool copies = std::getenv("APS5_NO_VARIANT_RESULT_COPIES") == nullptr;
+    return copies;
+}
+
 // APS5_PROFILE_DRAW: the memo's outcomes, every 10 s on a [stage-memo] line.
 struct StageMemoCounters {
     std::atomic<std::uint64_t> lookups{0}, hits{0}, revalidated{0}, absent{0}, mappings{0}, changed{0}, pending{0}, skipped{0};
     std::atomic<std::uint64_t> inserts{0}, refusedPatches{0}, refusedMismatch{0}, refusedUnwatched{0}, refusedUnstable{0}, evictions{0};
     std::atomic<std::uint64_t> verified{0}, differed{0};
+    // Hits that copied the entry's result: into an empty place of the slot, or because a draw held
+    // every served copy.
+    std::atomic<std::uint64_t> copiedEmpty{0}, copiedHeld{0};
+    // The served copies such a copy found held, by their use count: 2 (one reference besides the
+    // slot's, a draw cache variant's), 3 (a draw in flight: its stage capture and its results), more.
+    std::atomic<std::uint64_t> heldTwo{0}, heldThree{0}, heldMore{0};
     std::atomic<std::int64_t> lastReport{0};
 };
 
@@ -107,7 +120,7 @@ void reportStageMemo(std::size_t entries) {
     const auto take = [](std::atomic<std::uint64_t>& counter) { return static_cast<unsigned long long>(counter.exchange(0, std::memory_order_relaxed)); };
     const auto lookups = take(counters.lookups);
     const auto hits = take(counters.hits);
-    std::fprintf(stderr, "[stage-memo] %llu lookups (10 s): %llu hits (%.1f%%, %llu after comparing stamped words); misses: no entry %llu, mappings changed %llu, words changed %llu, pending results %llu, not tried (changing key) %llu; inserts %llu, refused: no patches %llu, patch mismatch %llu, unwatched %llu, unstable %llu; evictions %llu, %zu entries; verify: %llu compared, %llu differed\n", lookups, hits, lookups != 0 ? 100.0 * static_cast<double>(hits) / static_cast<double>(lookups) : 0.0, take(counters.revalidated), take(counters.absent), take(counters.mappings), take(counters.changed), take(counters.pending), take(counters.skipped), take(counters.inserts), take(counters.refusedPatches), take(counters.refusedMismatch), take(counters.refusedUnwatched), take(counters.refusedUnstable), take(counters.evictions), entries, take(counters.verified), take(counters.differed));
+    std::fprintf(stderr, "[stage-memo] %llu lookups (10 s): %llu hits (%.1f%%, %llu after comparing stamped words; result copied by %llu into an empty place, %llu with every served copy held, those held by use count 2/3/more %llu/%llu/%llu); misses: no entry %llu, mappings changed %llu, words changed %llu, pending results %llu, not tried (changing key) %llu; inserts %llu, refused: no patches %llu, patch mismatch %llu, unwatched %llu, unstable %llu; evictions %llu, %zu entries; verify: %llu compared, %llu differed\n", lookups, hits, lookups != 0 ? 100.0 * static_cast<double>(hits) / static_cast<double>(lookups) : 0.0, take(counters.revalidated), take(counters.copiedEmpty), take(counters.copiedHeld), take(counters.heldTwo), take(counters.heldThree), take(counters.heldMore), take(counters.absent), take(counters.mappings), take(counters.changed), take(counters.pending), take(counters.skipped), take(counters.inserts), take(counters.refusedPatches), take(counters.refusedMismatch), take(counters.refusedUnwatched), take(counters.refusedUnstable), take(counters.evictions), entries, take(counters.verified), take(counters.differed));
 }
 
 // A stage's memo key: the user data size, each user word's bits the source reads other than as a
@@ -369,6 +382,10 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::compileDrawStag
                 if (found != nullptr && found->entry == entry) {
                     const auto copies = std::span(found->served).first(StageMemoCopies());
                     auto place = std::find(copies.begin(), copies.end(), nullptr);
+                    (place != copies.end() ? counters.copiedEmpty : counters.copiedHeld).fetch_add(1, std::memory_order_relaxed);
+                    if (place == copies.end()) {
+                        for (const auto& copy : copies) (copy.use_count() == 2 ? counters.heldTwo : copy.use_count() == 3 ? counters.heldThree : counters.heldMore).fetch_add(1, std::memory_order_relaxed);
+                    }
                     if (place == copies.end()) place = std::find_if(copies.begin(), copies.end(), [](const auto& copy) { return copy.use_count() > 1; });
                     if (place != copies.end()) *place = served;
                 }
@@ -555,7 +572,11 @@ void Driver::cacheDrawStages(bool useDrawEntries, bool drawHit, const Pm4::DrawP
             const auto& stageCapture = stageCaptures[i];
             if (stageCapture.compiled == nullptr) continue;
             auto variant = std::make_shared<DispatchVariant>();
-            variant->compiled = stageCapture.compiled;
+            // A result the stage memo served is patched in place by the memo's later hits once nothing
+            // else holds it. Held by the variant until evicted (a parked cache keeps its variants), it
+            // made those hits copy the result instead: about half of them on the S2 menu page. The
+            // variant keeps a copy of its own.
+            variant->compiled = stageCapture.memo != nullptr && VariantResultCopies() ? std::make_shared<const ShaderRecompiler::RecompileResult>(*stageCapture.compiled) : stageCapture.compiled;
             variant->shader = programs[i].snapshot;
             variant->forgetSerial = stageCapture.forgetSerial;
             variant->pushOffset = stageCapture.pushOffset;
