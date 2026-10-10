@@ -110,9 +110,19 @@ StageMemoCounters& stageMemoCounters() {
     return counters;
 }
 
-void reportStageMemo(std::size_t entries) {
+bool StageMemoProfiled() {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
-    if (!profile) return;
+    return profile;
+}
+
+// A counter of the [stage-memo] line, counted only while the line is printed: a locked add on a
+// shared line at every lookup and hit otherwise.
+void countStageMemo(std::atomic<std::uint64_t>& counter) {
+    if (StageMemoProfiled()) counter.fetch_add(1, std::memory_order_relaxed);
+}
+
+void reportStageMemo(std::size_t entries) {
+    if (!StageMemoProfiled()) return;
     auto& counters = stageMemoCounters();
     const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
     auto last = counters.lastReport.load(std::memory_order_relaxed);
@@ -140,6 +150,13 @@ std::uint64_t stageMemoKey(const ShaderRecompiler::UserDataKey& key, const void*
     mix(reinterpret_cast<std::uintptr_t>(source));
     mix(pushOffset);
     for (const auto value : words) mix(value);
+    // MurmurHash3's finalizer: the memo's table indexes by the low bits, which FNV's last multiply
+    // leaves depending on the inputs' low bits alone.
+    hash ^= hash >> 33u;
+    hash *= 0xff51afd7ed558ccdull;
+    hash ^= hash >> 33u;
+    hash *= 0xc4ceb9fe1a85ec53ull;
+    hash ^= hash >> 33u;
     return hash;
 }
 
@@ -303,7 +320,7 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::compileDrawStag
     bool memoStore = true;
     if (memoKey != nullptr) {
         auto& counters = stageMemoCounters();
-        counters.lookups.fetch_add(1, std::memory_order_relaxed);
+        countStageMemo(counters.lookups);
         memoHash = stageMemoKey(*memoKey, handle->source.get(), pushOffset, program.userData, memoWords);
         std::shared_ptr<const StageMemoEntry> entry;
         std::shared_ptr<ShaderRecompiler::RecompileResult> served;
@@ -353,7 +370,7 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::compileDrawStag
                 const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::DrawCache);
                 if (captureStable(words.value)) {
                     miss = StageMemoMiss::None;
-                    counters.revalidated.fetch_add(1, std::memory_order_relaxed);
+                    countStageMemo(counters.revalidated);
                 }
             }
             std::lock_guard lock(stageMemoMutex);
@@ -365,11 +382,11 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::compileDrawStag
         }
         switch (miss) {
             case StageMemoMiss::None: break;
-            case StageMemoMiss::Absent: counters.absent.fetch_add(1, std::memory_order_relaxed); break;
-            case StageMemoMiss::Mappings: counters.mappings.fetch_add(1, std::memory_order_relaxed); break;
-            case StageMemoMiss::Changed: counters.changed.fetch_add(1, std::memory_order_relaxed); break;
-            case StageMemoMiss::Pending: counters.pending.fetch_add(1, std::memory_order_relaxed); break;
-            case StageMemoMiss::Skipped: counters.skipped.fetch_add(1, std::memory_order_relaxed); break;
+            case StageMemoMiss::Absent: countStageMemo(counters.absent); break;
+            case StageMemoMiss::Mappings: countStageMemo(counters.mappings); break;
+            case StageMemoMiss::Changed: countStageMemo(counters.changed); break;
+            case StageMemoMiss::Pending: countStageMemo(counters.pending); break;
+            case StageMemoMiss::Skipped: countStageMemo(counters.skipped); break;
         }
         if (miss == StageMemoMiss::None) {
             const bool fresh = served == nullptr;
@@ -382,17 +399,17 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::compileDrawStag
                 if (found != nullptr && found->entry == entry) {
                     const auto copies = std::span(found->served).first(StageMemoCopies());
                     auto place = std::find(copies.begin(), copies.end(), nullptr);
-                    (place != copies.end() ? counters.copiedEmpty : counters.copiedHeld).fetch_add(1, std::memory_order_relaxed);
-                    if (place == copies.end()) {
-                        for (const auto& copy : copies) (copy.use_count() == 2 ? counters.heldTwo : copy.use_count() == 3 ? counters.heldThree : counters.heldMore).fetch_add(1, std::memory_order_relaxed);
+                    countStageMemo(place != copies.end() ? counters.copiedEmpty : counters.copiedHeld);
+                    if (place == copies.end() && StageMemoProfiled()) {
+                        for (const auto& copy : copies) countStageMemo(copy.use_count() == 2 ? counters.heldTwo : copy.use_count() == 3 ? counters.heldThree : counters.heldMore);
                     }
                     if (place == copies.end()) place = std::find_if(copies.begin(), copies.end(), [](const auto& copy) { return copy.use_count() > 1; });
                     if (place != copies.end()) *place = served;
                 }
             }
-            memoResult = served;
+            memoResult = std::move(served);
             if (!VerifyStageMemo()) {
-                counters.hits.fetch_add(1, std::memory_order_relaxed);
+                countStageMemo(counters.hits);
                 shaderMemory.Seed(entry->regions);
                 if (wantRegions) {
                     stageCapture.regions.clear();
@@ -400,9 +417,13 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::compileDrawStag
                     stageCapture.memo = entry;
                 }
                 regionsDone();
-                stageCapture.compiled = std::move(memoResult);
                 phaseTiming.Phase(DrawRowRecompile);
                 reportStageMemo(entries);
+                // Only the draw cache and the traces read the stage capture's result (all under
+                // wantRegions): otherwise the result goes to the draw alone, without the capture's
+                // reference to drop again on the draw thread.
+                if (!wantRegions) return memoResult;
+                stageCapture.compiled = std::move(memoResult);
                 return stageCapture.compiled;
             }
         }
@@ -452,32 +473,34 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::compileDrawStag
 
     if (subPhases) lap = std::chrono::steady_clock::now();
     bool memoHit = false;
-    stageCapture.compiled = reuseCapture ? ShaderRecompiler::Recompile(request, *capture, &memoHit) : std::make_shared<const ShaderRecompiler::RecompileResult>(ShaderRecompiler::Recompile(request));
+    auto compiled = reuseCapture ? ShaderRecompiler::Recompile(request, *capture, &memoHit) : std::make_shared<const ShaderRecompiler::RecompileResult>(ShaderRecompiler::Recompile(request));
     if (subPhases) {
         part(memoHit ? StageTimes::RecompileHit : StageTimes::RecompileMiss);
         reportStageTimes();
     }
     phaseTiming.Phase(DrawRowRecompile);
-    if (memoKey != nullptr && (memoStore || memoResult != nullptr)) insertStageMemo(memoHash, handle, pushOffset, memoWords, mappings, stageCapture.compiled, memoResult, request.context.userData, recent, program.binary.codeAddress);
+    if (memoKey != nullptr && (memoStore || memoResult != nullptr)) insertStageMemo(memoHash, handle, pushOffset, memoWords, mappings, compiled, memoResult, request.context.userData, recent, program.binary.codeAddress);
     // Shared, not copied: the result is immutable (a copy cost a few dozen allocations per stage).
-    return stageCapture.compiled;
+    // The stage capture keeps it for its readers only (see the memo's hit above).
+    if (wantRegions) stageCapture.compiled = compiled;
+    return compiled;
 }
 
 void Driver::insertStageMemo(std::uint64_t hash, const std::shared_ptr<const ShaderRecompiler::SourceHandle>& handle, std::uint32_t pushOffset, const std::vector<std::uint32_t>& key, std::uint64_t mappings, const std::shared_ptr<const ShaderRecompiler::RecompileResult>& result, const std::shared_ptr<const ShaderRecompiler::RecompileResult>& memoResult, std::span<const std::uint32_t> userData, std::span<const ShaderRecompiler::MemoryRegion> recent, std::uint64_t codeAddress) {
     auto& counters = stageMemoCounters();
     if (memoResult != nullptr) {
         // APS5_VERIFY_STAGE_MEMO: the memo's result against the capture's.
-        counters.verified.fetch_add(1, std::memory_order_relaxed);
+        countStageMemo(counters.verified);
         const auto difference = stageMemoDifference(*memoResult, *result);
         if (!difference.empty()) {
-            counters.differed.fetch_add(1, std::memory_order_relaxed);
+            countStageMemo(counters.differed);
             static std::atomic<int> reports{0};
             if (reports.fetch_add(1) < 32) std::fprintf(stderr, "[stage-memo] verify: program 0x%llx: %s\n", static_cast<unsigned long long>(codeAddress), difference.c_str());
         }
     }
     const auto patches = ShaderRecompiler::UserDataPatchesFor(*handle, *result);
     if (patches == nullptr) {
-        counters.refusedPatches.fetch_add(1, std::memory_order_relaxed);
+        countStageMemo(counters.refusedPatches);
         return;
     }
     // Every copy the analysis names must hold in this result (an image the materializer cleared as
@@ -485,26 +508,26 @@ void Driver::insertStageMemo(std::uint64_t hash, const std::shared_ptr<const Sha
     // where the result does not follow them.
     for (const auto& patch : *patches) {
         if (patch.userWord >= userData.size()) {
-            counters.refusedMismatch.fetch_add(1, std::memory_order_relaxed);
+            countStageMemo(counters.refusedMismatch);
             return;
         }
         const auto value = userData[patch.userWord];
         std::uint32_t held = 0;
         if (patch.binding == ShaderRecompiler::UserDataPatch::PushConstants) {
             if ((static_cast<std::size_t>(patch.word) + 1u) * sizeof(held) > result->pushConstants.size()) {
-                counters.refusedMismatch.fetch_add(1, std::memory_order_relaxed);
+                countStageMemo(counters.refusedMismatch);
                 return;
             }
             std::memcpy(&held, result->pushConstants.data() + static_cast<std::size_t>(patch.word) * sizeof(held), sizeof(held));
         } else {
             if (patch.binding >= result->bindings.size() || patch.word >= result->bindings[patch.binding].guestDescriptor.size()) {
-                counters.refusedMismatch.fetch_add(1, std::memory_order_relaxed);
+                countStageMemo(counters.refusedMismatch);
                 return;
             }
             held = result->bindings[patch.binding].guestDescriptor[patch.word];
         }
         if (held != value) {
-            counters.refusedMismatch.fetch_add(1, std::memory_order_relaxed);
+            countStageMemo(counters.refusedMismatch);
             return;
         }
     }
@@ -528,7 +551,7 @@ void Driver::insertStageMemo(std::uint64_t hash, const std::shared_ptr<const Sha
     std::uint64_t generation = 0;
     for (const auto& [begin, end] : entry->runs) generation = std::max(generation, GuestMemory::CollectWrites(begin, static_cast<std::size_t>(end - begin)));
     if (!entry->runs.empty() && generation == 0) {
-        counters.refusedUnwatched.fetch_add(1, std::memory_order_relaxed);
+        countStageMemo(counters.refusedUnwatched);
         return;
     }
     entry->generation = generation;
@@ -537,11 +560,11 @@ void Driver::insertStageMemo(std::uint64_t hash, const std::shared_ptr<const Sha
         // the generation: the words must still be the guest's now.
         const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::DrawCache);
         if (!recent.empty() && !captureStable(recent)) {
-            counters.refusedUnstable.fetch_add(1, std::memory_order_relaxed);
+            countStageMemo(counters.refusedUnstable);
             return;
         }
     }
-    counters.inserts.fetch_add(1, std::memory_order_relaxed);
+    countStageMemo(counters.inserts);
     std::lock_guard lock(stageMemoMutex);
     auto [slot, inserted] = stageMemo.try_emplace(hash);
     if (inserted) {
@@ -560,7 +583,7 @@ void Driver::insertStageMemo(std::uint64_t hash, const std::shared_ptr<const Sha
     while (stageMemo.size() > StageMemoCapacity() && !stageMemoOrder.empty()) {
         stageMemo.erase(stageMemoOrder.front());
         stageMemoOrder.pop_front();
-        counters.evictions.fetch_add(1, std::memory_order_relaxed);
+        countStageMemo(counters.evictions);
     }
 }
 
