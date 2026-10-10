@@ -87,7 +87,14 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
         ++outcomes.atEntry;
         return;
     }
-    if (heldAtSubmit || storedSince(packet, awaited, awaitedBytes, received)) return;
+    if (heldAtSubmit) return;
+    // A store this queue recorded itself orders no CPU write: the epoch stays, as for a write the
+    // draw thread still holds above (a value another queue stored still moves it).
+    bool ownStore = false;
+    if (storedSince(packet, awaited, awaitedBytes, received, queue, &ownStore)) {
+        if (ownStore && ownLabelWaitsKeepEpoch()) epochPoint.bump = false;
+        return;
+    }
 
     static const bool labelShortcut = std::getenv("APS5_NO_LABEL_SHORTCUT") == nullptr;
     static const bool overlapSubmit = std::getenv("APS5_NO_WAIT_OVERLAP_SUBMIT") == nullptr;
@@ -273,7 +280,10 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
     bool spinning = pauseSpin;
     std::uint32_t polls = 0;
     while (!Pm4::WaitSatisfiedUnchecked(packet)) {
-        if (storedSince(packet, awaited, awaitedBytes, received)) return;
+        if (storedSince(packet, awaited, awaitedBytes, received, queue, &ownStore)) {
+            if (ownStore && ownLabelWaitsKeepEpoch()) epochPoint.bump = false;
+            return;
+        }
         ++polls;
         if (spinning) {
             _mm_pause();

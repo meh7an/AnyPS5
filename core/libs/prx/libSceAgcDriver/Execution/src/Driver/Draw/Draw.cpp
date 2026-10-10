@@ -833,7 +833,7 @@ void Driver::recordRingWrites(PreparedDraw& prepared, std::unique_lock<GuestMemo
             if (reason != 1 && localDevice != nullptr) localDevice->WaitIdle();
             GuestMemory::Write(write.address, bytes, write.store ? 1 : 4);
         }
-        noteLabelStore(write.address, bytes, write.stamp);
+        noteLabelStore(write.address, bytes, write.stamp, prepared.queue);
     }
     ++ringWritten;
     Graphics::Recorder::CloseLabelGroup(GuestMemory::TrackerGeneration());
