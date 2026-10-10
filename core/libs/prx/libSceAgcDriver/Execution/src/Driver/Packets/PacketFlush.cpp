@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ThreadScratch.hpp"
 #include <cstdlib>
 
 namespace AgcDriver::DriverDetail {
@@ -19,11 +20,24 @@ void Driver::flushBetweenPackets(std::uint32_t queue, std::uint32_t header, bool
     bool submit = false, record = false, needsRecord = false, deferredDue = false, pendingDue = false;
     const auto pending = Graphics::Recorder::PendingLabelSince();
 
-    thread_local std::chrono::steady_clock::time_point lastReapTry{};
+    // The worker's clock and last reap try (a thread slot: thread_local is emulated on MinGW). The
+    // clock is read at every packet while the worker's own labels wait, whose deadline decides whether
+    // it records them now, else at every 8th packet: the label deadline and the reap interval (a
+    // millisecond and more) take a few microseconds of lag, and a read per packet was 1.8% of the
+    // worker on the S2 page, where completions are pending all the time. APS5_CLOCK_EACH_PACKET=1 reads
+    // it at every packet, as before.
+    static const bool clockEachPacket = std::getenv("APS5_CLOCK_EACH_PACKET") != nullptr;
+    struct PacketClock {
+        std::chrono::steady_clock::time_point now{};
+        std::chrono::steady_clock::time_point lastReapTry{};
+        std::uint32_t packets = 0;
+    };
+    struct PacketClockTag {};
+    auto& clock = ThreadScratch<PacketClock, PacketClockTag>();
     const bool completions = completionsPending();
     const bool reapDue = completions && (reapEachPacket() || queue == 0);
-
-    const auto now = queued || pending.has_value() || reapDue ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    if (queued || ((pending.has_value() || reapDue) && (clockEachPacket || (++clock.packets & 7u) == 0))) clock.now = std::chrono::steady_clock::now();
+    const auto now = clock.now;
 
     bool recordAtLock = false;
     if (queued) {
@@ -44,12 +58,12 @@ void Driver::flushBetweenPackets(std::uint32_t queue, std::uint32_t header, bool
     }
     const auto work = Graphics::Recorder::RecordedWorkSinceSubmit();
     const bool capped = !submit && !record && batchCap() != 0 && work >= batchCap();
-    const bool reap = !submit && !record && !capped && reapDue && (reapEachPacket() || now - lastReapTry >= ReapInterval);
+    const bool reap = !submit && !record && !capped && reapDue && (reapEachPacket() || now - clock.lastReapTry >= ReapInterval);
     if (!submit && !record && !capped && !reap) {
         if (recordAtLock) ++recordTriesSkipped;
         return;
     }
-    if (reap) lastReapTry = now;
+    if (reap) clock.lastReapTry = now;
     std::unique_lock gpuLock(GuestMemory::GpuMutex(), std::defer_lock);
 
     if (record) GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Label);
