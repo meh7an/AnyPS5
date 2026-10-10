@@ -13,8 +13,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
+#include <numeric>
 #include <span>
 #include <string>
+#include <unordered_map>
 
 namespace AgcDriver::DriverDetail {
 
@@ -213,6 +216,169 @@ StageMemoMiss stageMemoCurrent(const StageMemoEntry& entry, std::uint64_t genera
     return StageMemoMiss::None;
 }
 
+// APS5_TRACE_MEMO_CHURN=1: what the stage memo's misses change, every 10 s on a [stage-memo-churn]
+// line. Each missed stage's capture is compared with the last capture of the same memo key (kept
+// whether or not the memo stored it): its regions moved (other addresses or sizes), held the same
+// words (the miss cost the capture and recompile for nothing: a stale entry, a backed-off key), or
+// changed in place. A change in place is then tried as a memo that let captured words differ would
+// serve it: the last capture's result with this stage's user words patched in must have the same
+// variant and binding shapes, and every word it still differs in must be a region word that
+// changed at the same position from the last capture's value to this one's (a word the result only
+// copies: a buffer or image address, flattened data). Profile-only: it copies each missed stage's
+// words and computes its patches.
+bool MemoChurnTraced() {
+    static const bool traced = std::getenv("APS5_TRACE_MEMO_CHURN") != nullptr;
+    return traced;
+}
+
+struct MemoChurn {
+    struct Last {
+        std::vector<std::pair<std::uint64_t, std::vector<std::uint32_t>>> regions;
+        std::shared_ptr<const ShaderRecompiler::RecompileResult> result;
+        std::shared_ptr<const std::vector<ShaderRecompiler::UserDataPatch>> patches;
+    };
+    AgcDriver::Mutex mutex;
+    std::unordered_map<std::uint64_t, Last> last;
+    // Misses by the memo's reason (StageMemoMiss's order), then by what the capture changed.
+    std::array<std::uint64_t, 6> reasons{};
+    std::uint64_t first = 0, moved = 0, identical = 0, changed = 0, served = 0, shapes = 0, noPatches = 0, unexplained = 0;
+    std::uint64_t wordsExplained = 0, wordsUnexplained = 0, pushUnexplained = 0;
+    // The explained words by the binding's DescriptorRole (the last place: push constants), and
+    // within a buffer's V# (4 words) and an image's T# (8 words) by word.
+    std::array<std::uint64_t, 9> explainedRoles{};
+    std::array<std::uint64_t, 4> explainedBufferWords{};
+    std::array<std::uint64_t, 8> explainedImageWords{};
+    std::map<std::uint64_t, std::uint64_t> unexplainedPrograms;
+    std::vector<std::string> examples;
+    std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
+};
+
+void traceMemoChurn(std::uint64_t hash, StageMemoMiss miss, const ShaderRecompiler::SourceHandle& handle, const ShaderRecompiler::RecompileRequest& request, std::span<const ShaderRecompiler::MemoryRegion> recent, const std::shared_ptr<const ShaderRecompiler::RecompileResult>& compiled, std::uint64_t code) {
+    static MemoChurn churn;
+    std::vector<std::pair<std::uint64_t, std::vector<std::uint32_t>>> regions;
+    regions.reserve(recent.size());
+    for (const auto& region : recent) {
+        std::vector<std::uint32_t> words(region.bytes.size() / sizeof(std::uint32_t));
+        std::memcpy(words.data(), region.bytes.data(), words.size() * sizeof(std::uint32_t));
+        regions.emplace_back(region.guestAddress, std::move(words));
+    }
+    auto patches = ShaderRecompiler::UserDataPatchesFor(handle, *compiled);
+    std::lock_guard lock(churn.mutex);
+    ++churn.reasons[static_cast<std::size_t>(miss)];
+    if (churn.last.size() >= 65536) churn.last.clear();
+    auto& last = churn.last[hash];
+    if (last.result == nullptr) {
+        ++churn.first;
+    } else {
+        bool sameAddresses = last.regions.size() == regions.size();
+        for (std::size_t r = 0; sameAddresses && r < regions.size(); ++r) sameAddresses = last.regions[r].first == regions[r].first && last.regions[r].second.size() == regions[r].second.size();
+        if (!sameAddresses) {
+            ++churn.moved;
+        } else if (last.regions == regions) {
+            ++churn.identical;
+        } else if (last.patches == nullptr) {
+            ++churn.changed;
+            ++churn.noPatches;
+        } else {
+            ++churn.changed;
+            auto patched = *last.result;
+            ShaderRecompiler::PatchOverUserData(request, patched, *last.patches);
+            const auto& fresh = *compiled;
+            bool sameShapes = patched.variantId == fresh.variantId && patched.bindings.size() == fresh.bindings.size() && patched.pushConstants.size() == fresh.pushConstants.size();
+            for (std::size_t b = 0; sameShapes && b < fresh.bindings.size(); ++b) {
+                const auto& left = patched.bindings[b];
+                const auto& right = fresh.bindings[b];
+                sameShapes = left.role == right.role && left.kind == right.kind && left.count == right.count && left.guestDescriptor.size() == right.guestDescriptor.size();
+            }
+            if (!sameShapes) {
+                ++churn.shapes;
+            } else {
+                // A region word at the same position that went from `before` to `after`.
+                const auto explained = [&](std::uint32_t before, std::uint32_t after) {
+                    for (std::size_t r = 0; r < regions.size(); ++r) {
+                        const auto& old = last.regions[r].second;
+                        const auto& now = regions[r].second;
+                        for (std::size_t p = 0; p < now.size(); ++p) {
+                            if (old[p] == before && now[p] == after) return true;
+                        }
+                    }
+                    return false;
+                };
+                bool all = true;
+                for (std::size_t b = 0; b < fresh.bindings.size(); ++b) {
+                    const auto& left = patched.bindings[b].guestDescriptor;
+                    const auto& right = fresh.bindings[b].guestDescriptor;
+                    for (std::size_t w = 0; w < right.size(); ++w) {
+                        if (left[w] == right[w]) continue;
+                        if (explained(left[w], right[w])) {
+                            ++churn.wordsExplained;
+                            const auto role = fresh.bindings[b].role;
+                            ++churn.explainedRoles[std::min<std::size_t>(static_cast<std::size_t>(role), 7)];
+                            if (role == ShaderRecompiler::DescriptorRole::GuestBuffers) ++churn.explainedBufferWords[w % 4];
+                            if (role == ShaderRecompiler::DescriptorRole::GuestImages) ++churn.explainedImageWords[w % 8];
+                            continue;
+                        }
+                        ++churn.wordsUnexplained;
+                        if (all && churn.examples.size() < 12) {
+                            char text[200];
+                            std::snprintf(text, sizeof(text), "program 0x%llx binding %zu (role %d) word %zu: 0x%08x -> 0x%08x", static_cast<unsigned long long>(code), b, static_cast<int>(fresh.bindings[b].role), w, left[w], right[w]);
+                            churn.examples.emplace_back(text);
+                        }
+                        all = false;
+                    }
+                }
+                for (std::size_t offset = 0; offset + sizeof(std::uint32_t) <= fresh.pushConstants.size(); offset += sizeof(std::uint32_t)) {
+                    std::uint32_t before = 0, after = 0;
+                    std::memcpy(&before, patched.pushConstants.data() + offset, sizeof(before));
+                    std::memcpy(&after, fresh.pushConstants.data() + offset, sizeof(after));
+                    if (before == after) continue;
+                    if (explained(before, after)) {
+                        ++churn.wordsExplained;
+                        ++churn.explainedRoles[8];
+                        continue;
+                    }
+                    ++churn.pushUnexplained;
+                    all = false;
+                }
+                if (all) {
+                    ++churn.served;
+                } else {
+                    ++churn.unexplained;
+                    ++churn.unexplainedPrograms[code];
+                }
+            }
+        }
+    }
+    last = {std::move(regions), compiled, std::move(patches)};
+    const auto now = std::chrono::steady_clock::now();
+    if (now - churn.lastReport < std::chrono::seconds(10)) return;
+    churn.lastReport = now;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> programs;
+    for (const auto& [program, count] : churn.unexplainedPrograms) programs.emplace_back(count, program);
+    std::sort(programs.rbegin(), programs.rend());
+    std::string top;
+    for (std::size_t i = 0; i < programs.size() && i < 6; ++i) {
+        char text[48];
+        std::snprintf(text, sizeof(text), " 0x%llx x%llu", static_cast<unsigned long long>(programs[i].second), static_cast<unsigned long long>(programs[i].first));
+        top += text;
+    }
+    const auto total = std::accumulate(churn.reasons.begin(), churn.reasons.end(), std::uint64_t{0});
+    std::fprintf(stderr, "[stage-memo-churn] %llu misses traced (10 s): words changed %llu, not tried %llu, no entry %llu, mappings %llu, pending %llu; first capture of the key %llu, regions moved %llu, same words %llu, changed in place %llu: served by copied words %llu, variant or shape changed %llu, no patches %llu, unexplained %llu (result words explained %llu, unexplained %llu, push dwords unexplained %llu); unexplained by program:%s\n", static_cast<unsigned long long>(total), static_cast<unsigned long long>(churn.reasons[static_cast<std::size_t>(StageMemoMiss::Changed)]), static_cast<unsigned long long>(churn.reasons[static_cast<std::size_t>(StageMemoMiss::Skipped)]), static_cast<unsigned long long>(churn.reasons[static_cast<std::size_t>(StageMemoMiss::Absent)]), static_cast<unsigned long long>(churn.reasons[static_cast<std::size_t>(StageMemoMiss::Mappings)]), static_cast<unsigned long long>(churn.reasons[static_cast<std::size_t>(StageMemoMiss::Pending)]), static_cast<unsigned long long>(churn.first), static_cast<unsigned long long>(churn.moved), static_cast<unsigned long long>(churn.identical), static_cast<unsigned long long>(churn.changed), static_cast<unsigned long long>(churn.served), static_cast<unsigned long long>(churn.shapes), static_cast<unsigned long long>(churn.noPatches), static_cast<unsigned long long>(churn.unexplained), static_cast<unsigned long long>(churn.wordsExplained), static_cast<unsigned long long>(churn.wordsUnexplained), static_cast<unsigned long long>(churn.pushUnexplained), top.c_str());
+    const auto& roles = churn.explainedRoles;
+    const auto& buffer = churn.explainedBufferWords;
+    const auto& image = churn.explainedImageWords;
+    std::fprintf(stderr, "[stage-memo-churn] explained words by binding: buffers %llu (V# words 0-3: %llu/%llu/%llu/%llu), images %llu (T# words 0-7: %llu/%llu/%llu/%llu/%llu/%llu/%llu/%llu), samplers %llu, gds/bda/fault %llu, flattened srt %llu, shader data %llu, push constants %llu\n", static_cast<unsigned long long>(roles[0]), static_cast<unsigned long long>(buffer[0]), static_cast<unsigned long long>(buffer[1]), static_cast<unsigned long long>(buffer[2]), static_cast<unsigned long long>(buffer[3]), static_cast<unsigned long long>(roles[1]), static_cast<unsigned long long>(image[0]), static_cast<unsigned long long>(image[1]), static_cast<unsigned long long>(image[2]), static_cast<unsigned long long>(image[3]), static_cast<unsigned long long>(image[4]), static_cast<unsigned long long>(image[5]), static_cast<unsigned long long>(image[6]), static_cast<unsigned long long>(image[7]), static_cast<unsigned long long>(roles[2]), static_cast<unsigned long long>(roles[3] + roles[4] + roles[5]), static_cast<unsigned long long>(roles[6]), static_cast<unsigned long long>(roles[7]), static_cast<unsigned long long>(roles[8]));
+    for (const auto& example : churn.examples) std::fprintf(stderr, "[stage-memo-churn]   %s\n", example.c_str());
+    churn.explainedRoles = {};
+    churn.explainedBufferWords = {};
+    churn.explainedImageWords = {};
+    churn.reasons = {};
+    churn.first = churn.moved = churn.identical = churn.changed = churn.served = churn.shapes = churn.noPatches = churn.unexplained = 0;
+    churn.wordsExplained = churn.wordsUnexplained = churn.pushUnexplained = 0;
+    churn.unexplainedPrograms.clear();
+    churn.examples.clear();
+}
+
 // The first difference between a memo result and a capture's result of the same stage (empty when
 // they are equal), for APS5_VERIFY_STAGE_MEMO.
 std::string stageMemoDifference(const ShaderRecompiler::RecompileResult& memo, const ShaderRecompiler::RecompileResult& captured) {
@@ -318,6 +484,8 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::compileDrawStag
     // Whether a capture of this stage is stored: always for a new key, at the misses in a row
     // stageMemoTried picks otherwise.
     bool memoStore = true;
+    // Why the memo missed (APS5_TRACE_MEMO_CHURN).
+    auto memoMiss = StageMemoMiss::Absent;
     if (memoKey != nullptr) {
         auto& counters = stageMemoCounters();
         countStageMemo(counters.lookups);
@@ -427,6 +595,7 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::compileDrawStag
                 return stageCapture.compiled;
             }
         }
+        memoMiss = miss;
         reportStageMemo(entries);
     }
 
@@ -479,6 +648,7 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::compileDrawStag
         reportStageTimes();
     }
     phaseTiming.Phase(DrawRowRecompile);
+    if (memoKey != nullptr && MemoChurnTraced()) traceMemoChurn(memoHash, memoMiss, *handle, request, recent, compiled, program.binary.codeAddress);
     if (memoKey != nullptr && (memoStore || memoResult != nullptr)) insertStageMemo(memoHash, handle, pushOffset, memoWords, mappings, compiled, memoResult, request.context.userData, recent, program.binary.codeAddress);
     // Shared, not copied: the result is immutable (a copy cost a few dozen allocations per stage).
     // The stage capture keeps it for its readers only (see the memo's hit above).
