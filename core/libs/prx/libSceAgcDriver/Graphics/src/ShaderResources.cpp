@@ -1314,6 +1314,10 @@ struct RevalidateProfile {
     std::atomic<std::uint64_t> ownSourceViews{0};
     std::atomic<std::uint64_t> refreshedOverlaps{0};
     std::atomic<std::uint64_t> proofsVerified{0};
+    // Proofs skipped because nothing they read moved since the object's last fast proof (see
+    // ShaderResources::provedEpoch), and of those the ones APS5_VERIFY_UNMOVED_PROOFS ran anyway.
+    std::atomic<std::uint64_t> unmoved{0};
+    std::atomic<std::uint64_t> unmovedVerified{0};
     std::atomic<std::int64_t> lastReport{0};
 };
 
@@ -1402,7 +1406,7 @@ void countRevalidate(bool fast, bool ok, std::chrono::steady_clock::time_point s
     const auto reasons = byReason(profile.fastFails, FastFailNames);
     const auto fullReasons = byReason(profile.fullByReason, FastFailNames);
     const auto fallbacks = byReason(profile.ownFallbacks, OwnRefreshFallbackNames);
-    AgcDriver::ProfilePrint_nid_no_patch("[rescache] revalidate %llu calls %.1f ms: fast %llu, full %llu, failed %llu; fast-fail by reason:%s; full walks: T1 refreshed %llu (%llu storage images, %llu view sources, %llu views served by their own pending source, %llu overlaps left by the refresh accepted), full by reason:%s, T1 fallback by reason:%s, proofs verified %llu; fast-fail pending image: own 0 (the query excepts the own object), foreign %llu, snapshot %llu, T1 eligible %llu; keys proven: %llu sampled, %llu storage; epoch gate: %llu registry scans skipped, %llu import loops skipped\n", static_cast<unsigned long long>(profile.calls.load()), profile.nanoseconds.load() / 1e6, static_cast<unsigned long long>(profile.fast.load()), static_cast<unsigned long long>(profile.full.load()), static_cast<unsigned long long>(profile.failed.load()), reasons.c_str(), static_cast<unsigned long long>(profile.ownRefreshed.load()), static_cast<unsigned long long>(profile.ownStorageRefreshes.load()), static_cast<unsigned long long>(profile.ownViewRefreshes.load()), static_cast<unsigned long long>(profile.ownSourceViews.load()), static_cast<unsigned long long>(profile.refreshedOverlaps.load()), fullReasons.c_str(), fallbacks.c_str(), static_cast<unsigned long long>(profile.proofsVerified.load()), static_cast<unsigned long long>(profile.pendingForeign.load()), static_cast<unsigned long long>(profile.pendingSnapshot.load()), static_cast<unsigned long long>(profile.pendingT1Eligible.load()), static_cast<unsigned long long>(profile.keysProven.load()), static_cast<unsigned long long>(profile.storageKeysProven.load()), static_cast<unsigned long long>(profile.serialSkips.load()), static_cast<unsigned long long>(profile.importSkips.load()));
+    AgcDriver::ProfilePrint_nid_no_patch("[rescache] revalidate %llu calls %.1f ms: fast %llu, full %llu, failed %llu; fast-fail by reason:%s; full walks: T1 refreshed %llu (%llu storage images, %llu view sources, %llu views served by their own pending source, %llu overlaps left by the refresh accepted), full by reason:%s, T1 fallback by reason:%s, proofs verified %llu; fast-fail pending image: own 0 (the query excepts the own object), foreign %llu, snapshot %llu, T1 eligible %llu; keys proven: %llu sampled, %llu storage; epoch gate: %llu registry scans skipped, %llu import loops skipped; proofs skipped with nothing moved since the last %llu (%llu verified)\n", static_cast<unsigned long long>(profile.calls.load()), profile.nanoseconds.load() / 1e6, static_cast<unsigned long long>(profile.fast.load()), static_cast<unsigned long long>(profile.full.load()), static_cast<unsigned long long>(profile.failed.load()), reasons.c_str(), static_cast<unsigned long long>(profile.ownRefreshed.load()), static_cast<unsigned long long>(profile.ownStorageRefreshes.load()), static_cast<unsigned long long>(profile.ownViewRefreshes.load()), static_cast<unsigned long long>(profile.ownSourceViews.load()), static_cast<unsigned long long>(profile.refreshedOverlaps.load()), fullReasons.c_str(), fallbacks.c_str(), static_cast<unsigned long long>(profile.proofsVerified.load()), static_cast<unsigned long long>(profile.pendingForeign.load()), static_cast<unsigned long long>(profile.pendingSnapshot.load()), static_cast<unsigned long long>(profile.pendingT1Eligible.load()), static_cast<unsigned long long>(profile.keysProven.load()), static_cast<unsigned long long>(profile.storageKeysProven.load()), static_cast<unsigned long long>(profile.serialSkips.load()), static_cast<unsigned long long>(profile.importSkips.load()), static_cast<unsigned long long>(profile.unmoved.load()), static_cast<unsigned long long>(profile.unmovedVerified.load()));
 }
 
 // APS5_NO_EPOCH_REVALIDATE=1: the per-element registry, cache and stamp checks and the per-region
@@ -1410,6 +1414,19 @@ void countRevalidate(bool fast, bool ok, std::chrono::steady_clock::time_point s
 bool EpochRevalidate() {
     static const bool enabled = std::getenv("APS5_NO_EPOCH_REVALIDATE") == nullptr;
     return enabled;
+}
+
+// APS5_NO_UNMOVED_PROOF_SKIP=1: every Revalidate runs its proof, also when nothing it reads moved
+// since the object's last one (ShaderResources::provedEpoch).
+bool UnmovedProofSkip() {
+    static const bool enabled = std::getenv("APS5_NO_UNMOVED_PROOF_SKIP") == nullptr && EpochRevalidate();
+    return enabled;
+}
+
+// APS5_VERIFY_UNMOVED_PROOFS=1: a proof the skip leaves out runs anyway and must succeed.
+bool VerifyUnmovedProofs() {
+    static const bool verify = std::getenv("APS5_VERIFY_UNMOVED_PROOFS") != nullptr;
+    return verify;
 }
 
 }
@@ -1737,6 +1754,13 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
     // Loaded before any check (the memo rule of fastRevalidate): kept as the memo only when the
     // registry did not move through the whole proof, flushes of this call included.
     const auto serialBefore = StorageTexture::PendingSerial();
+    // The epoch and generation this call starts from: the skip's test, and what a fast proof that
+    // nothing moved through keeps (provedEpoch).
+    const auto epoch = GuestMemory::ThreadCollectEpoch();
+    const auto generationBefore = UnmovedProofSkip() ? GuestMemory::TrackerGeneration() : 0;
+    const bool unmoved = UnmovedProofSkip() && !noFast && provedEpoch != 0 && provedEpoch == epoch && provedGeneration == generationBefore && pendingSerialSeen == serialBefore;
+    // Until this call proves the object again: a call that fails leaves nothing to skip by.
+    provedEpoch = 0;
     // (1) Textures and storage images, from stamps when every element allows it (fastRevalidate),
     // else by the same lookups as the build (which refresh or replace them as guest memory changed):
     // they must hand back the very objects the set's views belong to. The build appended them stage
@@ -1785,7 +1809,46 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
     refreshed.clear();
     FastFail reason = FastFail::Count;
     bool accepted = false;
-    bool fast = !noFast && fastRevalidate(serialBefore, refreshed, reason, overlapping, accepted);
+    // Nothing the last fast proof read moved since (`unmoved`): its collects would answer from the
+    // epoch's memo, its stamp and key checks from unchanged stamps, its registry checks from the same
+    // serial, all as they did. What no stamp covers is asked as the proof asks it: every storage image
+    // still the cache's (its flag, then one touch of the cache), noted proved.
+    const auto unmovedProof = [&] {
+        struct UnmovedImagesTag {};
+        auto& images = ThreadScratch<std::vector<const StorageTexture*>, UnmovedImagesTag>();
+        images.clear();
+        if (validatedTextures.size() != textures.size()) return false;
+        for (const auto& surface : validatedTextures) {
+            if (!surface.valid) return false;
+            if (surface.source == nullptr) continue;
+            if (!surface.source->Cached()) return false;
+            images.push_back(surface.source);
+        }
+        for (std::size_t i = 0; i < storageTextures.size(); ++i) {
+            if (i != 0 && storageTextures[i] == storageTextures[i - 1]) continue;
+            const auto* image = storageTextures[i].get();
+            if (image == nullptr || !image->Cached()) return false;
+            images.push_back(image);
+        }
+        if (!StorageImagesCached(context, images)) return false;
+        for (const auto* image : images) image->NoteProved();
+        return true;
+    };
+    bool fast = false;
+    if (unmoved && unmovedProof()) {
+        fast = true;
+        if (profile) Revalidations().unmoved.fetch_add(1, std::memory_order_relaxed);
+        if (VerifyUnmovedProofs()) {
+            if (!fastRevalidate(serialBefore, refreshed, reason, overlapping, accepted)) {
+                std::fprintf(stderr, "[rescache] APS5_VERIFY_UNMOVED_PROOFS: a skipped proof fails when run (reason %s)\n", reason < FastFail::Count ? FastFailNames[static_cast<std::size_t>(reason)] : "?");
+                std::fflush(stderr);
+                std::abort();
+            }
+            if (profile) Revalidations().unmovedVerified.fetch_add(1, std::memory_order_relaxed);
+        }
+    } else {
+        fast = !noFast && fastRevalidate(serialBefore, refreshed, reason, overlapping, accepted);
+    }
     // T1 (design_cpu_final M3, rule RT1): a Pending failure whose overlapping images are foreign
     // to the surfaces is resolved by the own objects' refresh (what the walk's lookups would do to
     // them) and the fast proof run again, which is then authoritative (it accepts what stays
@@ -1904,6 +1967,12 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
     // stale units seeded; a shadow gone since leaves the set naming a stale buffer: rebuilt.
     if (guestMemory.UsesBufferShadows() && !guestMemory.RebindBufferShadows()) return finish(fast, false, ProofFailure::Imports);
     pendingSerialSeen = EpochRevalidate() && StorageTexture::PendingSerial() == serialBefore ? serialBefore : 0;
+    // Kept only when the generation did not move through the whole call either, flushes and the
+    // proof's own collects included (as the serial above): a stamp landing inside it may postdate the
+    // check that would have seen it.
+    const bool steady = fast && !ownRefreshed && !accepted && pendingSerialSeen != 0 && epoch != 0 && UnmovedProofSkip() && GuestMemory::TrackerGeneration() == generationBefore;
+    provedEpoch = steady ? epoch : 0;
+    provedGeneration = steady ? generationBefore : 0;
     return finish(fast, true);
 }
 
