@@ -5,7 +5,9 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "Optimization/ResourceProgram.hpp"
+#include <array>
 #include <cstdlib>
+#include <set>
 #include <stdexcept>
 
 namespace AgcDriver::DriverDetail {
@@ -247,6 +249,16 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
             groups[axis] = (groups[axis] + threads - 1) / threads;
         }
     }
+    // APS5_TRACE_DISPATCH_GROUPS=1: each program's group and thread counts, once per distinct pair
+    // (APS5_TRACE_DISPATCH_IO's light part: no sync and no resource list, so a scene runs as usual).
+    static const bool traceGroups = std::getenv("APS5_TRACE_DISPATCH_GROUPS") != nullptr;
+    if (traceGroups) {
+        static AgcDriver::Mutex groupsMutex;
+        static std::set<std::array<std::uint64_t, 7>> seen;
+        const std::array<std::uint64_t, 7> entry{address, groups[0], groups[1], groups[2], readRegister(queue.shader, 0x207) & 0xffffu, readRegister(queue.shader, 0x208) & 0xffffu, readRegister(queue.shader, 0x209) & 0xffffu};
+        std::lock_guard lock(groupsMutex);
+        if (seen.insert(entry).second) std::fprintf(stderr, "[dispatch-groups] shader 0x%llx groups %llux%llux%llu of %llux%llux%llu threads%s\n", static_cast<unsigned long long>(address), static_cast<unsigned long long>(entry[1]), static_cast<unsigned long long>(entry[2]), static_cast<unsigned long long>(entry[3]), static_cast<unsigned long long>(entry[4]), static_cast<unsigned long long>(entry[5]), static_cast<unsigned long long>(entry[6]), indirectArguments != 0 ? " (indirect)" : "");
+    }
     static const bool traceIo = std::getenv("APS5_TRACE_DISPATCH_IO") != nullptr;
     if (traceIo) {
 
@@ -258,7 +270,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
                 words += text;
             }
         }
-        std::fprintf(stderr, "[dispatch-io] shader 0x%llx%s\n", static_cast<unsigned long long>(address), words.c_str());
+        std::fprintf(stderr, "[dispatch-io] shader 0x%llx groups %ux%ux%u%s\n", static_cast<unsigned long long>(address), groups[0], groups[1], groups[2], words.c_str());
     }
 
     const auto rethrow = [&](const std::exception& error) {
