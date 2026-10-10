@@ -81,14 +81,29 @@ Registers& registersFor(QueueState& queue, std::uint32_t opcode) {
     return queue.userConfig;
 }
 
-void writeRegister(QueueState& queue, std::uint32_t opcode, std::uint32_t offset, std::uint32_t value) {
+// One register written into `registers` (registersFor(queue, opcode)), the decode generation left to
+// the caller: whether a register a draw's decode or precheck reads changed.
+bool storeRegister(QueueState& queue, Registers& registers, std::uint32_t opcode, std::uint32_t offset, std::uint32_t value) {
     if ((opcode == 0x69 || opcode == 0x9f) && (offset == 0x8e || offset == 0x8f || offset == 0x318 || offset == 0x31b || offset == 0x31c || offset == 0x31d || offset == 0x390 || offset == 0x3b0 || offset == 0x3b8))
         APS5_LOG_OUT_DEBUG("CONTEXT WRITE opcode=0x%x offset=0x%x value=0x%x", opcode, offset, value);
-    auto& registers = registersFor(queue, opcode);
-    if ((&registers != &queue.shader || !PerDrawShaderRegister(offset)) && (!registers.contains(offset) || std::as_const(registers).at(offset) != value)) queue.decodeGeneration = NextDecodeGeneration();
+    const bool decodeInput = (&registers != &queue.shader || !PerDrawShaderRegister(offset)) && (!registers.contains(offset) || std::as_const(registers).at(offset) != value);
     registers.insert_or_assign(offset, value);
     if (TraceContextState() && (opcode == 0x69 || opcode == 0x9f) && ((offset >= 0x318 && offset < 0x318 + 8 * 0xf && (offset - 0x318) % 0xf == 0) || offset == 0x8e)) std::fprintf(stderr, "[context]   write %x = %08x (0x%x)\n", offset, value, opcode);
     if ((opcode == 0x64 || opcode == 0x79 || opcode == 0x7a) && offset == 0x243) queue.indexType = value & 3u;
+    return decodeInput;
+}
+
+void writeRegister(QueueState& queue, std::uint32_t opcode, std::uint32_t offset, std::uint32_t value) {
+    if (storeRegister(queue, registersFor(queue, opcode), opcode, offset, value)) queue.decodeGeneration = NextDecodeGeneration();
+}
+
+// A SET_*_REG packet's run of registers from `offset`: the decode generation moves once for the run
+// (a fresh generation per changed register was a locked add each), before any draw can read it.
+void writeRegisters(QueueState& queue, std::uint32_t opcode, std::uint32_t offset, std::span<const std::uint32_t> values) {
+    auto& registers = registersFor(queue, opcode);
+    bool decodeInput = false;
+    for (std::size_t i = 0; i < values.size(); ++i) decodeInput |= storeRegister(queue, registers, opcode, offset + static_cast<std::uint32_t>(i), values[i]);
+    if (decodeInput) queue.decodeGeneration = NextDecodeGeneration();
 }
 
 bool memorySelector(std::uint32_t selector) {
@@ -839,8 +854,7 @@ void Execute(std::span<const std::uint32_t> packet, QueueState& queue) {
         }
         case 0x69: case 0x76: case 0x79: case 0x7a: {
             if (IsTagMarker(packet)) return;
-            const auto offset = registerOffset(packet[1]);
-            for (std::size_t i = 2; i < packet.size(); ++i) writeRegister(queue, opcode, offset + static_cast<std::uint32_t>(i - 2), packet[i]);
+            writeRegisters(queue, opcode, registerOffset(packet[1]), packet.subspan(2));
             return;
         }
         case 0x81:

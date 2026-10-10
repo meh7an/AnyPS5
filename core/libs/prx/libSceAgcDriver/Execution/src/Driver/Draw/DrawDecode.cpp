@@ -34,7 +34,10 @@ void readMergedPointer(const QueueState& queue, DrawProgram& program) {
 // decode depends on registers QueueState::decodeGeneration covers.
 void rereadUserData(const QueueState& queue, DrawProgram& program) {
     const std::size_t front = program.mergedPointer != 0 ? 8 : 0;
-    for (std::size_t i = front; i < program.userData.size(); ++i) program.userData[i] = readRegister(queue.shader, program.userDataBase + static_cast<std::uint32_t>(i - front));
+    // One pass over the bank; a word never written takes the per-word reads, which name it.
+    if (front > program.userData.size() || !queue.shader.ReadRange(program.userDataBase, std::span(program.userData).subspan(front))) {
+        for (std::size_t i = front; i < program.userData.size(); ++i) program.userData[i] = readRegister(queue.shader, program.userDataBase + static_cast<std::uint32_t>(i - front));
+    }
     if (front == 0) return;
     program.userData[0] = 0;
     program.userData[1] = 0;

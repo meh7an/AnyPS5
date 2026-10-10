@@ -12,6 +12,7 @@
 #include <map>
 #include <array>
 #include <optional>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -145,6 +146,16 @@ public:
     const std::uint32_t& at(std::uint32_t offset) const {
         if (!contains(offset)) throw std::out_of_range("register is not set");
         return values[offset];
+    }
+    // The values of the registers from `offset` on into `out`, one pass over the bank: false (with
+    // `out` partly written) when one of them is not set.
+    bool ReadRange(std::uint32_t offset, std::span<std::uint32_t> out) const {
+        for (std::size_t i = 0; i < out.size(); ++i) {
+            const auto index = offset + static_cast<std::uint32_t>(i);
+            if (!contains(index)) return false;
+            out[i] = values[index];
+        }
+        return true;
     }
     std::size_t erase(std::uint32_t offset) {
         if (!contains(offset)) return 0;
