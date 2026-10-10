@@ -10,6 +10,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4Opcodes.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ThreadScratch.hpp"
 #include "prx/libc/include/CpuTopology.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include <algorithm>
@@ -498,8 +499,10 @@ void ReleaseDeferredKeeps() {
 constexpr std::int64_t NoPendingLabel = std::numeric_limits<std::int64_t>::min();
 std::atomic<std::int64_t> pendingLabelSince{NoPendingLabel};
 std::atomic<std::uint64_t> writeGeneration{0};
-std::atomic<std::uint64_t> publishGeneration{0};
-std::atomic<std::uint64_t> completionLabels{0};
+// Read by the flush hook at every guest access (ThreadSnapshot): kept off writeGeneration's line,
+// which every noted write moves.
+alignas(64) std::atomic<std::uint64_t> publishGeneration{0};
+alignas(64) std::atomic<std::uint64_t> completionLabels{0};
 std::atomic<std::uint64_t> writeBackCompletions{0};
 std::atomic<std::uint64_t> completionStoresSkipped{0};
 std::atomic<std::uint64_t> completionStoresRun{0};
@@ -633,12 +636,41 @@ using WriteRanges = Recorder::WriteRanges;
 // work. A range leaves the snapshot only after its batch's completions (CPU write-backs) ran, so a
 // reader that sees no overlap either precedes the note (the queues are unordered then, as on the
 // GPU) or follows the write-back.
-std::atomic<std::shared_ptr<const WriteRanges>> pendingWrites;
+alignas(64) std::atomic<std::shared_ptr<const WriteRanges>> pendingWrites;
 
 bool HookSnapshotEnabled() {
     // Debug aid: APS5_NO_HOOK_SNAPSHOT=1 takes the GpuMutex on every access as before.
     static const bool enabled = std::getenv("APS5_NO_HOOK_SNAPSHOT") == nullptr;
     return enabled;
+}
+
+bool SnapshotCopyEnabled() {
+    static const bool enabled = std::getenv("APS5_NO_HOOK_SNAPSHOT_COPY") == nullptr;
+    return enabled;
+}
+
+// The calling thread's copy of the snapshot, with the publish generation read before it was taken.
+// A load of pendingWrites (an atomic<shared_ptr>) takes a spin bit and changes the reference count
+// twice with locked instructions, and the flush hook made one at every guest access of the worker
+// and the draw thread (about 27k a frame on the S2 menu page). The copy is taken again once the
+// generation moved: a publish stores the snapshot before it bumps the generation, so a thread that
+// reads the new generation loads the new snapshot (one that read the generation just before a
+// store loads that snapshot at its next query). The reference must not be held across a call that
+// can query again. APS5_NO_HOOK_SNAPSHOT_COPY=1 loads the snapshot at every query.
+struct SnapshotCopy {
+    std::uint64_t generation = ~std::uint64_t{0};
+    std::shared_ptr<const WriteRanges> ranges;
+};
+
+const std::shared_ptr<const WriteRanges>& ThreadSnapshot() {
+    struct SnapshotCopyTag {};
+    auto& copy = ThreadScratch<SnapshotCopy, SnapshotCopyTag>();
+    const auto generation = publishGeneration.load(std::memory_order_acquire);
+    if (generation != copy.generation || !SnapshotCopyEnabled()) {
+        copy.ranges = pendingWrites.load(std::memory_order_acquire);
+        copy.generation = generation;
+    }
+    return copy.ranges;
 }
 
 bool SnapshotOverlaps(const WriteRanges* snapshot, std::uint64_t address, std::size_t bytes) {
@@ -650,8 +682,7 @@ bool SnapshotOverlaps(const WriteRanges* snapshot, std::uint64_t address, std::s
 
 bool SnapshotOverlaps(std::uint64_t address, std::size_t bytes) {
     if (bytes == 0) return false;
-    const auto snapshot = pendingWrites.load(std::memory_order_acquire);
-    return SnapshotOverlaps(snapshot.get(), address, bytes);
+    return SnapshotOverlaps(ThreadSnapshot().get(), address, bytes);
 }
 
 // Whether one merged range of `snapshot` contains [address, end) entirely.
@@ -662,8 +693,7 @@ bool SnapshotCovers(const WriteRanges* snapshot, std::uint64_t address, std::uin
 }
 
 bool SnapshotCovers(std::uint64_t address, std::uint64_t end) {
-    const auto snapshot = pendingWrites.load(std::memory_order_acquire);
-    return SnapshotCovers(snapshot.get(), address, end);
+    return SnapshotCovers(ThreadSnapshot().get(), address, end);
 }
 
 // Attribution of the pending-write syncs the hook makes (the [hooksync] line every 10 s, under
@@ -1371,7 +1401,7 @@ bool Recorder::SnapshotWriteOverlaps(std::uint64_t address, std::size_t bytes) {
 }
 
 std::shared_ptr<const Recorder::WriteRanges> Recorder::PendingWriteSnapshot() {
-    return pendingWrites.load(std::memory_order_acquire);
+    return ThreadSnapshot();
 }
 
 bool Recorder::SnapshotOverlaps(const WriteRanges* snapshot, std::uint64_t address, std::size_t bytes) {
