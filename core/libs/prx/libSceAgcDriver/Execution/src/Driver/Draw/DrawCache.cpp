@@ -1,7 +1,10 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawCache.hpp"
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <limits>
 
 namespace AgcDriver::DriverDetail {
 
@@ -29,11 +32,23 @@ bool drawCacheAlways() {
     return always;
 }
 
+bool drawCacheParkBackoff() {
+    static const bool backoff = [] {
+        const char* text = std::getenv("APS5_DRAW_CACHE_PARK_BACKOFF");
+        return text == nullptr || std::strcmp(text, "0") != 0;
+    }();
+    return backoff;
+}
+
 }
 
 bool Driver::drawCacheActive() {
     if (drawCacheAlways()) return true;
-    return drawCacheDraws.fetch_add(1, std::memory_order_relaxed) >= drawCacheParkedUntil.load(std::memory_order_relaxed);
+    // Only a queue's worker draws: a plain load and store count the draw without a locked add
+    // (a count another worker overwrote would only move the next probe by a draw).
+    const auto draws = drawCacheDraws.load(std::memory_order_relaxed);
+    drawCacheDraws.store(draws + 1, std::memory_order_relaxed);
+    return draws >= drawCacheParkedUntil.load(std::memory_order_relaxed) || flipsCounted.load(std::memory_order_relaxed) >= drawCacheParkedUntilFlip.load(std::memory_order_relaxed);
 }
 
 void Driver::noteDrawCacheLookup(bool hit) {
@@ -43,10 +58,20 @@ void Driver::noteDrawCacheLookup(bool hit) {
     // The lookup that fills the window closes it.
     const auto hits = drawCacheWindowHits.exchange(0, std::memory_order_relaxed);
     drawCacheWindowLookups.store(0, std::memory_order_relaxed);
-    if (static_cast<std::uint64_t>(hits) * 32u >= DrawCacheProbeLookups) return;
-    drawCacheParkedUntil.store(drawCacheDraws.load(std::memory_order_relaxed) + DrawCacheParkDraws, std::memory_order_relaxed);
+    if (static_cast<std::uint64_t>(hits) * 32u >= DrawCacheProbeLookups) {
+        drawCacheFailedWindows.store(0, std::memory_order_relaxed);
+        return;
+    }
+    const bool backoff = drawCacheParkBackoff();
+    const auto doublings = backoff ? std::min(drawCacheFailedWindows.fetch_add(1, std::memory_order_relaxed), DrawCacheParkDoublings) : 0u;
+    const auto parkDraws = DrawCacheParkDraws << doublings;
+    // The flip limit first: until the draw limit moves, the cache still reads as active.
+    drawCacheParkedUntilFlip.store(backoff ? flipsCounted.load(std::memory_order_relaxed) + DrawCacheParkMaxFlips : std::numeric_limits<std::uint64_t>::max(), std::memory_order_relaxed);
+    drawCacheParkedUntil.store(drawCacheDraws.load(std::memory_order_relaxed) + parkDraws, std::memory_order_relaxed);
     const auto parks = drawCacheParks.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (parks <= 3 || parks % 50 == 0) std::fprintf(stderr, "[draw-cache] %u of %u lookups hit: the cache is parked for %llu draws (%llu parks so far)\n", hits, DrawCacheProbeLookups, static_cast<unsigned long long>(DrawCacheParkDraws), static_cast<unsigned long long>(parks));
+    if (parks > 8 && parks % 50 != 0) return;
+    if (backoff) std::fprintf(stderr, "[draw-cache] %u of %u lookups hit: the cache is parked for %llu draws or %llu flips (%llu parks so far)\n", hits, DrawCacheProbeLookups, static_cast<unsigned long long>(parkDraws), static_cast<unsigned long long>(DrawCacheParkMaxFlips), static_cast<unsigned long long>(parks));
+    else std::fprintf(stderr, "[draw-cache] %u of %u lookups hit: the cache is parked for %llu draws (%llu parks so far)\n", hits, DrawCacheProbeLookups, static_cast<unsigned long long>(parkDraws), static_cast<unsigned long long>(parks));
 }
 
 bool Driver::verifyDrawEntries() {

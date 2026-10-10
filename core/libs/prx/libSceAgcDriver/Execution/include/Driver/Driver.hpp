@@ -112,12 +112,17 @@ private:
     // Whether this draw uses the draw cache (key, lookup, insertion). A title that writes its per-draw
     // constants to fresh addresses every frame changes the user data words of every draw, so the
     // register key never repeats and the cache only costs: a probe window of lookups hitting under
-    // 1 in 32 parks the cache for DrawCacheParkDraws draws, then another window probes again.
-    // APS5_DRAW_CACHE_ALWAYS=1 never parks it.
+    // 1 in 32 parks the cache for DrawCacheParkDraws draws, then another window probes again. Each
+    // window that fails again in a row doubles the park, up to DrawCacheParkDoublings times, and a
+    // park also ends after DrawCacheParkMaxFlips flips: a window costs about 9 ms on a 2,900-draw
+    // frame, so on such a page the fixed park made it a stutter every 0.45 s.
+    // APS5_DRAW_CACHE_PARK_BACKOFF=0 keeps the fixed park; APS5_DRAW_CACHE_ALWAYS=1 never parks it.
     bool drawCacheActive();
     void noteDrawCacheLookup(bool hit);
     static constexpr std::uint32_t DrawCacheProbeLookups = 2048;
     static constexpr std::uint64_t DrawCacheParkDraws = 60000;
+    static constexpr std::uint32_t DrawCacheParkDoublings = 6;
+    static constexpr std::uint64_t DrawCacheParkMaxFlips = 600;
     static bool verifyDrawEntries();
     static bool registerKeyEnabled();
     static bool verifyDrawRecipe();
@@ -335,9 +340,12 @@ private:
     AgcDriver::Mutex drawCacheMutex;
     std::uint64_t drawCacheHits = 0, drawCacheEvictions = 0, drawCacheVariants = 0, drawCacheVariantBytes = 0;
     // The draw cache parks itself while it does not pay (drawCacheActive): draws counted, the draw
-    // count the park lasts until, and the current probe window's lookups and hits.
+    // count and the flip count the park lasts until, the failed windows in a row, and the current
+    // probe window's lookups and hits.
     std::atomic<std::uint64_t> drawCacheDraws{0};
     std::atomic<std::uint64_t> drawCacheParkedUntil{0};
+    std::atomic<std::uint64_t> drawCacheParkedUntilFlip{0};
+    std::atomic<std::uint32_t> drawCacheFailedWindows{0};
     std::atomic<std::uint32_t> drawCacheWindowLookups{0};
     std::atomic<std::uint32_t> drawCacheWindowHits{0};
     std::atomic<std::uint64_t> drawCacheParks{0};
