@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawThread.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
@@ -64,11 +65,6 @@ void Driver::flushBetweenPackets(std::uint32_t queue, std::uint32_t header, bool
         return;
     }
     if (reap) clock.lastReapTry = now;
-    std::unique_lock gpuLock(GuestMemory::GpuMutex(), std::defer_lock);
-
-    if (record) GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Label);
-    else if (submit || capped) GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Flush);
-
     bool outright = needsRecord;
     if (LabelBatchSubmit()) {
         const auto grace = 4 * labelFlushDeadline();
@@ -78,12 +74,32 @@ void Driver::flushBetweenPackets(std::uint32_t queue, std::uint32_t header, bool
     } else if (deferredDue || (queue == 0 && (capped || (submit && (!selfLocking || pendingDue))))) {
         outright = true;
     }
-    if (outright) {
-        gpuLock.lock();
-    } else if (!gpuLock.try_lock()) {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    // The failed tries are only counted for the [labels] line: a locked add per try otherwise.
+    const auto failedTry = [&] {
+        if (!profile) return;
         ++triesFailed[record ? TryLabel : submit || capped ? TryFlush : TryReap];
         if (selfLocking && record) ++packetLockDeferred;
         else if (selfLocking && submit) ++packetSubmitDeferred;
+    };
+    // At the draw thread's front a try fails while the draw thread holds records (the mutex's
+    // front, GpuMutexType::try_lock): that is known without touching the mutex, which the tries
+    // did about 2.8M times per 10 s on the S2 menu page.
+    if (!outright) {
+        if (const auto* back = FrontDrawThread(); back != nullptr && back->Busy() && !GuestMemory::GpuMutex().HeldByThisThread()) {
+            failedTry();
+            return;
+        }
+    }
+    std::unique_lock gpuLock(GuestMemory::GpuMutex(), std::defer_lock);
+
+    if (record) GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Label);
+    else if (submit || capped) GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Flush);
+
+    if (outright) {
+        gpuLock.lock();
+    } else if (!gpuLock.try_lock()) {
+        failedTry();
         return;
     }
     const auto localDevice = device.Load();
@@ -104,7 +120,6 @@ void Driver::flushBetweenPackets(std::uint32_t queue, std::uint32_t header, bool
         localDevice->ReapRecorded();
         ++boundaryReaps;
     }
-    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
 
     static std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
     if (!profile) return;

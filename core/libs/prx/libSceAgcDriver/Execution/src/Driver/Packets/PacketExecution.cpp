@@ -72,6 +72,17 @@ bool drawThreadPassesOver(std::span<const std::uint32_t> packet, std::uint32_t o
     }
 }
 
+// A packet that only changes the queue state: register writes (an indirect list's registers were
+// read at submission), index and instance state, the indirect bases and constant RAM.
+bool statePacket(std::uint32_t opcode) {
+    switch (opcode) {
+        case 0x11: case 0x13: case 0x26: case 0x2a: case 0x2f: case 0x63: case 0x64: case 0x69: case 0x76: case 0x79: case 0x7a: case 0x81: case 0x9f:
+            return true;
+        default:
+            return false;
+    }
+}
+
 }
 
 void Driver::execute(const Submission& submission) {
@@ -142,6 +153,14 @@ void Driver::execute(const Submission& submission) {
     auto& packetProfile = ShaderRecompiler::ThreadOwned(packetProfileSlot);
     ++packetProfile.submissions;
 
+    // A pure state packet (statePacket, about 81% of the packets on the S2 menu page) that is not
+    // predicated changes the queue state and nothing else: it skips the drain test (it passes over
+    // the draw thread), the device-use gate, the packet tag, the flush decision (made at the next
+    // other packet instead, well under a microsecond later), the packet memory pass and the progress
+    // counters. Every packet takes the full path while a mode needs to see each one, or with
+    // APS5_NO_STATE_FAST_PATH=1.
+    static const bool stateFastPath = std::getenv("APS5_NO_STATE_FAST_PATH") == nullptr && std::getenv("APS5_DRAIN_ALL") == nullptr && !profilePackets && !traceGpu && dumpQueue < 0 && !packetEpoch() && !CaptureTrace::Enabled();
+
     bumpEpoch(&EpochBumps::submissions);
     for (std::size_t cursor = 0; cursor < submission.commands.size();) {
         if (packetEpoch()) bumpEpoch(&EpochBumps::packets);
@@ -152,6 +171,13 @@ void Driver::execute(const Submission& submission) {
         const auto packet = std::span(submission.commands).subspan(cursor, count);
         const auto opcode = (header >> 8u) & 0xffu;
         auto nextCursor = cursor + count;
+        if (stateFastPath && statePacket(opcode) && !(Pm4::Predicated(header) && queue.predication.operation != 0)) {
+            recent.Record(cursor);
+            if (Pm4::IndirectRegisterOpcode(opcode)) Pm4::ExecuteIndirectRegisters(packet, submission.registerLists.at(cursor), queue);
+            else Pm4::Execute(packet, queue);
+            cursor = nextCursor;
+            continue;
+        }
         // The draw thread may still be recording the last draw: any other packet with effects
         // outside the queue state, or a predicated one (its predicate is read), waits for it.
         // With ring writes (DrawThread::RingWrites) a label or a packet store goes to the draw thread as a record when
