@@ -182,6 +182,13 @@ public:
         mutex.unlock();
     }
 
+    // Whether another thread holds the mutex at this moment: a hint for a caller that can put its
+    // queue call off (the holder may let go right after).
+    bool HeldElsewhere() const noexcept {
+        const auto* holder = owner.load(std::memory_order_relaxed);
+        return holder != nullptr && holder != CurrentThreadToken();
+    }
+
 private:
     Mutex mutex;
     // The holder's thread token and recursion depth, written by the holder only.
