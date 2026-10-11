@@ -117,13 +117,17 @@ private:
 }
 
 DrawThread::DrawThread(std::uint32_t queue) : queue(queue) {
+    slots.resize(RingSlots());
+    for (auto& slot : slots) slot = std::make_unique<PreparedDraw>();
+}
+
+std::size_t DrawThread::RingSlots() {
     static const std::size_t ring = [] {
         const char* text = std::getenv("APS5_DRAW_RING");
         const auto value = text != nullptr ? std::strtoull(text, nullptr, 10) : 8ull;
         return static_cast<std::size_t>(std::clamp<unsigned long long>(value, 2ull, 64ull));
     }();
-    slots.resize(ring);
-    for (auto& slot : slots) slot = std::make_unique<PreparedDraw>();
+    return ring;
 }
 
 DrawThread::~DrawThread() = default;

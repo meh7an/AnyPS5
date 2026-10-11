@@ -410,9 +410,10 @@ private:
         // The results the slot served, each patched in place by a later hit while no draw holds it
         // (a copy of the entry's result per hit cost a few dozen allocations). Several, because the
         // draws in the draw thread's ring hold theirs (as the draw cache's variants do until
-        // evicted): a hit that finds all of them held copies, and the copy joins them
-        // (APS5_STAGE_MEMO_COPIES, 1 to 8, 8 by default).
-        std::array<std::shared_ptr<ShaderRecompiler::RecompileResult>, 8> served;
+        // evicted): a hit that finds all of them held copies, and the copy joins them, up to
+        // StageMemoCopies (the ring's records and two, or APS5_STAGE_MEMO_COPIES, 1 to 66). Made as
+        // needed: a slot whose draws never overlap keeps one.
+        std::vector<std::shared_ptr<ShaderRecompiler::RecompileResult>> served;
         // The entry's misses in a row (its words changed): a key whose words keep changing is
         // validated and stored again only at powers of two of them, then every 64th.
         std::uint32_t misses = 0;

@@ -40,6 +40,9 @@ public:
     // Stage 4 (on unless APS5_NO_RING_WRITES=1): end-of-pipe labels and small packet stores go through the ring
     // (Driver::ringWrite), so the worker no longer drains the thread before them.
     static bool RingWrites();
+    // The records of a ring: APS5_DRAW_RING (2 to 64, 8 by default). The pools of copies the draws
+    // in flight hold (the stage memo's served results, the decode cache's decodes) are sized by it.
+    static std::size_t RingSlots();
 
     // The front's side.
     // Whether the front may prepare a draw into Slot(): not while it prepares one there already (a

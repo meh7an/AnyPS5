@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawThread.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
@@ -103,10 +104,13 @@ struct DecodeCache {
 
 struct DecodeCacheTag;
 
-// The draw thread's ring holds up to 8 draws (DrawThread::Slots): copies for those and the one
-// being prepared serve a run of draws with the same registers.
+// The draw thread's ring holds its draws (DrawThread::RingSlots): copies for those, the one being
+// prepared and one more serve a run of draws with the same registers.
 constexpr std::size_t DecodeCacheEntries = 4096;
-constexpr std::size_t DecodeCacheCopies = 10;
+
+std::size_t decodeCacheCopies() {
+    return DrawThread::RingSlots() + 2;
+}
 
 bool DecodeCacheEnabled() {
     static const bool enabled = std::getenv("APS5_NO_DECODE_CACHE") == nullptr;
@@ -292,7 +296,7 @@ void Driver::resolveDrawDecode(const QueueState& queue, const Submission& submis
             if (served == nullptr) {
                 served = std::make_shared<DrawDecode>(*entry.copies.front());
                 ++cache.copied;
-                if (entry.copies.size() < DecodeCacheCopies) {
+                if (entry.copies.size() < decodeCacheCopies()) {
                     entry.copies.push_back(served);
                 } else {
                     entry.copies[entry.replace] = served;

@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawThread.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
@@ -71,12 +72,13 @@ bool VerifyStageMemo() {
     return verify;
 }
 
-// The served copies a memo slot keeps (StageMemoSlot::served): APS5_STAGE_MEMO_COPIES, 1 to 8.
+// The served copies a memo slot keeps at most (StageMemoSlot::served): one for each draw the ring
+// holds, the one being prepared and one more, or APS5_STAGE_MEMO_COPIES, 1 to 66.
 std::size_t StageMemoCopies() {
     static const std::size_t copies = [] {
         const char* text = std::getenv("APS5_STAGE_MEMO_COPIES");
-        const auto value = text != nullptr ? std::strtoull(text, nullptr, 10) : 8ull;
-        return static_cast<std::size_t>(std::clamp<unsigned long long>(value, 1ull, 8ull));
+        const auto value = text != nullptr ? std::strtoull(text, nullptr, 10) : static_cast<unsigned long long>(DrawThread::RingSlots() + 2);
+        return static_cast<std::size_t>(std::clamp<unsigned long long>(value, 1ull, 66ull));
     }();
     return copies;
 }
@@ -673,10 +675,10 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
                 // Held by nothing but the slot: no draw is using it any more.
                 // use_count reads relaxed: the fence orders the patch after the last holder's
                 // release (a draw thread's record drops its reference there).
-                for (std::size_t copy = 0; copy < StageMemoCopies(); ++copy) {
-                    if (slot.served[copy] == nullptr || slot.served[copy].use_count() != 1) continue;
+                for (const auto& copy : slot.served) {
+                    if (copy.use_count() != 1) continue;
                     std::atomic_thread_fence(std::memory_order_acquire);
-                    served = slot.served[copy];
+                    served = copy;
                     break;
                 }
             } else {
@@ -749,16 +751,20 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
             if (fresh) {
                 std::lock_guard lock(stageMemoMutex);
                 auto* found = stageMemo.find(memoHash);
-                // The copy takes an empty place, else one whose result a draw still holds.
+                // The copy joins the slot's while there is room, else takes the place of one whose
+                // result a draw still holds.
                 if (found != nullptr && found->entry == entry) {
-                    const auto copies = std::span(found->served).first(StageMemoCopies());
-                    auto place = std::find(copies.begin(), copies.end(), nullptr);
-                    countStageMemo(place != copies.end() ? counters.copiedEmpty : counters.copiedHeld);
-                    if (place == copies.end() && StageMemoProfiled()) {
+                    auto& copies = found->served;
+                    const bool room = copies.size() < StageMemoCopies();
+                    countStageMemo(room ? counters.copiedEmpty : counters.copiedHeld);
+                    if (!room && StageMemoProfiled()) {
                         for (const auto& copy : copies) countStageMemo(copy.use_count() == 2 ? counters.heldTwo : copy.use_count() == 3 ? counters.heldThree : counters.heldMore);
                     }
-                    if (place == copies.end()) place = std::find_if(copies.begin(), copies.end(), [](const auto& copy) { return copy.use_count() > 1; });
-                    if (place != copies.end()) *place = served;
+                    if (room) {
+                        copies.push_back(served);
+                    } else if (const auto place = std::find_if(copies.begin(), copies.end(), [](const auto& copy) { return copy.use_count() > 1; }); place != copies.end()) {
+                        *place = served;
+                    }
                 }
             }
             memoResult = std::move(served);
