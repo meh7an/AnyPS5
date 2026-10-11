@@ -672,6 +672,12 @@ void SetDebugProbeActive(bool active);
 [[nodiscard]] bool DebugProbeActive();
 [[nodiscard]] bool RayTracingStrict();
 [[nodiscard]] bool RayTracingMiss();
+// Whether f32 arithmetic reproduces RDNA bit for bit (APS5_EXACT_F32=1): denormals flushed as the
+// shader's FLOAT_MODE says, with tininess after rounding, and NaN results carrying the operand
+// payload RDNA picks. Off, the host's float arithmetic serves, which roughly halves the ALU work of
+// float-heavy shaders; results differ only for denormals and NaN payloads. The disk cache keeps the
+// two modes apart (ShaderDiskCache::SourceVersion).
+[[nodiscard]] bool ExactF32Arithmetic();
 
 struct RectListShaders {
     RecompileResult control;

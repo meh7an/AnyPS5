@@ -888,7 +888,8 @@ DiskStore& store() {
 }
 
 std::uint64_t SourceVersion() {
-    return Generated::SourceVersion;
+    // Fast and exact f32 arithmetic (ExactF32Arithmetic) compile differently.
+    return ExactF32Arithmetic() ? Generated::SourceVersion ^ 0x9e3779b97f4a7c15ull : Generated::SourceVersion;
 }
 
 void BuildKey(const RecompileRequest& request, std::uint32_t hostSubgroupSize, std::vector<std::byte>& key) {

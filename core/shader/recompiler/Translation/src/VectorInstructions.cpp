@@ -1,5 +1,6 @@
 #include "Translation/VectorInstructions.hpp"
 #include "Translation/TranslationContext.hpp"
+#include "Recompiler.hpp"
 #include <stdexcept>
 
 namespace ShaderRecompiler {
@@ -98,6 +99,7 @@ std::uint32_t TranslationContext::f32DenormalFlushFor(const RdnaInstruction& ins
     default:
         return 0u;
     }
+    if (!ExactF32Arithmetic()) return 0u;
     const std::uint32_t denormals = floatMode.has_value() ? (floatMode->floatMode >> 4u) & 3u : 0u;
     if (denormals == 1u || denormals == 2u) {
         throw std::runtime_error("f32 denormal mode " + std::to_string(denormals) + " at pc " + std::to_string(inst.programCounter) + " is not implemented");
