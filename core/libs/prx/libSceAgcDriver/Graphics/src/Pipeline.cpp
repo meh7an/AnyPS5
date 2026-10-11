@@ -591,8 +591,10 @@ void Pipeline::Continue(VkCommandBuffer commands, const State& state, PassBindin
     if (!same || std::memcmp(&bound->viewport, &state.viewport, sizeof(VkViewport)) != 0) context.Resolved(&DeviceFunctions::cmdSetViewport, "vkCmdSetViewport")(commands, 0, 1, &state.viewport);
     if (!same || std::memcmp(&bound->scissor, &state.scissor, sizeof(VkRect2D)) != 0) context.Resolved(&DeviceFunctions::cmdSetScissor, "vkCmdSetScissor")(commands, 0, 1, &state.scissor);
     if (libraries) {
-        setLibraryState(commands, state);
-        if (bound != nullptr) *bound = {handle, state.viewport, state.scissor, bias, bounds};
+        // As for the viewport: the same pipeline keeps the dynamic state its previous draw set.
+        const auto values = libraryState(state);
+        if (!same || !bound->hasLibrary || std::memcmp(&bound->library, &values, sizeof(values)) != 0) setLibraryState(commands, values);
+        if (bound != nullptr) *bound = {handle, state.viewport, state.scissor, bias, bounds, true, values};
         return;
     }
     if (depthBias && (!same || bound->depthBias != bias)) context.Resolved(&DeviceFunctions::cmdSetDepthBias, "vkCmdSetDepthBias")(commands, state.depthBiasConstant, state.depthBiasClamp, state.depthBiasSlope);
@@ -600,25 +602,44 @@ void Pipeline::Continue(VkCommandBuffer commands, const State& state, PassBindin
     if (bound != nullptr) *bound = {handle, state.viewport, state.scissor, bias, bounds};
 }
 
-void Pipeline::setLibraryState(VkCommandBuffer commands, const State& state) const {
+PassLibraryState Pipeline::libraryState(const State& state) const {
+    PassLibraryState values;
+    std::memset(&values, 0, sizeof(values));
     const bool depth = state.depth.has_value();
-    context.Resolved(&DeviceFunctions::cmdSetCullMode, "vkCmdSetCullModeEXT")(commands, state.cullMode);
-    context.Resolved(&DeviceFunctions::cmdSetFrontFace, "vkCmdSetFrontFaceEXT")(commands, state.frontFace);
-    context.Resolved(&DeviceFunctions::cmdSetDepthBias, "vkCmdSetDepthBias")(commands, depthBias ? state.depthBiasConstant : 0.0f, depthBias ? state.depthBiasClamp : 0.0f, depthBias ? state.depthBiasSlope : 0.0f);
-    context.Resolved(&DeviceFunctions::cmdSetDepthBounds, "vkCmdSetDepthBounds")(commands, depthBounds ? state.minDepthBounds : 0.0f, depthBounds ? state.maxDepthBounds : 1.0f);
-    context.Resolved(&DeviceFunctions::cmdSetDepthTestEnable, "vkCmdSetDepthTestEnableEXT")(commands, depth && state.depthTest);
-    context.Resolved(&DeviceFunctions::cmdSetDepthWriteEnable, "vkCmdSetDepthWriteEnableEXT")(commands, depth && state.depthWrite);
-    context.Resolved(&DeviceFunctions::cmdSetDepthCompareOp, "vkCmdSetDepthCompareOpEXT")(commands, depth ? state.depthCompare : VK_COMPARE_OP_ALWAYS);
-    context.Resolved(&DeviceFunctions::cmdSetDepthBoundsTestEnable, "vkCmdSetDepthBoundsTestEnableEXT")(commands, depthBounds);
-    context.Resolved(&DeviceFunctions::cmdSetStencilTestEnable, "vkCmdSetStencilTestEnableEXT")(commands, depth && state.stencilTest);
+    values.cullMode = state.cullMode;
+    values.frontFace = state.frontFace;
+    if (depthBias) values.depthBias = {state.depthBiasConstant, state.depthBiasClamp, state.depthBiasSlope};
+    values.depthBounds = depthBounds ? std::array<float, 2>{state.minDepthBounds, state.maxDepthBounds} : std::array<float, 2>{0.0f, 1.0f};
+    values.depthTest = depth && state.depthTest;
+    values.depthWrite = depth && state.depthWrite;
+    values.depthCompare = depth ? state.depthCompare : VK_COMPARE_OP_ALWAYS;
+    values.boundsTest = depthBounds;
+    values.stencilTest = depth && state.stencilTest;
+    if (depth) {
+        values.stencilFront = state.stencilFront;
+        values.stencilBack = state.stencilBack;
+    }
+    return values;
+}
+
+void Pipeline::setLibraryState(VkCommandBuffer commands, const PassLibraryState& values) const {
+    context.Resolved(&DeviceFunctions::cmdSetCullMode, "vkCmdSetCullModeEXT")(commands, values.cullMode);
+    context.Resolved(&DeviceFunctions::cmdSetFrontFace, "vkCmdSetFrontFaceEXT")(commands, values.frontFace);
+    context.Resolved(&DeviceFunctions::cmdSetDepthBias, "vkCmdSetDepthBias")(commands, values.depthBias[0], values.depthBias[1], values.depthBias[2]);
+    context.Resolved(&DeviceFunctions::cmdSetDepthBounds, "vkCmdSetDepthBounds")(commands, values.depthBounds[0], values.depthBounds[1]);
+    context.Resolved(&DeviceFunctions::cmdSetDepthTestEnable, "vkCmdSetDepthTestEnableEXT")(commands, values.depthTest);
+    context.Resolved(&DeviceFunctions::cmdSetDepthWriteEnable, "vkCmdSetDepthWriteEnableEXT")(commands, values.depthWrite);
+    context.Resolved(&DeviceFunctions::cmdSetDepthCompareOp, "vkCmdSetDepthCompareOpEXT")(commands, values.depthCompare);
+    context.Resolved(&DeviceFunctions::cmdSetDepthBoundsTestEnable, "vkCmdSetDepthBoundsTestEnableEXT")(commands, values.boundsTest);
+    context.Resolved(&DeviceFunctions::cmdSetStencilTestEnable, "vkCmdSetStencilTestEnableEXT")(commands, values.stencilTest);
     const auto stencil = [&](VkStencilFaceFlags face, const VkStencilOpState& op) {
         context.Resolved(&DeviceFunctions::cmdSetStencilOp, "vkCmdSetStencilOpEXT")(commands, face, op.failOp, op.passOp, op.depthFailOp, op.compareOp);
         context.Resolved(&DeviceFunctions::cmdSetStencilCompareMask, "vkCmdSetStencilCompareMask")(commands, face, op.compareMask);
         context.Resolved(&DeviceFunctions::cmdSetStencilWriteMask, "vkCmdSetStencilWriteMask")(commands, face, op.writeMask);
         context.Resolved(&DeviceFunctions::cmdSetStencilReference, "vkCmdSetStencilReference")(commands, face, op.reference);
     };
-    stencil(VK_STENCIL_FACE_FRONT_BIT, depth ? state.stencilFront : VkStencilOpState{});
-    stencil(VK_STENCIL_FACE_BACK_BIT, depth ? state.stencilBack : VkStencilOpState{});
+    stencil(VK_STENCIL_FACE_FRONT_BIT, values.stencilFront);
+    stencil(VK_STENCIL_FACE_BACK_BIT, values.stencilBack);
 }
 
 void Pipeline::ContinueSecondChannel(VkCommandBuffer commands) const {

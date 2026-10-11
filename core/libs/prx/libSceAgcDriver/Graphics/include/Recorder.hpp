@@ -31,12 +31,31 @@ class Buffer;
 
 // The graphics state the open render pass's last draw bound (Pipeline::Continue), so a continued
 // draw skips the binds it repeats. Kept with the recorder's pass and reset when the pass ends.
+// The dynamic state Pipeline::setLibraryState sets for a library-linked pipeline. Made zero-filled
+// (padding included), so two are compared bytewise.
+struct PassLibraryState {
+    VkCullModeFlags cullMode;
+    VkFrontFace frontFace;
+    std::array<float, 3> depthBias;
+    std::array<float, 2> depthBounds;
+    VkBool32 depthTest;
+    VkBool32 depthWrite;
+    VkCompareOp depthCompare;
+    VkBool32 boundsTest;
+    VkBool32 stencilTest;
+    VkStencilOpState stencilFront;
+    VkStencilOpState stencilBack;
+};
+
 struct PassBinding {
     VkPipeline pipeline = VK_NULL_HANDLE;
     VkViewport viewport{};
     VkRect2D scissor{};
     std::array<float, 3> depthBias{};
     std::array<float, 2> depthBounds{};
+    // Whether `library` holds the dynamic state the last draw set under `pipeline`, library-linked.
+    bool hasLibrary = false;
+    PassLibraryState library{};
 };
 
 // Accumulates GPU work across guest commands so the CPU does not wait for each one. Dispatches and the

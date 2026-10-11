@@ -9,6 +9,7 @@ namespace AgcDriver::Graphics {
 
 struct VertexInputLayout;
 struct PassBinding;
+struct PassLibraryState;
 
 void LogPipelineStatistics_nid_no_patch(const Context& context, VkPipeline pipeline);
 
@@ -72,7 +73,8 @@ private:
         std::shared_ptr<Framebuffer> framebuffer;
     };
     void release() noexcept;
-    void setLibraryState(VkCommandBuffer commands, const State& state) const;
+    PassLibraryState libraryState(const State& state) const;
+    void setLibraryState(VkCommandBuffer commands, const PassLibraryState& values) const;
     Context context;
     std::vector<VkShaderModule> _modules;
     VkPipelineLayout layout = VK_NULL_HANDLE;
