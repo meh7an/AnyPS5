@@ -1619,6 +1619,10 @@ bool MatchesPreparedShader(const RecompileRequest& request, const SourceHandle& 
     return handle.source->code.data() == request.shader.code.data() || std::ranges::equal(handle.source->code, request.shader.code);
 }
 
+void ValidatePreparedInputs(const RecompileRequest& request) {
+    if (request.shader.stage != ShaderStage::Compute && request.shader.stage != ShaderStage::Fragment) ValidateRequestInputs(request);
+}
+
 std::span<const std::uint32_t> GetPreparedCode(const SourceHandle& handle) {
     if (handle.source == nullptr || handle.artifact == nullptr) throw std::runtime_error("ShaderRecompiler: prepared artifact is missing");
     return handle.source->code;
@@ -1635,7 +1639,7 @@ std::optional<PreparedShaderInvocation> PreparedShaderInvocation::TryCreate(cons
 
 std::optional<PreparedShaderInvocation> PreparedShaderInvocation::TryCreate(const RecompileRequest& request, const std::shared_ptr<const SourceHandle>& handle, std::span<const std::uint64_t> key) {
     if (handle == nullptr || !MatchesPreparedShader(request, *handle, key)) return std::nullopt;
-    if (request.shader.stage != ShaderStage::Compute && request.shader.stage != ShaderStage::Fragment) ValidateRequestInputs(request);
+    ValidatePreparedInputs(request);
     return PreparedShaderInvocation(request, handle);
 }
 

@@ -499,7 +499,7 @@ std::optional<DrawVerdict> Driver::prepareDraw(PreparedDraw& prepared, QueueStat
             memory.insert(memory.end(), matchedRegions[i].begin(), matchedRegions[i].end());
         } else {
             resultIndex[i] = results.size();
-            results.push_back(materializeDrawStage(i, pushCursorBytes, queue, submission, programs, graphics, pixel, vertexInfos, requests, memory, linked, drawParameters, localDevice, shaderMemory, stageCaptures, recompiled, drawHit, wantRegions, matched, matchedRegions, profile, dumpTarget, dumpSlot1, captures, phaseTiming, phaseMs, rejected));
+            results.push_back(materializeDrawStage(i, pushCursorBytes, queue, submission, *decode, programs, graphics, pixel, vertexInfos, requests, memory, linked, drawParameters, localDevice, shaderMemory, stageCaptures, recompiled, drawHit, wantRegions, matched, matchedRegions, profile, dumpTarget, dumpSlot1, captures, phaseTiming, phaseMs, rejected));
             if (!rejected.empty()) return DrawVerdict::Rejected;
             programResults[i] = results.back().get();
         }
@@ -608,7 +608,7 @@ std::optional<DrawVerdict> Driver::prepareDraw(PreparedDraw& prepared, QueueStat
                 const auto* previous = result.get();
                 const auto pushBytes = result->pushConstants.size();
                 decodeVertexInfo(programIndex);
-                result = materializeDrawStage(programIndex, pushOffsets[programIndex], queue, submission, programs, graphics, pixel, vertexInfos, requests, memory, linked, drawParameters, localDevice, shaderMemory, stageCaptures, recompiled, drawHit, wantRegions, matched, matchedRegions, profile, dumpTarget, dumpSlot1, captures, phaseTiming, phaseMs, rejected);
+                result = materializeDrawStage(programIndex, pushOffsets[programIndex], queue, submission, *decode, programs, graphics, pixel, vertexInfos, requests, memory, linked, drawParameters, localDevice, shaderMemory, stageCaptures, recompiled, drawHit, wantRegions, matched, matchedRegions, profile, dumpTarget, dumpSlot1, captures, phaseTiming, phaseMs, rejected);
                 if (!rejected.empty()) return DrawVerdict::Rejected;
                 require(result->pushConstants.size() == pushBytes, "patched program changed its push constant layout");
                 // The stages name the program's result by address: repoint them at the new one.

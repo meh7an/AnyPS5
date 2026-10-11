@@ -244,7 +244,9 @@ void DecodeGraphicsPrograms(DrawDecode& decoded, const QueueState& queue, const 
 }
 
 std::shared_ptr<DrawDecode> Driver::decodeDraw(const QueueState& queue, const Submission& submission) {
+    static std::atomic<std::uint64_t> serials{0};
     auto product = std::make_shared<DrawDecode>();
+    product->serial = serials.fetch_add(1, std::memory_order_relaxed) + 1;
     bool vertexWorkgroup = false;
     const auto stages = queue.context.find(0x2d5);
     const auto low = queue.shader.find(0xc8);

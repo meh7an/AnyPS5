@@ -39,6 +39,9 @@ struct DrawDecode {
     ShaderRecompiler::ShaderPixelStageInfo pixel;
     std::vector<DrawProgram> programs;
     std::vector<ShaderRecompiler::ProgramRole> roles;
+    // Names everything above but the programs' user words (Driver::decodeDraw numbers each decode
+    // it makes from 1; a decode cache's copy keeps the number, its user words read again). 0: none.
+    std::uint64_t serial = 0;
 };
 
 void DecodeGraphicsPrograms(DrawDecode& decoded, const QueueState& queue, const ShaderRegistry& registry, bool staticAbi, bool includeFragment);

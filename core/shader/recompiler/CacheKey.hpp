@@ -38,6 +38,13 @@ public:
         appendInterface(key, request);
     }
 
+    // The part of BuildInterface's key a request's vertex stage info gives, for a driver that knows
+    // the rest of the request's interface unchanged (the AGC driver's kept stage handles).
+    static void BuildVertexInterface(const StageInfo<ShaderVertexStageInfo>& vertex, std::vector<std::uint64_t>& key) {
+        key.clear();
+        append(key, vertex);
+    }
+
     // A hash over every field Build appends except the code, the target and the probe flag: the
     // key of a source memo whose owner fixes the code (a registered shader at an offset) and the
     // device itself, and which is bypassed while the probe is active.

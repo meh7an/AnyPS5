@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
+#include "CacheKey.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ThreadScratch.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
@@ -210,6 +211,49 @@ struct StageMemoKeys {
         if (known == nullptr) known = ShaderRecompiler::UserDataKeyFor(handle);
         if (known != nullptr) way = {source, known.get()};
         return known.get();
+    }
+};
+
+// A thread's prepared handles of draw stages (InvocationFor's), for the stage memo's lookup: a
+// decode's stage at one push offset has every input of its interface key fixed but the vertex
+// stage info, so the handle is kept by the decode's serial (DrawDecode::serial, which its copies
+// share), the stage, the push offset, the device (watched: a live one is the only object at its
+// address) and the key's vertex part. Building and matching the whole key at every stage of every
+// draw cost the worker more than the rest of the memo's hit. APS5_NO_STAGE_HANDLES=1 looks every
+// stage up.
+struct StageHandles {
+    struct Way {
+        std::uint64_t decode = 0;
+        std::size_t stage = 0;
+        std::uint32_t pushOffset = 0;
+        const VulkanDevice* device = nullptr;
+        std::weak_ptr<VulkanDevice> deviceAlive;
+        std::vector<std::uint64_t> vertexKey;
+        std::shared_ptr<const ShaderRecompiler::SourceHandle> handle;
+    };
+    std::array<Way, 1024> ways{};
+    // The lookup's vertex key part and way, which Remember fills.
+    std::vector<std::uint64_t> vertexKey;
+    Way* way = &ways[0];
+
+    std::shared_ptr<const ShaderRecompiler::SourceHandle> Find(std::uint64_t decode, std::size_t stage, std::uint32_t pushOffset, const std::shared_ptr<VulkanDevice>& device, const ShaderRecompiler::RecompileRequest& request) {
+        ShaderRecompiler::RecompileCacheKey::BuildVertexInterface(request.context.vertex, vertexKey);
+        auto hash = (decode * 0x9e3779b97f4a7c15ull) ^ ((static_cast<std::uint64_t>(stage) << 32u) | pushOffset);
+        for (const auto word : vertexKey) hash = (hash ^ word) * 0x100000001b3ull;
+        way = &ways[((hash ^ (hash >> 29u)) * 0xbf58476d1ce4e5b9ull) >> 54u];
+        if (way->decode != decode || way->stage != stage || way->pushOffset != pushOffset || way->device != device.get() || way->deviceAlive.expired() || way->vertexKey != vertexKey) return nullptr;
+        return way->handle;
+    }
+
+    // After Find for the same request.
+    void Remember(std::uint64_t decode, std::size_t stage, std::uint32_t pushOffset, const std::shared_ptr<VulkanDevice>& device, std::shared_ptr<const ShaderRecompiler::SourceHandle> handle) {
+        way->decode = decode;
+        way->stage = stage;
+        way->pushOffset = pushOffset;
+        way->device = device.get();
+        way->deviceAlive = device;
+        way->vertexKey = vertexKey;
+        way->handle = std::move(handle);
     }
 };
 
@@ -518,7 +562,7 @@ std::string stageMemoDifference(const ShaderRecompiler::RecompileResult& memo, c
 
 }
 
-std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDrawStage(std::size_t i, std::uint32_t pushOffset, const QueueState& queue, const Submission& submission, const std::vector<DrawProgram>& programs, const Graphics::State& graphics, const ShaderRecompiler::ShaderPixelStageInfo& pixel, const std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>>& vertexInfos, std::vector<ShaderRecompiler::RecompileRequest>& requests, std::vector<ShaderRecompiler::MemoryRegion>& memory, const std::vector<ShaderRecompiler::LinkedProgram>& linked, const Pm4::DrawParameters& drawParameters, const std::shared_ptr<VulkanDevice>& localDevice, ShaderMemory& shaderMemory, std::vector<StageCapture>& stageCaptures, std::vector<bool>& recompiled, bool drawHit, bool wantRegions, const std::vector<std::shared_ptr<DispatchVariant>>& matched, const std::vector<std::vector<ShaderRecompiler::MemoryRegion>>& matchedRegions, bool profile, std::uint64_t dumpTarget, std::uint64_t dumpSlot1, std::uint64_t& captures, DrawPhaseTiming& phaseTiming, std::array<double, DrawDriverPhaseCount>& phaseMs, std::string& rejected) {
+std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDrawStage(std::size_t i, std::uint32_t pushOffset, const QueueState& queue, const Submission& submission, const DrawDecode& decode, const std::vector<DrawProgram>& programs, const Graphics::State& graphics, const ShaderRecompiler::ShaderPixelStageInfo& pixel, const std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>>& vertexInfos, std::vector<ShaderRecompiler::RecompileRequest>& requests, std::vector<ShaderRecompiler::MemoryRegion>& memory, const std::vector<ShaderRecompiler::LinkedProgram>& linked, const Pm4::DrawParameters& drawParameters, const std::shared_ptr<VulkanDevice>& localDevice, ShaderMemory& shaderMemory, std::vector<StageCapture>& stageCaptures, std::vector<bool>& recompiled, bool drawHit, bool wantRegions, const std::vector<std::shared_ptr<DispatchVariant>>& matched, const std::vector<std::vector<ShaderRecompiler::MemoryRegion>>& matchedRegions, bool profile, std::uint64_t dumpTarget, std::uint64_t dumpSlot1, std::uint64_t& captures, DrawPhaseTiming& phaseTiming, std::array<double, DrawDriverPhaseCount>& phaseMs, std::string& rejected) {
     PerformanceTimer timing("Shader.DrawStage");
     using Stage = ShaderRecompiler::ShaderStage;
     phaseTiming.Phase(DrawRowVectors);
@@ -551,8 +595,24 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
         ++stageTimes().calls[which];
         lap = now;
     };
-    const auto invocation = InvocationFor(*program.snapshot, program.codeOffset, request);
-    const auto& handle = invocation.Handle();
+    // A stage the memo serves needs only its request's prepared handle (StageHandles); the
+    // invocation the capture works over is made when the memo misses.
+    static const bool memoize = StageMemoEnabled();
+    static const bool handlesKept = std::getenv("APS5_NO_STAGE_HANDLES") == nullptr;
+    const bool memoUsable = memoize && dumpTarget == 0 && dumpSlot1 == 0 && !ShaderRecompiler::DebugProbeActive();
+    const bool keepHandle = memoUsable && handlesKept && decode.serial != 0;
+    struct StageHandlesTag {};
+    auto& stageHandles = ThreadScratch<StageHandles, StageHandlesTag>();
+    std::optional<ShaderRecompiler::PreparedShaderInvocation> invocation;
+    auto handle = keepHandle ? stageHandles.Find(decode.serial, i, pushOffset, localDevice, request) : nullptr;
+    if (handle != nullptr) {
+        // The checks the match made of this draw's own inputs.
+        ShaderRecompiler::ValidatePreparedInputs(request);
+    } else {
+        invocation.emplace(InvocationFor(*program.snapshot, program.codeOffset, request));
+        handle = invocation->Handle();
+        if (keepHandle && handle != nullptr) stageHandles.Remember(decode.serial, i, pushOffset, localDevice, handle);
+    }
     timing.Mark("prepared_invocation");
     part(StageTimes::Invocation);
     auto& stageCapture = stageCaptures[i];
@@ -574,9 +634,8 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
     // The stage memo (StageMemoEntry): a key that repeats over unchanged captured words takes the
     // remembered result with this stage's user words copied in. Its words enter the draw's shader
     // memory as this stage's reads, so the draw's regions are those a capture would have made.
-    static const bool memoize = StageMemoEnabled();
     const ShaderRecompiler::UserDataKey* memoKey = nullptr;
-    if (memoize && handle != nullptr && dumpTarget == 0 && dumpSlot1 == 0 && !ShaderRecompiler::DebugProbeActive()) {
+    if (memoUsable && handle != nullptr) {
         struct MemoKeysTag {};
         memoKey = ThreadScratch<StageMemoKeys, MemoKeysTag>().Find(*handle);
     }
@@ -746,9 +805,22 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
         reportStageMemo(entries);
     }
 
+    if (!invocation) {
+        invocation.emplace(InvocationFor(*program.snapshot, program.codeOffset, request));
+        // The kept handle is InvocationFor's first matching entry, which later entries never
+        // displace. One that differed would have keyed the memo by another source: this stage then
+        // stores nothing, and the way takes the invocation's.
+        if (invocation->Handle() != handle) {
+            static std::atomic<int> reports{0};
+            if (reports.fetch_add(1, std::memory_order_relaxed) < 4) std::fprintf(stderr, "[stage-memo] program 0x%llx: a kept stage handle is not the invocation's\n", static_cast<unsigned long long>(program.binary.codeAddress));
+            handle = invocation->Handle();
+            memoKey = nullptr;
+            if (handle != nullptr) stageHandles.Remember(decode.serial, i, pushOffset, localDevice, handle);
+        }
+    }
     const auto capture = [&] {
         const SampledReadScope sampling(evidenceReads);
-        return shaderMemory.Capture(invocation);
+        return shaderMemory.Capture(*invocation);
     }();
     part(StageTimes::Capture);
 
@@ -789,7 +861,7 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
     timing.Mark("capture_resources");
     if (subPhases) lap = std::chrono::steady_clock::now();
     bool memoHit = false;
-    auto compiled = invocation.Materialize(*capture, &memoHit);
+    auto compiled = invocation->Materialize(*capture, &memoHit);
     timing.Mark("materialize");
     if (subPhases) {
         part(memoHit ? StageTimes::RecompileHit : StageTimes::RecompileMiss);

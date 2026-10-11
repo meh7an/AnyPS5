@@ -71,6 +71,9 @@ private:
 [[nodiscard]] bool MatchesPreparedShader(const RecompileRequest& request, const SourceHandle& handle);
 void BuildPreparedShaderKey(const RecompileRequest& request, std::vector<std::uint64_t>& key);
 [[nodiscard]] bool MatchesPreparedShader(const RecompileRequest& request, const SourceHandle& handle, std::span<const std::uint64_t> key);
+// The input checks PreparedShaderInvocation::TryCreate makes once a handle matched, throwing for
+// inputs its stage cannot serve: for a driver that keeps the handle a request matched.
+void ValidatePreparedInputs(const RecompileRequest& request);
 [[nodiscard]] const CompiledShaderArtifact& GetPreparedArtifact(const SourceHandle& handle);
 [[nodiscard]] std::shared_ptr<const RecompileResult> MaterializeShader(const RecompileRequest& request, const ResourceCapture& capture, const SourceHandle& handle);
 [[nodiscard]] std::shared_ptr<const SourceHandle> ResolveSource(const RecompileRequest& request);

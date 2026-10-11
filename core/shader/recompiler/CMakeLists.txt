@@ -232,6 +232,7 @@ function(add_shader_recompiler target runtimeTarget)
             RayTracingMiss
             ReadWholeFile
             Recompile
+            RecompileCacheKey::BuildVertexInterface
             RecompileCacheKey::ContextHash
             RecompileResult
             PrepareShader
@@ -255,6 +256,7 @@ function(add_shader_recompiler target runtimeTarget)
             LinkUserDataCalls
             UserDataKeyFor
             UserDataPatchesFor
+            ValidatePreparedInputs
             WriteFileAtomically
     )
     set(shaderCacheManifest)
