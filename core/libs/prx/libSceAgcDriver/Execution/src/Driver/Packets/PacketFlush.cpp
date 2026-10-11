@@ -81,13 +81,13 @@ void Driver::flushBetweenPackets(std::uint32_t queue, std::uint32_t header, bool
     // a later packet instead, unless it is 4 times past its cap or its labels 8 times past their
     // deadline. APS5_NO_PRESENT_DEFER=1 submits at once.
     static const bool presentDefer = std::getenv("APS5_NO_PRESENT_DEFER") == nullptr;
-    if (presentDefer && !record && !recordAtLock && (submit || capped) && GuestMemory::QueueMutex().HeldElsewhere()) {
-        const bool farPast = (capped && work >= 4 * batchCap()) || (pendingDue && now - *pending >= 8 * labelFlushDeadline());
-        if (!farPast) {
-            presentDeferrals.fetch_add(1, std::memory_order_relaxed);
-            return;
-        }
-    }
+    const auto presentDeferred = [&] {
+        if (!presentDefer || record || recordAtLock || !(submit || capped) || !GuestMemory::QueueMutex().HeldElsewhere()) return false;
+        if ((capped && work >= 4 * batchCap()) || (pendingDue && now - *pending >= 8 * labelFlushDeadline())) return false;
+        presentDeferrals.fetch_add(1, std::memory_order_relaxed);
+        return true;
+    };
+    if (presentDeferred()) return;
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     // The failed tries are only counted for the [labels] line: a locked add per try otherwise.
     const auto failedTry = [&] {
@@ -126,6 +126,14 @@ void Driver::flushBetweenPackets(std::uint32_t queue, std::uint32_t header, bool
     if (submit || capped) {
 
         if (!Graphics::Recorder::PendingLabelSince().has_value() && (batchCap() == 0 || Graphics::Recorder::RecordedWorkSinceSubmit() < batchCap())) return;
+        // Asked again under the GPU mutex: the check above mostly loses the race to a presenter
+        // queueing its blit, which holds the mutex meanwhile and takes the queue just before it
+        // lets go, so this thread got the mutex only to wait for the whole presentation. The
+        // presenter takes the queue under the mutex (Driver::Present, unless APS5_FLIP_INFLIGHT=0):
+        // free now, it stays free for this submit. APS5_NO_PRESENT_RECHECK=1 asks before the mutex
+        // alone, as before.
+        static const bool recheck = std::getenv("APS5_NO_PRESENT_RECHECK") == nullptr;
+        if (recheck && presentDeferred()) return;
         TimelineTrace::Mark(TimelineTrace::Event::SubmitBegin);
         localDevice->SubmitRecorded(queue == 0);
         TimelineTrace::Mark(TimelineTrace::Event::SubmitEnd);
