@@ -312,6 +312,20 @@ const std::vector<IrBlock*>& IrProgram::BlockOrder() const {
     return blockOrder;
 }
 
+std::string DescribeValue(const IrValue* value, std::uint32_t depth) {
+    if (value == nullptr) return "null";
+    value = value->Resolve();
+    std::string text(IrOpcodeName(value->Opcode()));
+    if (value->HasImmediate() && value->Type() == IrType::U32) return text + "(" + std::to_string(value->ImmediateU32()) + ")";
+    if (depth == 0 || value->ArgumentCount() == 0) return text;
+    text += "(";
+    for (std::size_t index = 0; index < value->ArgumentCount(); ++index) {
+        if (index != 0) text += ", ";
+        text += DescribeValue(value->Argument(index), depth - 1);
+    }
+    return text + ")";
+}
+
 std::string ProgramToString(const IrProgram& program) {
     std::map<const IrValue*, std::size_t> ids;
     std::size_t nextId = 1;
@@ -738,6 +752,9 @@ void ResolveControlFlowIdentities(IrProgram& program) {
         }
         if (info.indirectTarget != nullptr) {
             info.indirectTarget = info.indirectTarget->Resolve();
+        }
+        if (info.exec != nullptr) {
+            info.exec = info.exec->Resolve();
         }
     }
 }

@@ -2679,6 +2679,13 @@ void verifyCubeDepthCompareMode() {
 }
 
 int main(int argc, char** argv) {
+    // The wave64 compute checks here read the two-lane emitter's output; the single-lane rule would
+    // take the programs that qualify to one lane per invocation (tests/SingleLane.cpp covers it).
+#ifdef _WIN32
+    _putenv_s("APS5_NO_SINGLE_LANE_RULE", "1");
+#else
+    setenv("APS5_NO_SINGLE_LANE_RULE", "1", 1);
+#endif
     try {
         using namespace ShaderRecompiler;
         if (argc == 2 && std::string_view(argv[1]) == "--frontend-pair") {

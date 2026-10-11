@@ -17,6 +17,9 @@ struct BlockInfo {
     Terminator terminator;
     IrValue* condition = nullptr;
     IrValue* indirectTarget = nullptr;
+    // A VCC branch's exec mask (the lane's bit) where it branches: which lanes the branch decides
+    // for. The VCC bits themselves may come from an earlier exec (SingleLaneAnalysis compares them).
+    IrValue* exec = nullptr;
 };
 
 struct DescriptorSource {

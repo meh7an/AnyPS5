@@ -272,7 +272,9 @@ bool AllOnesWord(const IrValue* word) {
 }
 
 bool AllLanesBit(const IrValue* bit) {
-    const auto words = LaneBitWords(Resolved(bit));
+    bit = Resolved(bit);
+    if (bit != nullptr && bit->HasImmediate()) return bit->Type() == IrType::Bool && bit->ImmediateBool();
+    const auto words = LaneBitWords(bit);
     return words && AllOnesWord((*words)[0]) && AllOnesWord((*words)[1]);
 }
 
