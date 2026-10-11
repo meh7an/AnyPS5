@@ -119,6 +119,43 @@ void importSpanTests(const Context& context) {
     ::operator delete(block, std::align_val_t{piece});
 }
 
+// A span past the import budget (APS5_HOST_IMPORT_MIB, 6 GiB by default) cannot be imported whole:
+// its ranges are imported one by one, as before spans, instead of every use copying. The large
+// range is only reserved: nothing imports or touches it.
+void importBudgetSpanTests(const Context& context) {
+    constexpr std::size_t piece = 65536;
+    constexpr std::size_t large = std::size_t{7} << 30u;
+#ifdef _WIN32
+    auto* guest = static_cast<std::uint8_t*>(VirtualAlloc(nullptr, piece + large, MEM_RESERVE, PAGE_NOACCESS));
+    Require(guest != nullptr && VirtualAlloc(guest, piece, MEM_COMMIT, PAGE_READWRITE) != nullptr, "cannot reserve a span past the import budget");
+#else
+    auto* reserved = static_cast<std::uint8_t*>(mmap(nullptr, 2 * piece + large, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0));
+    Require(reserved != MAP_FAILED, "cannot reserve a span past the import budget");
+    auto* guest = reserved + (piece - reinterpret_cast<std::uintptr_t>(reserved) % piece) % piece;
+    Require(mprotect(guest, piece, PROT_READ | PROT_WRITE) == 0, "cannot commit the first range of a span past the import budget");
+#endif
+    const auto first = reinterpret_cast<std::uintptr_t>(guest);
+    auto importing = context;
+    importing.hostImportAlignment = piece;
+    const auto change = [&](std::uint8_t* range, std::size_t bytes, bool add) {
+        auto* mutation = GuestAllocations::GuestAllocationsBegin_nid_postfix();
+        if (add) GuestAllocations::GuestAllocationsAdd_nid_postfix(mutation, range, bytes, true, true, true);
+        else GuestAllocations::GuestAllocationsRemove_nid_postfix(mutation, range);
+        GuestAllocations::GuestAllocationsEnd_nid_postfix(mutation);
+    };
+    change(guest, piece, true);
+    change(guest + piece, large, true);
+    const auto* alone = HostImportFor(importing, first, 16);
+    Require(alone != nullptr && alone->base == first && alone->bytes == piece, "a range of a span past the import budget was not imported on its own");
+    change(guest + piece, large, false);
+    change(guest, piece, false);
+#ifdef _WIN32
+    VirtualFree(guest, 0, MEM_RELEASE);
+#else
+    munmap(reserved, 2 * piece + large);
+#endif
+}
+
 ShaderRecompiler::DescriptorBinding binding(Role role, std::uint32_t slot) {
     return {ShaderRecompiler::DescriptorKind::StorageBuffer, role, 0, slot, 1, {}, false};
 }
@@ -1037,6 +1074,7 @@ void RunBdaResourceTests(const Context& context, const BdaTestAccess& access) {
     }
     importCrossingTests(context, access);
     importSpanTests(context);
+    importBudgetSpanTests(context);
     heapMirrorTests(context, access);
     importedHeapMirrorTests(context, access);
     importWatchTests();

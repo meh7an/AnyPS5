@@ -608,6 +608,12 @@ const HostImport* importAllocation(const Context& context, HostImports& state, s
     }();
     const auto live = state.liveBytes;
     if (live + bytes > budget) {
+        // A span of several ranges is imported range by range instead, as its ranges were before
+        // spans: a title's whole GPU mapping can be one span past the budget.
+        if (run.ranges.size() > 1) {
+            state.unaliasedSpans.insert(base);
+            return importAllocation(context, state, address, lease);
+        }
         // A refused import turns every later use of the range into CPU copies, so say so.
         static std::uint64_t refused = 0, refusedBytes = 0;
         static auto lastReport = std::chrono::steady_clock::now() - std::chrono::seconds(60);
