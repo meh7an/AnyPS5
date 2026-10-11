@@ -95,6 +95,9 @@ inline unsigned EncodingSize(Byte encoding) {
     default: std::abort();
     }
 }
+
+bool FdeRange(const Byte* fde, Word& start, Word& length);
+bool StepWithin(_Unwind_Context& context, const Byte* fde, Word low, Word high);
 }
 
 extern "C" {

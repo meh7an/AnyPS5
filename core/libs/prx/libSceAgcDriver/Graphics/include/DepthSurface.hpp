@@ -11,9 +11,14 @@
 namespace AgcDriver::Graphics {
 
 class Texture;
+class StorageTexture;
 
 VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target);
 std::uint64_t DepthSliceBytes(VkExtent2D extent, std::uint32_t bytesPerTexel);
+void ClearDepthSurface(const Context& context, const DepthTarget& target, bool depth, bool stencil);
+// A shader's storage image over a depth surface uses the storage image of its guest surface: the
+// depth plane is copied into it before the use (intoStorage) and back after a write.
+void TransferDepthSurface(const Context& context, std::uint64_t address, StorageTexture& storage, bool intoStorage);
 void ClearDepthSurfaces(VkDevice device);
 bool DepthSurfaceAt(std::uint64_t address);
 std::uint64_t HtileDepthClearAddress(std::span<const std::uint32_t> code, std::span<const std::uint32_t> userData, const std::array<std::uint32_t, 3>& numThreads);

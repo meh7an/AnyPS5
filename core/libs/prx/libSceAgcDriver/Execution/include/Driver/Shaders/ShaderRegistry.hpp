@@ -3,6 +3,7 @@
 
 #include "prx/libSceAgcDriver/Execution/include/ShaderMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/QueueState.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include <array>
 #include <optional>
 #include <atomic>

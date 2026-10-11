@@ -3,13 +3,16 @@
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineLibrary.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineSpecialization.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ThreadScratch.hpp"
 #include <algorithm>
 #include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <list>
 #include <mutex>
 #include <string_view>
@@ -486,18 +489,23 @@ std::shared_ptr<Framebuffer> Pipeline::AcquireFramebuffer(std::span<const VkImag
     Require(targets.size() == attachments && owners.size() == colorAttachments, "render targets do not match the pipeline's attachments");
     const bool resident = std::all_of(owners.begin(), owners.end(), [](const auto& owner) { return owner != nullptr; });
     if (resident) {
+        const auto matches = [&](const CachedFramebuffer& entry) {
+            if (entry.extent.width != extent.width || entry.extent.height != extent.height || !std::equal(entry.views.begin(), entry.views.end(), targets.begin(), targets.end())) return false;
+            // View handles are recycled once a StorageTexture is destroyed, so the owners must be the
+            // very objects the views were made for.
+            for (std::size_t i = 0; i < owners.size(); ++i) {
+                if (entry.owners[i].lock().get() != owners[i].get()) return false;
+            }
+            return true;
+        };
+        if (!framebuffers.empty() && matches(framebuffers.back())) return framebuffers.back().framebuffer;
         // Entries whose views are gone can never match again and go as soon as no recorded draw holds
         // them (Kept keeps its framebuffer until the batch completes).
         std::erase_if(framebuffers, [](const CachedFramebuffer& entry) {
             return entry.framebuffer.use_count() == 1 && std::any_of(entry.owners.begin(), entry.owners.end(), [](const auto& owner) { return owner.expired(); });
         });
         for (auto it = framebuffers.begin(); it != framebuffers.end(); ++it) {
-            if (it->extent.width != extent.width || it->extent.height != extent.height || !std::equal(it->views.begin(), it->views.end(), targets.begin(), targets.end())) continue;
-            // View handles are recycled once a StorageTexture is destroyed, so the owners must be the
-            // very objects the views were made for.
-            bool same = true;
-            for (std::size_t i = 0; i < owners.size() && same; ++i) same = it->owners[i].lock().get() == owners[i].get();
-            if (!same) continue;
+            if (!matches(*it)) continue;
             std::rotate(it, std::next(it), framebuffers.end());
             return framebuffers.back().framebuffer;
         }
@@ -626,13 +634,16 @@ void append(std::vector<std::byte>& key, const TValue& value) {
     key.insert(key.end(), bytes.begin(), bytes.end());
 }
 
-// Everything the Pipeline objects are built from, or empty when a stage's result has no variant id
-// (the recompiler could not identify it, so nothing else may share its pipeline). The rect-list
-// control and evaluation stages are generated from the vertex and fragment results, which the key
-// already names, so they carry no id of their own.
+// Everything the Pipeline objects are built from, into `key` (CachedPipeline passes its thread's
+// buffer), or nothing when a stage's result has no variant id (the recompiler could not identify
+// it, so nothing else may share its pipeline). The rect-list control and evaluation stages are
+// generated from the vertex and fragment results, which the key already names, so they carry no
+// id of their own.
 void pipelineKey(std::vector<std::byte>& key, const Context& context, const State& state, const VertexInputLayout& input, const ShaderResources& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout) {
     using Stage = ShaderRecompiler::ShaderStage;
     key.clear();
+    // Room for a usual key (a few hundred bytes): growing it value by value reallocated it often.
+    key.reserve(1024);
     append(key, context.device);
     append(key, attachmentLayout);
     append(key, shaders.size());
@@ -718,8 +729,22 @@ void pipelineKey(std::vector<std::byte>& key, const Context& context, const Stat
     }
 }
 
+// FNV-1a over eight bytes at a time (and the tail byte-wise): every draw hashes its key, and a byte
+// per step cost more than building it.
 std::uint64_t hashKey(const std::vector<std::byte>& key) {
-    return std::hash<std::string_view>{}(std::string_view(reinterpret_cast<const char*>(key.data()), key.size()));
+    std::uint64_t hash = 14695981039346656037ull;
+    std::size_t at = 0;
+    for (; at + sizeof(std::uint64_t) <= key.size(); at += sizeof(std::uint64_t)) {
+        std::uint64_t word = 0;
+        std::memcpy(&word, key.data() + at, sizeof(word));
+        hash ^= word;
+        hash *= 1099511628211ull;
+    }
+    for (; at < key.size(); ++at) {
+        hash ^= static_cast<std::uint8_t>(key[at]);
+        hash *= 1099511628211ull;
+    }
+    return hash;
 }
 
 struct PipelineStore {
@@ -732,8 +757,7 @@ struct PipelineStore {
         std::vector<std::byte> key;
         std::shared_ptr<Pipeline> pipeline;
     };
-    std::mutex mutex;
-    std::vector<std::byte> scratchKey;
+    AgcDriver::Mutex mutex;
     // Least recently used first.
     std::list<Entry> entries;
     std::unordered_map<std::uint64_t, std::list<Entry>::iterator> index;
@@ -783,15 +807,18 @@ std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& st
     static const bool disabled = std::getenv("APS5_NO_PIPELINE_CACHE") != nullptr;
     if (disabled) return std::make_shared<Pipeline>(context, state, vertexInput, resources, shaders, attachmentLayout);
     auto& store = Pipelines();
+    // The key and its hash need no lock. The key is built in the calling thread's buffer: a fresh
+    // kilobyte for every draw was an allocation.
+    struct KeyTag {};
+    auto& key = ThreadScratch<std::vector<std::byte>, KeyTag>();
+    pipelineKey(key, context, state, vertexInput, resources, shaders, attachmentLayout);
+    const auto hash = key.empty() ? 0 : hashKey(key);
     std::lock_guard lock(store.mutex);
     reportPipelines(store);
-    auto& key = store.scratchKey;
-    pipelineKey(key, context, state, vertexInput, resources, shaders, attachmentLayout);
     if (key.empty()) {
         ++store.uncached;
         return std::make_shared<Pipeline>(context, state, vertexInput, resources, shaders, attachmentLayout);
     }
-    const auto hash = hashKey(key);
     if (const auto found = store.index.find(hash); found != store.index.end()) {
         const auto it = found->second;
         if (it->key == key) {

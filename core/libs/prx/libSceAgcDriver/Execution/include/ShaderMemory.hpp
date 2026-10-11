@@ -3,7 +3,6 @@
 
 #include "Recompiler.hpp"
 #include <array>
-#include <bitset>
 #include <cstddef>
 #include <cstdint>
 #include <map>
@@ -64,6 +63,8 @@ public:
     std::shared_ptr<const ShaderRecompiler::ResourceCapture> Capture(const ShaderRecompiler::RecompileRequest& request, const ShaderRecompiler::SourceHandle* handle = nullptr);
     std::shared_ptr<const ShaderRecompiler::ResourceCapture> Capture(const ShaderRecompiler::PreparedShaderInvocation& invocation);
     [[nodiscard]] std::vector<ShaderRecompiler::MemoryRegion> Regions() const;
+    // Regions() in place of `regions`' contents, in its capacity.
+    void Regions(std::vector<ShaderRecompiler::MemoryRegion>& regions) const;
     // The page regions read since the previous call (or construction), a word read again
     // included, the initial regions excluded: one stage's own reads on the draw path's shared
     // ShaderMemory (Regions() stays the union). The spans point into the pages, as Regions()'s do.
@@ -76,11 +77,31 @@ private:
     static constexpr std::size_t PageBytes = 4096;
     static constexpr std::size_t PageWords = PageBytes / sizeof(std::uint32_t);
 
+    // A flag per page word, kept in 64-bit words so a scan skips 64 clear flags at a time.
+    struct WordFlags {
+        std::array<std::uint64_t, PageWords / 64> bits{};
+
+        [[nodiscard]] bool test(std::size_t index) const { return (bits[index / 64] >> (index % 64) & 1u) != 0; }
+        void set(std::size_t index) { bits[index / 64] |= std::uint64_t{1} << (index % 64); }
+        void set() { bits.fill(~std::uint64_t{0}); }
+        void reset() { bits.fill(0); }
+        [[nodiscard]] bool none() const;
+        [[nodiscard]] bool all() const {
+            for (const auto word : bits) {
+                if (word != ~std::uint64_t{0}) return false;
+            }
+            return true;
+        }
+        // Calls visit(first, end) for each run of set flags, in order.
+        template<typename TVisit>
+        void forEachRun(TVisit&& visit) const;
+    };
+
     struct Page {
         std::array<std::uint32_t, PageWords> words{};
-        std::bitset<PageWords> valid;
-        std::bitset<PageWords> read;
-        std::bitset<PageWords> recent;
+        WordFlags valid;
+        WordFlags read;
+        WordFlags recent;
         bool wordwise = false;
     };
 
@@ -89,8 +110,9 @@ private:
     Page& page(std::uint64_t base);
 
     // Regions given at construction (the registered shader's code and header), referenced as given:
-    // the caller keeps them alive for as long as the capture is used.
-    std::map<std::uint64_t, std::span<const std::byte>> initial;
+    // the caller keeps them alive for as long as the capture is used. Sorted by address in one
+    // vector, not a map: a draw makes one of these, and the map's node per region was an allocation.
+    std::vector<std::pair<std::uint64_t, std::span<const std::byte>>> initial;
     std::map<std::uint64_t, Page> pages;
     PendingWriteQuery pendingWrite = nullptr;
     PendingWriteObserver observe = nullptr;

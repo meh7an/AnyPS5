@@ -47,6 +47,8 @@ void DecodeGraphicsPrograms(DrawDecode& decoded, const QueueState& queue, const 
             program,
             codeOffset
         };
+        // One allocation: the words, and the 8 a merged stage puts in front (initializeMerged).
+        result.userData.reserve(userCount + 8u);
         for (std::uint32_t i = 0; i < userCount; ++i) {
             Graphics::NoteRegisterRead(Graphics::RegisterBank::Shader, userDataBase + i);
             result.userData.push_back((staticAbi ? ReadGraphicsRegister(queue.shader, userDataBase + i) : readUserData(queue.shader, userDataBase + i)));
@@ -130,10 +132,7 @@ std::shared_ptr<DrawDecode> Driver::decodeDraw(const QueueState& queue, const Su
 void Driver::resolveDrawDecode(const QueueState& queue, const Submission& submission, std::shared_ptr<const DrawDecode>& decode, bool registerKey, std::uint64_t drawKey, bool profile) {
     if (decode == nullptr || verifyDrawRecipe()) {
         std::vector<Graphics::RegisterRead> readLog;
-        struct LogScope {
-            explicit LogScope(std::vector<Graphics::RegisterRead>* log) { Graphics::RegisterReadLog() = log; }
-            ~LogScope() { Graphics::RegisterReadLog() = nullptr; }
-        } logScope(verifyDrawRecipe() && registerKey ? &readLog : nullptr);
+        const Graphics::RegisterReadLogScope logScope(verifyDrawRecipe() && registerKey ? &readLog : nullptr);
         auto fresh = decodeDraw(queue, submission);
         if (verifyDrawRecipe() && registerKey) {
             std::uint64_t facadeMismatches = 0;

@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineSpecialization.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include "BdaAbi.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
@@ -73,6 +74,45 @@ std::string workgroupLimitError(std::uint32_t x, std::uint32_t y, std::uint32_t 
     char text[160];
     std::snprintf(text, sizeof(text), "Vulkan dispatch: workgroup count %ux%ux%u exceeds device limits %ux%ux%u", x, y, z, limit[0], limit[1], limit[2]);
     return text;
+}
+
+// The swapchain's presentation mode and image count. FIFO with the surface's minimum of two images
+// holds the queue on the previous presentation until its vblank: under the Windows compositor a flip
+// then costs two refreshes, 30 frames per second for a title flipping every vblank. Flips are paced
+// by the emulated vblank (VideoOut) already, so MAILBOX (tear-free, never holding the queue) is taken
+// when the surface offers it, with three images. APS5_PRESENT_MODE=fifo|mailbox|immediate|relaxed and
+// APS5_SWAPCHAIN_IMAGES=<n> override (a mode the surface lacks falls back to FIFO, always offered).
+struct PresentationChoice {
+    VkPresentModeKHR mode;
+    std::uint32_t images;
+};
+
+PresentationChoice ChoosePresentation(PFN_vkGetPhysicalDeviceSurfacePresentModesKHR getModes, VkPhysicalDevice physical, VkSurfaceKHR surface, const VkSurfaceCapabilitiesKHR& capabilities) {
+    std::vector<VkPresentModeKHR> modes;
+    std::uint32_t count = 0;
+    if (getModes != nullptr && getModes(physical, surface, &count, nullptr) == VK_SUCCESS && count != 0) {
+        modes.resize(count);
+        if (getModes(physical, surface, &count, modes.data()) != VK_SUCCESS) count = 0;
+        modes.resize(count);
+    }
+    const auto offered = [&](VkPresentModeKHR mode) { return mode == VK_PRESENT_MODE_FIFO_KHR || std::find(modes.begin(), modes.end(), mode) != modes.end(); };
+    PresentationChoice choice{offered(VK_PRESENT_MODE_MAILBOX_KHR) ? VK_PRESENT_MODE_MAILBOX_KHR : VK_PRESENT_MODE_FIFO_KHR, std::max<std::uint32_t>(capabilities.minImageCount, 3u)};
+    if (const char* text = std::getenv("APS5_PRESENT_MODE"); text != nullptr) {
+        const std::string name(text);
+        const auto wanted = name == "mailbox" ? VK_PRESENT_MODE_MAILBOX_KHR : name == "immediate" ? VK_PRESENT_MODE_IMMEDIATE_KHR : name == "relaxed" ? VK_PRESENT_MODE_FIFO_RELAXED_KHR : VK_PRESENT_MODE_FIFO_KHR;
+        choice.mode = offered(wanted) ? wanted : VK_PRESENT_MODE_FIFO_KHR;
+    }
+    if (const char* text = std::getenv("APS5_SWAPCHAIN_IMAGES"); text != nullptr) {
+        const auto parsed = std::strtoul(text, nullptr, 10);
+        if (parsed != 0) choice.images = std::max<std::uint32_t>(capabilities.minImageCount, static_cast<std::uint32_t>(parsed));
+    }
+    if (capabilities.maxImageCount != 0) choice.images = std::min(choice.images, capabilities.maxImageCount);
+    static std::atomic<bool> reported{false};
+    if (!reported.exchange(true)) {
+        const char* name = choice.mode == VK_PRESENT_MODE_MAILBOX_KHR ? "mailbox" : choice.mode == VK_PRESENT_MODE_IMMEDIATE_KHR ? "immediate" : choice.mode == VK_PRESENT_MODE_FIFO_RELAXED_KHR ? "fifo-relaxed" : "fifo";
+        std::fprintf(stderr, "[present] swapchain: %s, %u images (surface minimum %u)\n", name, choice.images, capabilities.minImageCount);
+    }
+    return choice;
 }
 
 // The ShaderResources content cache dispatches share with recorded draws: Graphics::ResourceCache,
@@ -279,7 +319,7 @@ struct VulkanDevice::State {
     // Compute pipeline objects by variant (and push-constant use), under their own mutex: the
     // dispatch's find-or-insert and the verify switch's lookups touch the map, recipes hold weak
     // references to its objects.
-    std::mutex computePipelinesMutex;
+    AgcDriver::Mutex computePipelinesMutex;
     std::map<std::uint64_t, std::shared_ptr<ComputePipelineObjects>> computePipelines;
     std::unique_ptr<Graphics::GpuColorTransfer> colorTransfer;
     std::shared_ptr<Graphics::BufferPool> bufferPool;
@@ -342,7 +382,7 @@ struct VulkanDevice::State {
         std::uint64_t throughSerial;
     };
     std::deque<RetiredRange> retiredRanges;
-    std::mutex presentMutex;
+    AgcDriver::Mutex presentMutex;
     // The presentation present() submitted and QueuePresent has not handed to the swapchain.
     bool queuePending = false;
     std::uint32_t queueIndex = 0;
@@ -1364,9 +1404,10 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
         std::vector<VkSurfaceFormatKHR> formats(formatCount);
         check(getFormats(selected, state->surface, &formatCount, formats.data()), "vkGetPhysicalDeviceSurfaceFormatsKHR");
         require(std::any_of(formats.begin(), formats.end(), [](const auto& format) { return format.format == VK_FORMAT_B8G8R8A8_UNORM && format.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR; }), "BGRA8 sRGB-nonlinear surface format is unavailable");
+        const auto presentation = ChoosePresentation(state->InstanceFunction<PFN_vkGetPhysicalDeviceSurfacePresentModesKHR>("vkGetPhysicalDeviceSurfacePresentModesKHR"), selected, state->surface, surface);
         VkSwapchainCreateInfoKHR swapchain{VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR};
         swapchain.surface = state->surface;
-        swapchain.minImageCount = surface.minImageCount;
+        swapchain.minImageCount = presentation.images;
         swapchain.imageFormat = VK_FORMAT_B8G8R8A8_UNORM;
         swapchain.imageColorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
         swapchain.imageExtent = state->extent;
@@ -1375,7 +1416,7 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
         swapchain.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
         swapchain.preTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
         swapchain.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
-        swapchain.presentMode = VK_PRESENT_MODE_FIFO_KHR;
+        swapchain.presentMode = presentation.mode;
         swapchain.clipped = VK_FALSE;
         check(state->DeviceFunction<PFN_vkCreateSwapchainKHR>("vkCreateSwapchainKHR")(state->device, &swapchain, nullptr, &state->swapchain), "vkCreateSwapchainKHR");
         std::uint32_t imageCount = 0;
@@ -1512,7 +1553,8 @@ int VulkanDevice::WriteLabelOnGpu(std::uint64_t address, std::span<const std::by
     if (reapFirst && (queue == 0 || reapAllQueues) && OpportunisticReap()) recorder.Reap();
     if (recorder.Idle()) return 1;
     static const bool drain = std::getenv("APS5_DRAIN_COMPLETION_LABELS") != nullptr;
-    const auto context = graphicsContext();
+    std::optional<Graphics::Context> contextStorage;
+    const auto& context = graphicsContext(contextStorage);
     const auto* import = Graphics::HostImportFor(context, address, bytes.size());
     if (import == nullptr) return 3;
     // A unit shadow's results in the label's unit reach the import before the store lands over
@@ -1573,7 +1615,8 @@ bool VulkanDevice::DumpSamplesOnGpu(std::uint64_t address) {
     constexpr std::size_t bytes = 15 * 16 + 8;
     if (OpportunisticReap()) recorder.Reap();
     if (state->CopiedWriterOverlaps(address, bytes) || (Graphics::Recorder::PendingCompletionLabels() != 0 && recorder.CompletionLabelIn(address, bytes))) return false;
-    const auto context = graphicsContext();
+    std::optional<Graphics::Context> contextStorage;
+    const auto& context = graphicsContext(contextStorage);
     Graphics::StorageTexture::FlushPending(address, bytes, nullptr, "occlusion counter dump", Graphics::PublishScope::PartialUnits);
     const auto* import = Graphics::HostImportFor(context, address, bytes);
     if (import == nullptr || import->address == 0) return false;
@@ -1594,7 +1637,8 @@ bool VulkanDevice::FillBuffer(std::uint64_t address, std::size_t bytes, std::spa
     // finished does not force a wait below. Before the import lookup: a completion may refresh the
     // import table. Debug aid: APS5_NO_OPPORTUNISTIC_REAP=1 skips it.
     if (OpportunisticReap()) recorder.Reap();
-    const auto context = graphicsContext();
+    std::optional<Graphics::Context> contextStorage;
+    const auto& context = graphicsContext(contextStorage);
     const Graphics::HostImport* import = Graphics::HostImportFor(context, address, bytes);
     if (import == nullptr) return false;
     // Earlier recorded work that stores into the range must land before the fill, or it would
@@ -1914,7 +1958,8 @@ VulkanDevice::CopyOutcome VulkanDevice::CopyBuffer(std::uint64_t destination, st
             outcome.readerOpen = reader->open;
         }
     }
-    const auto context = graphicsContext();
+    std::optional<Graphics::Context> contextStorage;
+    const auto& context = graphicsContext(contextStorage);
     // The ordering decision of FillBuffer, for both ranges: GPU stores recorded earlier are ordered
     // before the transfer (or the device copy below) by its barrier; a store a batch's completion
     // makes on the CPU must land before the copy reads the source or writes the destination, so
@@ -2035,9 +2080,10 @@ void VulkanDevice::Resize(std::uint32_t width, std::uint32_t height) {
     WaitIdle();
     require(width >= surface.minImageExtent.width && width <= surface.maxImageExtent.width && height >= surface.minImageExtent.height && height <= surface.maxImageExtent.height, "unsupported resized output extent");
     require((surface.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_DST_BIT) != 0 && (surface.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR) != 0 && (surface.supportedTransforms & VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR) != 0, "resized surface capabilities are unsupported");
+    const auto presentation = ChoosePresentation(state->InstanceFunction<PFN_vkGetPhysicalDeviceSurfacePresentModesKHR>("vkGetPhysicalDeviceSurfacePresentModesKHR"), state->physical, state->surface, surface);
     VkSwapchainCreateInfoKHR create{VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR};
     create.surface = state->surface;
-    create.minImageCount = surface.minImageCount;
+    create.minImageCount = presentation.images;
     create.imageFormat = VK_FORMAT_B8G8R8A8_UNORM;
     create.imageColorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
     create.imageExtent = {width, height};
@@ -2046,7 +2092,7 @@ void VulkanDevice::Resize(std::uint32_t width, std::uint32_t height) {
     create.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
     create.preTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
     create.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
-    create.presentMode = VK_PRESENT_MODE_FIFO_KHR;
+    create.presentMode = presentation.mode;
     create.oldSwapchain = state->swapchain;
     state->retiredSwapchains.reserve(state->retiredSwapchains.size() + 1);
     VkSwapchainKHR replacement = VK_NULL_HANDLE;
@@ -2706,9 +2752,14 @@ bool VulkanDevice::GraphicsPipelineLibraries() const {
 }
 
 Graphics::Context VulkanDevice::graphicsContext() const {
+    std::optional<Graphics::Context> storage;
+    return graphicsContext(storage);
+}
+
+const Graphics::Context& VulkanDevice::graphicsContext(std::optional<Graphics::Context>& storage) const {
     static const bool noCache = std::getenv("APS5_NO_CONTEXT_CACHE") != nullptr;
     if (state->contextReady && !noCache) return state->context;
-    return buildContext();
+    return storage.emplace(buildContext());
 }
 
 Graphics::Context VulkanDevice::buildContext() const {
@@ -2783,11 +2834,16 @@ VulkanDevice::IndirectDrawSupport VulkanDevice::DrawIndirectSupport() const {
 }
 
 std::optional<std::string> VulkanDevice::KnownDrawRejection(const Graphics::State& graphics, std::span<const Graphics::CompiledShader> shaders) const {
-    return Graphics::KnownValidationFailure(graphicsContext(), shaders, graphics);
+    std::optional<Graphics::Context> contextStorage;
+    return Graphics::KnownValidationFailure(graphicsContext(contextStorage), shaders, graphics);
 }
 
 void VulkanDevice::ColorMetadataPass(const Graphics::ColorMetadataPass& pass) {
     Graphics::RunColorMetadataPass(graphicsContext(), pass);
+}
+
+void VulkanDevice::DepthClearPass(const Graphics::DepthClearPass& pass) {
+    Graphics::ClearDepthSurface(graphicsContext(), pass.target, pass.depth, pass.stencil);
 }
 
 void VulkanDevice::Draw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, std::span<const Graphics::GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipe) {
@@ -2799,7 +2855,8 @@ void VulkanDevice::Draw(const Graphics::State& graphics, const Pm4::DrawParamete
     // GPU mutex); APS5_TRACE_DRAWS=1 restores them.
     static const bool trace = std::getenv("APS5_TRACE_DRAWS") != nullptr;
     if (trace) APS5_LOG_OUT("VulkanDevice::Draw indices=%u instances=%u indexSize=%u address=0x%llx shaders=%zu colorTarget=%u", draw.indexCount, draw.instanceCount, draw.indexSize, static_cast<unsigned long long>(draw.indexAddress), shaders.size(), static_cast<unsigned>(graphics.hasColorTarget));
-    const auto context = graphicsContext();
+    std::optional<Graphics::Context> contextStorage;
+    const auto& context = graphicsContext(contextStorage);
     Graphics::Draw(context, graphics, draw, shaders, snapshots, recipe);
     if (trace) APS5_LOG_CHARS_OUT("VulkanDevice::Draw complete");
 }
@@ -2944,7 +3001,7 @@ void WatchMemory(std::uint64_t programAddress) {
         return parsed;
     }();
     if (ranges.empty()) return;
-    static std::mutex mutex;
+    static AgcDriver::Mutex mutex;
     static std::deque<std::pair<std::uint64_t, std::vector<std::uint8_t>>> history;
     static bool written = false;
     std::lock_guard lock(mutex);
@@ -3247,7 +3304,8 @@ RecipeOutcome VulkanDevice::DrawFromRecipe(const Graphics::State& graphics, cons
         counters.rebuildDevice.fetch_add(1, std::memory_order_relaxed);
         return RecipeOutcome::Rebuild;
     }
-    const auto context = graphicsContext();
+    std::optional<Graphics::Context> contextStorage;
+    const auto& context = graphicsContext(contextStorage);
     const auto outcome = Graphics::DrawWithRecipe(context, graphics, draw, shaders, snapshots, *recipe);
     if (!outcome.recorded) {
         switch (outcome.miss) {
@@ -3313,7 +3371,8 @@ std::shared_ptr<PreparedDispatch> VulkanDevice::PrepareDispatch(const ShaderReco
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     const auto start = std::chrono::steady_clock::now();
     const Graphics::CompiledShader compute{ShaderRecompiler::ShaderStage::Compute, &shader, 0};
-    const auto context = graphicsContext();
+    std::optional<Graphics::Context> contextStorage;
+    const auto& context = graphicsContext(contextStorage);
     auto prepared = std::make_shared<PreparedDispatch>();
     prepared->dispatchThreads = dispatchThreads;
     // A cached build (the map locks itself) is revalidated under the mutex by the dispatch, which
@@ -3633,7 +3692,8 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
         throw std::runtime_error("Vulkan dispatch: compute push constant range exceeds device limit");
     }
     auto pushBytes = Graphics::AssemblePushConstants(shaders);
-    const auto context = graphicsContext();
+    std::optional<Graphics::Context> contextStorage;
+    const auto& context = graphicsContext(contextStorage);
     const auto* limit = state->properties.limits.maxComputeWorkGroupCount;
     if (arguments == 0 && (x > limit[0] || y > limit[1] || z > limit[2])) {
         throw std::runtime_error(workgroupLimitError(x, y, z, limit));
@@ -3921,7 +3981,8 @@ RecipeOutcome VulkanDevice::DispatchRecipe(const ShaderRecompiler::RecompileResu
     auto& counters = Recipes().kinds[hit->indirect ? 1 : 0];
     auto& d = Dispatches();
     const std::array<Graphics::CompiledShader, 1> shaders{{{ShaderRecompiler::ShaderStage::Compute, &shader, 0}}};
-    const auto context = graphicsContext();
+    std::optional<Graphics::Context> contextStorage;
+    const auto& context = graphicsContext(contextStorage);
     const auto* limit = state->properties.limits.maxComputeWorkGroupCount;
     if (arguments == 0 && (x > limit[0] || y > limit[1] || z > limit[2])) {
         throw std::runtime_error(workgroupLimitError(x, y, z, limit));

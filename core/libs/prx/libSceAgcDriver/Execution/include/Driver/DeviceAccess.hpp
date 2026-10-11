@@ -3,10 +3,9 @@
 
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include <atomic>
-#include <condition_variable>
 #include <cstddef>
+#include <cstdint>
 #include <memory>
-#include <mutex>
 
 namespace AgcDriver::DriverDetail {
 
@@ -24,6 +23,9 @@ private:
     std::atomic<std::shared_ptr<VulkanDevice>> pointer;
 };
 
+// Packets use the device shared (lock_shared, once per packet); a device replacement (lock) waits for
+// the users inside to leave while new ones wait for it. A packet enters and leaves with one atomic
+// instruction each.
 class DeviceUseGate {
 public:
     void lock_shared();
@@ -32,10 +34,10 @@ public:
     void unlock();
 
 private:
-    std::mutex mutex;
-    std::condition_variable changed;
-    std::size_t users = 0;
-    bool replacing = false;
+    // The users inside in the low bits, and Replacing from a replacement's lock to its unlock;
+    // whoever waits sleeps on the word.
+    static constexpr std::uint32_t Replacing = 0x80000000u;
+    std::atomic<std::uint32_t> state{0};
 };
 
 }

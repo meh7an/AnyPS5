@@ -23,6 +23,16 @@ std::optional<DrawVerdict> Driver::precheckDraw(const QueueState& queue, const S
         localDevice->ColorMetadataPass(*pass);
         return DrawVerdict::Drawn;
     }
+    if (const auto clear = Graphics::DecodeDepthClearPass(queue)) {
+        require(!drawParameters.indirect, "indirect depth/stencil clear passes are unsupported");
+        GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
+        std::lock_guard gpuLock(GuestMemory::GpuMutex());
+        if (device == nullptr) device = std::make_shared<VulkanDevice>();
+        const std::shared_ptr<VulkanDevice> localDevice = device;
+        recordLabelsForPacket(localDevice.get(), submission.queue);
+        localDevice->DepthClearPass(*clear);
+        return DrawVerdict::Drawn;
+    }
     rejected = Graphics::DepthMaintenanceRejection(queue);
     if (!rejected.empty()) return DrawVerdict::Rejected;
     static const bool traceIndirectEnabled = std::getenv("APS5_TRACE_INDIRECT_DRAWS") != nullptr;

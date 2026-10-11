@@ -2,6 +2,7 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_PERFORMANCETIMER_HPP
 
 #include <algorithm>
+#include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -14,6 +15,8 @@
 #include <stdexcept>
 #include <string_view>
 #include <utility>
+#include "prx/libc/include/HostThreadSlot.hpp"
+#include "prx/libc/include/general/LogMacros.hpp"
 
 namespace AgcDriver {
 
@@ -204,7 +207,7 @@ private:
         return std::chrono::duration<double, std::milli>(elapsed).count();
     }
 
-    std::mutex mutex;
+    AgcDriver::Mutex mutex;
     bool localMetrics = false;
     std::map<std::pair<std::string_view, std::string_view>, Metric> metrics;
     std::map<std::pair<std::string_view, std::string_view>, Metric> asyncMetrics;
@@ -236,33 +239,34 @@ private:
 
 class PerformanceContext {
 public:
-    explicit PerformanceContext(FrameTiming* frame) : previous(current) {
-        current = frame;
+    explicit PerformanceContext(FrameTiming* frame) : previous(Current()) {
+        Slot::Set(frame);
     }
 
     PerformanceContext(const PerformanceContext&) = delete;
     PerformanceContext& operator=(const PerformanceContext&) = delete;
 
     ~PerformanceContext() {
-        current = previous;
+        Slot::Set(previous);
     }
 
     static FrameTiming* Current() {
-        return current;
+        return Slot::Get();
     }
 
 private:
-    inline static thread_local FrameTiming* current = nullptr;
+    struct CurrentTag {};
+    using Slot = HostThreadSlot<FrameTiming*, CurrentTag>;
+
     FrameTiming* previous;
 };
 
 class PerformanceTimer {
 public:
     explicit PerformanceTimer(const char* scope) : frame(PerformanceContext::Current()), scope(scope) {
-        if (frame != nullptr) {
-            total = frame->Get(scope, "total");
-        }
-        if (frame != nullptr) start = Clock::now();
+        if (frame == nullptr) return;
+        total = frame->Get(scope, "total");
+        start = Clock::now();
         previous = start;
     }
 

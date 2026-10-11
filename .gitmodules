@@ -28,6 +28,9 @@
 [submodule "3rdparty/stb"]
 	path = 3rdparty/stb
 	url = https://github.com/nothings/stb.git
+[submodule "3rdparty/mimalloc"]
+	path = 3rdparty/mimalloc
+	url = https://github.com/microsoft/mimalloc.git
 [submodule "3rdparty/libjpeg-turbo"]
 	path = 3rdparty/libjpeg-turbo
 	url = https://github.com/libjpeg-turbo/libjpeg-turbo.git

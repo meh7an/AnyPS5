@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/BufferCopy.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
@@ -31,7 +32,7 @@ void Driver::countCopy(int path, std::size_t bytes, std::chrono::steady_clock::t
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     if (!profile || path < 0 || path >= CopyPaths) return;
     using Outcome = VulkanDevice::CopyOutcome;
-    static std::mutex countsMutex;
+    static AgcDriver::Mutex countsMutex;
     static std::uint64_t counts[CopyPaths] = {};
     static std::uint64_t refused[Outcome::Refusals] = {};
     static std::uint64_t cpuBytes = 0, gpuBytes = 0, aliasedBytes = 0, syncs = 0, settledBySignal = 0, sourceWaits = 0;

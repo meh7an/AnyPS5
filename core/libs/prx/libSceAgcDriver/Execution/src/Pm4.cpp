@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libc/include/General.hpp"
 #include "prx/libc/include/PreciseWait.hpp"
@@ -767,7 +768,6 @@ std::uint32_t ReadDrawCount(const DrawParameters::IndirectDraw& indirect) {
 }
 
 DrawParameters ResolveDraw(std::span<const std::uint32_t> packet, const QueueState& queue) {
-    Validate(packet, 0);
     if (IndirectDrawOpcode((packet[0] >> 8u) & 0xffu)) return resolveIndirectDraw(packet, queue);
     if (((packet[0] >> 8u) & 0xffu) == 0x2d) {
         const auto offset = queue.userConfig.find(0x24a);

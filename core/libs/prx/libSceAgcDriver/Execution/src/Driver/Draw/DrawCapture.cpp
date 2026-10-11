@@ -5,12 +5,43 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "Optimization/ResourceProgram.hpp"
+#include <array>
+#include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 
 namespace AgcDriver::DriverDetail {
 
-ShaderRecompiler::RecompileResult Driver::materializeDrawStage(std::size_t i, std::uint32_t pushOffset, const QueueState& queue, const Submission& submission, const std::vector<DrawProgram>& programs, const Graphics::State& graphics, const ShaderRecompiler::ShaderPixelStageInfo& pixel, const std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>>& vertexInfos, std::vector<ShaderRecompiler::MemoryRegion>& memory, const std::vector<ShaderRecompiler::LinkedProgram>& linked, const Pm4::DrawParameters& drawParameters, const std::shared_ptr<VulkanDevice>& localDevice, ShaderMemory& shaderMemory, std::vector<StageCapture>& stageCaptures, std::vector<bool>& recompiled, bool drawHit, const std::vector<std::shared_ptr<DispatchVariant>>& matched, const std::vector<std::vector<ShaderRecompiler::MemoryRegion>>& matchedRegions, bool profile, std::uint64_t dumpTarget, std::uint64_t dumpSlot1, std::uint64_t& captures, DrawPhaseTiming& phaseTiming, std::array<double, DrawDriverPhaseCount>& phaseMs, std::string& rejected) {
+namespace {
+
+// APS5_PROFILE_DRAW_PHASES: materializeDrawStage's own parts per stage, every 10 s.
+struct StageTimes {
+    enum Part { Invocation, Capture, Regions, RecompileHit, RecompileMiss, Count };
+    std::array<double, Count> us{};
+    std::array<std::uint64_t, Count> calls{};
+    std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
+};
+
+StageTimes& stageTimes() {
+    static StageTimes times;
+    return times;
+}
+
+void reportStageTimes() {
+    auto& times = stageTimes();
+    const auto now = std::chrono::steady_clock::now();
+    if (now - times.lastReport < std::chrono::seconds(10)) return;
+    times.lastReport = now;
+    const auto avg = [&](StageTimes::Part part) { return times.calls[part] != 0 ? times.us[part] / static_cast<double>(times.calls[part]) : 0.0; };
+    std::fprintf(stderr, "[stage-compile] %llu stages (10 s), us per stage: invocation %.2f, capture %.2f, regions %.2f, recompile %.2f on %llu memo hits / %.2f on %llu misses\n", static_cast<unsigned long long>(times.calls[StageTimes::Invocation]), avg(StageTimes::Invocation), avg(StageTimes::Capture), avg(StageTimes::Regions), avg(StageTimes::RecompileHit), static_cast<unsigned long long>(times.calls[StageTimes::RecompileHit]), avg(StageTimes::RecompileMiss), static_cast<unsigned long long>(times.calls[StageTimes::RecompileMiss]));
+    times.us = {};
+    times.calls = {};
+}
+
+}
+
+std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDrawStage(std::size_t i, std::uint32_t pushOffset, const QueueState& queue, const Submission& submission, const std::vector<DrawProgram>& programs, const Graphics::State& graphics, const ShaderRecompiler::ShaderPixelStageInfo& pixel, const std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>>& vertexInfos, std::vector<ShaderRecompiler::MemoryRegion>& memory, const std::vector<ShaderRecompiler::LinkedProgram>& linked, const Pm4::DrawParameters& drawParameters, const std::shared_ptr<VulkanDevice>& localDevice, ShaderMemory& shaderMemory, std::vector<StageCapture>& stageCaptures, std::vector<bool>& recompiled, bool drawHit, bool wantRegions, const std::vector<std::shared_ptr<DispatchVariant>>& matched, const std::vector<std::vector<ShaderRecompiler::MemoryRegion>>& matchedRegions, bool profile, std::uint64_t dumpTarget, std::uint64_t dumpSlot1, std::uint64_t& captures, DrawPhaseTiming& phaseTiming, std::array<double, DrawDriverPhaseCount>& phaseMs, std::string& rejected) {
     PerformanceTimer timing("Shader.DrawStage");
     using Stage = ShaderRecompiler::ShaderStage;
     phaseTiming.Phase(DrawRowVectors);
@@ -24,8 +55,18 @@ ShaderRecompiler::RecompileResult Driver::materializeDrawStage(std::size_t i, st
         ShaderRecompiler::GraphicsCompileContext{program.firstUserSgpr, linked, graphics.stages.mesh, graphics.stages.tessellation, {drawParameters.indexAddress, drawParameters.indexCount, drawParameters.indexSize, drawParameters.instanceCount}}
     };
     const auto waitedBefore = traceCapSync() || profile ? Graphics::Recorder::ThreadWaitedMs() : 0.0;
+    static const bool subPhases = std::getenv("APS5_PROFILE_DRAW_PHASES") != nullptr;
+    auto lap = subPhases ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const auto part = [&](StageTimes::Part which) {
+        if (!subPhases) return;
+        const auto now = std::chrono::steady_clock::now();
+        stageTimes().us[which] += std::chrono::duration<double, std::micro>(now - lap).count();
+        ++stageTimes().calls[which];
+        lap = now;
+    };
     const auto invocation = InvocationFor(*program.snapshot, program.codeOffset, request);
     timing.Mark("prepared_invocation");
+    part(StageTimes::Invocation);
     auto& stageCapture = stageCaptures[i];
     stageCapture.forgetSerial = GuestMemory::ForgetSerial();
     stageCapture.pushOffset = pushOffset;
@@ -33,10 +74,12 @@ ShaderRecompiler::RecompileResult Driver::materializeDrawStage(std::size_t i, st
         const SampledReadScope sampling(evidenceReads);
         return shaderMemory.Capture(invocation);
     }();
+    part(StageTimes::Capture);
 
-    stageCapture.regions = shaderMemory.TakeRecentRegions();
+    if (wantRegions) stageCapture.regions = shaderMemory.TakeRecentRegions();
     recompiled[i] = true;
-    memory = shaderMemory.Regions();
+    shaderMemory.Regions(memory);
+    part(StageTimes::Regions);
 
     if (drawHit) {
         for (std::size_t j = 0; j < programs.size(); ++j) {
@@ -75,11 +118,17 @@ ShaderRecompiler::RecompileResult Driver::materializeDrawStage(std::size_t i, st
     phaseTiming.Phase(DrawRowCapture);
 
     timing.Mark("capture_resources");
-    stageCapture.compiled = invocation.Materialize(*capture);
+    if (subPhases) lap = std::chrono::steady_clock::now();
+    bool memoHit = false;
+    stageCapture.compiled = invocation.Materialize(*capture, &memoHit);
     timing.Mark("materialize");
-    ShaderRecompiler::RecompileResult result = *stageCapture.compiled;
+    if (subPhases) {
+        part(memoHit ? StageTimes::RecompileHit : StageTimes::RecompileMiss);
+        reportStageTimes();
+    }
     phaseTiming.Phase(DrawRowRecompile);
-    return result;
+    // Shared, not copied: the result is immutable (a copy cost a few dozen allocations per stage).
+    return stageCapture.compiled;
 }
 
 void Driver::cacheDrawStages(bool useDrawEntries, bool drawHit, const Pm4::DrawParameters& drawParameters, const std::optional<Graphics::IndirectDrawPath>& indirectCpu, const std::vector<DrawProgram>& programs, const std::vector<StageCapture>& stageCaptures, const std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>>& vertexInfos, const std::vector<std::vector<Graphics::DecodeRead>>& decodeReads, bool verifyHit, const std::vector<std::shared_ptr<DispatchVariant>>& matched, std::vector<std::shared_ptr<DispatchVariant>>& fresh, std::uint64_t drawKey, bool registerKey, const std::shared_ptr<const DrawDecode>& decode, DrawPhaseTiming& phaseTiming) {
@@ -97,7 +146,7 @@ void Driver::cacheDrawStages(bool useDrawEntries, bool drawHit, const Pm4::DrawP
             if (vertexInfos[i]) variant->vertexInfo = std::make_shared<const ShaderRecompiler::ShaderVertexStageInfo>(*vertexInfos[i]);
 
             std::vector<ShaderRecompiler::MemoryRegion> regions(stageCapture.regions.begin(), stageCapture.regions.end());
-            for (const auto& read : decodeReads[i]) regions.push_back({read.address, std::as_bytes(std::span(read.bytes))});
+            for (const auto& read : decodeReads[i]) regions.push_back({read.address, read.Bytes()});
             std::stable_sort(regions.begin(), regions.end(), [](const ShaderRecompiler::MemoryRegion& a, const ShaderRecompiler::MemoryRegion& b) { return a.guestAddress < b.guestAddress; });
             for (const auto& region : regions) {
                 variant->runs.emplace_back(region.guestAddress, region.guestAddress + region.bytes.size());

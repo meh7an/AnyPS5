@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include "ThreadOwned.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PlaceholderImages.hpp"
@@ -113,7 +114,7 @@ struct CachedTexture {
 // eviction takes the back. APS5_NO_TEXTURE_HASH=1 finds entries by scanning the list (the index is
 // still kept), the linear lookup of before.
 struct TextureCache {
-    std::mutex mutex;
+    AgcDriver::Mutex mutex;
     std::list<CachedTexture> entries;
     std::unordered_map<TextureKey, std::list<CachedTexture>::iterator, TextureKeyHash> index;
     std::unordered_multimap<const StorageTexture*, std::list<CachedTexture>::iterator> views;
@@ -378,7 +379,7 @@ void logLookup(const LookupRecord& record) {
     log.push_back(record);
 }
 
-std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& resource, std::uint32_t mip, std::uint64_t guestBytes = 0);
+std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& resource, std::uint32_t mip, std::uint64_t guestBytes = 0, bool depthSurface = false);
 
 std::uint64_t heldBytes(const StorageTexture& image) {
     return std::max<std::uint64_t>(image.AllocationBytes(), image.GuestBytes());
@@ -425,7 +426,7 @@ std::uint64_t DepthCopyMinBytes() {
 // they were when it failed (the allocation generation): pages committed later, or another surface
 // at the address, get a fresh attempt.
 struct StorageFailures {
-    std::mutex mutex;
+    AgcDriver::Mutex mutex;
     std::map<std::pair<std::uint64_t, std::uint64_t>, std::uint64_t> generations;
 };
 
@@ -519,10 +520,13 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
         return depth;
     }
     const auto depthBitsWidth = words.size() >= 4 ? ShaderRecompiler::DepthBitsTextureWidth(words[1], words[3]) : 0u;
-    if (depthBitsWidth == 32u) {
-        char text[160];
-        std::snprintf(text, sizeof(text), "AGC graphics: 32-bit integer read of the depth-layout texture 0x%llx, which is no depth surface drawn with, is not implemented", static_cast<unsigned long long>(resource.baseAddress));
-        throw std::runtime_error(text);
+    // No depth surface was drawn at this address, so guest memory holds the plane: the shader reads
+    // the bits of a float sample, so the texture is sampled as 32-bit float.
+    constexpr auto float32 = static_cast<std::uint32_t>(ShaderRecompiler::IrBufferFormat::Format32Float);
+    if (depthBitsWidth == 32u && resource.format != float32) {
+        auto bits = resource;
+        bits.format = float32;
+        return cachedTexture(context, words, bits, components, guestBytes, depthCompare);
     }
     constexpr auto unorm16 = static_cast<std::uint32_t>(ShaderRecompiler::IrBufferFormat::Format16UNorm);
     if (depthBitsWidth == 16u && resource.format != unorm16) {
@@ -735,7 +739,7 @@ struct CachedStorageTexture {
 
 // As TextureCache: use order with a hash index by key, plus one by image for StorageImageCached.
 struct StorageTextureCache {
-    std::mutex mutex;
+    AgcDriver::Mutex mutex;
     std::list<CachedStorageTexture> entries;
     std::unordered_map<StorageKey, std::list<CachedStorageTexture>::iterator, StorageKeyHash> index;
     std::unordered_map<const StorageTexture*, std::list<CachedStorageTexture>::iterator> byImage;
@@ -788,11 +792,11 @@ void evictStorage(StorageTextureCache& cache, std::list<CachedStorageTexture>::i
 // mode): the image holds the whole mip chain, and render targets in the same memory attach to it.
 std::array<std::uint32_t, 8> SurfaceKey(const Context& context, const GuestTextureResource& resource) {
     // Guest formats that store in the same Vulkan format share the image (views carry the difference).
-    return {static_cast<std::uint32_t>(resource.baseAddress | resource.pipeBankXor), static_cast<std::uint32_t>(resource.baseAddress >> 32u), resource.width, resource.height, (resource.depthOrLastArray << 16u) | (resource.mipCount & 0xffffu), (static_cast<std::uint32_t>(resource.tileMode) << 12u) | (static_cast<std::uint32_t>(resource.dimension) << 20u), resource.baseArray, static_cast<std::uint32_t>(StorageFormatForGuest(context, resource.format))};
+    return {static_cast<std::uint32_t>(resource.baseAddress | resource.pipeBankXor), static_cast<std::uint32_t>(resource.baseAddress >> 32u), resource.width, resource.height, (resource.depthOrLastArray << 16u) | (resource.mipCount & 0xffffu), (static_cast<std::uint32_t>(resource.tileMode) << 12u) | (static_cast<std::uint32_t>(SurfaceDimension(resource)) << 20u), resource.baseArray, static_cast<std::uint32_t>(StorageFormatForGuest(context, resource.format))};
 }
 
 struct ExtendedSurfaces {
-    std::mutex mutex;
+    AgcDriver::Mutex mutex;
     std::map<std::array<std::uint32_t, 8>, std::uint32_t> levels;
     std::atomic<bool> any{false};
 };
@@ -828,8 +832,8 @@ GuestTextureResource StorageSurface(const Context& context, const GuestTextureRe
 }
 
 // `guestBytes` is the surface size when the caller described the surface already (0: described here).
-std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& viewed, std::uint32_t mip, std::uint64_t guestBytes) {
-    if (DepthSurfaceAt(viewed.baseAddress)) {
+std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& viewed, std::uint32_t mip, std::uint64_t guestBytes, bool depthSurface) {
+    if (!depthSurface && viewed.tileMode == TextureTileMode::kZ64KBX && DepthSurfaceAt(viewed.baseAddress)) {
         char text[112];
         std::snprintf(text, sizeof(text), "AGC graphics: storage image access to depth/stencil surface 0x%llx is not implemented", static_cast<unsigned long long>(viewed.baseAddress));
         throw std::runtime_error(text);
@@ -867,7 +871,11 @@ std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std
     // import buffer without the flush hook. The flush is recorded ahead of the upload in the batch.
     if (guestBytes == 0) guestBytes = DescribeSurface(resource).guestBytes;
     if (StorageTexture::FlushPending(resource.baseAddress, static_cast<std::size_t>(guestBytes), nullptr, "storage image creation", PublishScope::None) && profile) start = LookupOutcomes::Add(LookupOutcomes::PendingFlush, start);
-    CachedStorageTexture entry{key, mip, std::make_shared<StorageTexture>(context, *context.detiler, resource, mip)};
+    // A one-slice array is made as the 2D surface it is (SurfaceDimension), so a render target in
+    // the memory can attach to the image; array descriptors view it through ArrayView.
+    auto made = resource;
+    made.dimension = SurfaceDimension(resource);
+    CachedStorageTexture entry{key, mip, std::make_shared<StorageTexture>(context, *context.detiler, made, mip)};
     // The constructor's upload may have recorded into the open batch (a GPU clear, a direct
     // detile) before the image could keep itself (no weak_from_this yet): the batch keeps it here,
     // so an eviction or a failed view before it ran cannot destroy a referenced image.
@@ -1163,7 +1171,7 @@ constexpr std::size_t BuildPhaseCount = static_cast<std::size_t>(ShaderResources
 constexpr std::array<const char*, BuildPhaseCount> BuildPhaseNames{"bindings", "precollect", "guest memory upload", "descriptors", "stage A", "images", "bda", "stage B"};
 
 struct BuildProfile {
-    std::mutex mutex;
+    AgcDriver::Mutex mutex;
     std::array<double, BuildPhaseCount> ms{};
     std::uint64_t builds = 0;
 };
@@ -1514,7 +1522,7 @@ void ShaderResources::buildComplete() {
                         write.pImageInfo = images.data() + images.size();
                         for (const auto index : binding.imageAllocations) {
                             if (index == std::numeric_limits<std::size_t>::max()) images.push_back(absentImage(binding.layout.binding));
-                            else images.push_back({VK_NULL_HANDLE, storageAtomic64[index] ? storageTextures[index]->Atomic64View(storageMips[index], storageFirstLayer[index]) : storageAtomic[index] ? storageTextures[index]->AtomicView(storageMips[index], storageFirstLayer[index]) : storageTextures[index]->StorageView(storageMips[index], storageFirstLayer[index]), VK_IMAGE_LAYOUT_GENERAL});
+                            else images.push_back({VK_NULL_HANDLE, storageAtomic64[index] ? storageTextures[index]->Atomic64View(storageMips[index], storageFirstLayer[index]) : storageAtomic[index] ? storageTextures[index]->AtomicView(storageMips[index], storageFirstLayer[index]) : storageArrayView[index] ? storageTextures[index]->ArrayView(storageMips[index]) : storageTextures[index]->StorageView(storageMips[index], storageFirstLayer[index]), VK_IMAGE_LAYOUT_GENERAL});
                         }
                         Require(binding.imageAllocations.size() == binding.layout.descriptorCount, "descriptor allocations disagree with compact binding");
                         break;
@@ -1603,7 +1611,7 @@ void ShaderResources::noteReusable() {
     captureValidation();
     reusable = false;
     directRegions.clear();
-    if (guestMemory.HasCopiedWrites() || HoldsLease() || usesBda || (bda != nullptr && LoopGuardEnabled())) return;
+    if (touchesDepthSurface || guestMemory.HasCopiedWrites() || HoldsLease() || usesBda || (bda != nullptr && LoopGuardEnabled())) return;
     if (TemplateDataRefresh() && std::any_of(allocations.begin(), allocations.end(), [](const Allocation& allocation) { return allocation.buffer != nullptr && !allocation.guest && allocation.size > MaxRefreshBytes; })) return;
     const auto regions = guestMemory.DirectRegions();
     if (!regions.has_value()) return;
@@ -1629,7 +1637,7 @@ bool ShaderResources::NeverReusable(std::span<const CompiledShader> shaders) {
 
 // APS5_PROFILE_DRAW: the per-device descriptor caches' counters, every 10 s.
 void ShaderResources::reportDescriptorCaches() const {
-    static std::mutex reportMutex;
+    static AgcDriver::Mutex reportMutex;
     static auto lastReport = std::chrono::steady_clock::now();
     const auto now = std::chrono::steady_clock::now();
     std::lock_guard lock(reportMutex);
@@ -1638,7 +1646,7 @@ void ShaderResources::reportDescriptorCaches() const {
     const auto descriptors = context.descriptorCache != nullptr ? context.descriptorCache->Counters() : DescriptorCache::Stats{};
     const auto samplerHits = context.samplerCache != nullptr ? context.samplerCache->Hits() : 0;
     const auto samplerMisses = context.samplerCache != nullptr ? context.samplerCache->Misses() : 0;
-    AgcDriver::ProfilePrint_nid_no_patch("[descriptors] layouts %llu hits / %llu created, sets %llu from %llu pools and %llu dedicated pools, samplers %llu hits / %llu created\n", static_cast<unsigned long long>(descriptors.layoutHits), static_cast<unsigned long long>(descriptors.layoutMisses), static_cast<unsigned long long>(descriptors.sets), static_cast<unsigned long long>(descriptors.pools), static_cast<unsigned long long>(descriptors.dedicatedPools), static_cast<unsigned long long>(samplerHits), static_cast<unsigned long long>(samplerMisses));
+    AgcDriver::ProfilePrint_nid_no_patch("[descriptors] layouts %llu hits / %llu created, sets %llu from %llu pools and %llu dedicated pools, transient sets %llu from %llu pools (%llu resets), samplers %llu hits / %llu created\n", static_cast<unsigned long long>(descriptors.layoutHits), static_cast<unsigned long long>(descriptors.layoutMisses), static_cast<unsigned long long>(descriptors.sets), static_cast<unsigned long long>(descriptors.pools), static_cast<unsigned long long>(descriptors.dedicatedPools), static_cast<unsigned long long>(descriptors.transientSets), static_cast<unsigned long long>(descriptors.transientPools), static_cast<unsigned long long>(descriptors.transientResets), static_cast<unsigned long long>(samplerHits), static_cast<unsigned long long>(samplerMisses));
 }
 
 template<typename TVisitor>
@@ -1695,6 +1703,10 @@ std::vector<std::uint32_t> ShaderResources::ContentKey(const CompiledShader& sha
     key.reserve(8u + shader.program->bindings.size() * 12u);
     VisitContentKey(shader, dataWords, movableBuffers, [&](std::uint32_t word) { key.push_back(word); });
     return key;
+}
+
+void ShaderResources::AppendContentKey(std::vector<std::uint32_t>& key, const CompiledShader& shader, bool dataWords, bool movableBuffers) {
+    VisitContentKey(shader, dataWords, movableBuffers, [&](std::uint32_t word) { key.push_back(word); });
 }
 
 bool MatchesContentKey(const CompiledShader& shader, std::span<const std::uint32_t> key) {
@@ -2374,7 +2386,7 @@ struct ChurnCounts {
 
 // Dispatch keys and draw keys are counted apart: what churns a draw's key decides the draw steps.
 struct ChurnProfile {
-    std::mutex mutex;
+    AgcDriver::Mutex mutex;
     std::unordered_map<std::uint64_t, ResourceCache::Key> lastByVariant;
     ChurnCounts dispatch;
     ChurnCounts draws;
@@ -2587,12 +2599,13 @@ ResourceCache& SharedResourceCache() {
     return *cache;
 }
 
-DescriptorCache::DescriptorCache(const Context& context) : context(context), destroyLayout(context.Function<PFN_vkDestroyDescriptorSetLayout>("vkDestroyDescriptorSetLayout")), destroyPool(context.Function<PFN_vkDestroyDescriptorPool>("vkDestroyDescriptorPool")), freeSets(context.Function<PFN_vkFreeDescriptorSets>("vkFreeDescriptorSets")) {}
+DescriptorCache::DescriptorCache(const Context& context) : context(context), destroyLayout(context.Function<PFN_vkDestroyDescriptorSetLayout>("vkDestroyDescriptorSetLayout")), destroyPool(context.Function<PFN_vkDestroyDescriptorPool>("vkDestroyDescriptorPool")), freeSets(context.Function<PFN_vkFreeDescriptorSets>("vkFreeDescriptorSets")), resetPool(context.Function<PFN_vkResetDescriptorPool>("vkResetDescriptorPool")) {}
 
 DescriptorCache::~DescriptorCache() {
     for (const auto pool : pools) destroyPool(context.device, pool, nullptr);
     for (const auto pool : updateAfterBindPools) destroyPool(context.device, pool, nullptr);
     for (const auto pool : dedicated) destroyPool(context.device, pool, nullptr);
+    for (const auto& entry : transientPools) destroyPool(context.device, entry.pool, nullptr);
     for (const auto& [key, layout] : layouts) destroyLayout(context.device, layout, nullptr);
 }
 
@@ -2625,6 +2638,103 @@ std::uint32_t SetDescriptorLimit(const VkPhysicalDeviceLimits& limits, VkDescrip
 constexpr std::uint32_t ChainPoolSets = 1024;
 constexpr std::array<VkDescriptorPoolSize, 4> ChainPoolSizes{{{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4096}, {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1024}, {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1024}, {VK_DESCRIPTOR_TYPE_SAMPLER, 512}}};
 constexpr std::array<VkDescriptorPoolSize, 4> ChainPoolCreateSizes{{{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4096 + 2}, {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1024}, {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1024}, {VK_DESCRIPTOR_TYPE_SAMPLER, 512}}};
+// A transient pool: four chain pools' worth, so a frame's draw sets (a few thousand) fill few pools.
+constexpr std::uint32_t TransientPoolScale = 4;
+
+bool transientSetsEnabled() {
+    static const bool disabled = std::getenv("APS5_NO_TRANSIENT_SETS") != nullptr;
+    return !disabled;
+}
+}
+
+bool DescriptorCache::fitsChainPool(std::span<const VkDescriptorPoolSize> sizes) {
+    for (const auto& size : sizes) {
+        const auto capacity = std::find_if(ChainPoolSizes.begin(), ChainPoolSizes.end(), [&](const auto& item) { return item.type == size.type; });
+        if (capacity == ChainPoolSizes.end() || size.descriptorCount > capacity->descriptorCount) return false;
+    }
+    return true;
+}
+
+void DescriptorCache::retireTransient(std::size_t index) {
+    auto& entry = transientPools[index];
+    entry.full = true;
+    if (entry.live != 0) return;
+    // No set of it lives (every owner was kept until its batch completed): whole again.
+    static_cast<void>(resetPool(context.device, entry.pool, 0));
+    entry.full = false;
+    entry.sets = 0;
+    entry.descriptors = {};
+    ++stats.transientResets;
+    try {
+        resetTransient.push_back(index);
+    } catch (...) {
+        // Not reused then; it stays allocated until the cache goes.
+    }
+}
+
+DescriptorCache::SetAllocation DescriptorCache::AllocateTransient(VkDescriptorSetLayout layout, std::span<const VkDescriptorPoolSize> sizes) {
+    if (!transientSetsEnabled()) return Allocate(layout, sizes);
+    if (!fitsChainPool(sizes)) return {};
+    // The set's needs by chain pool type (fitsChainPool found every type there).
+    std::array<std::uint32_t, ChainPoolSizes.size()> needs{};
+    for (const auto& size : sizes) {
+        for (std::size_t type = 0; type < ChainPoolSizes.size(); ++type) {
+            if (ChainPoolSizes[type].type == size.type) needs[type] += size.descriptorCount;
+        }
+    }
+    std::lock_guard lock(mutex);
+    const auto allocate = context.Resolved(&DeviceFunctions::allocateDescriptorSets, "vkAllocateDescriptorSets");
+    VkDescriptorSetAllocateInfo allocation{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    allocation.descriptorSetCount = 1;
+    allocation.pSetLayouts = &layout;
+    // Two tries: the pool being filled, then (when it has no room) a reset or a new one, which
+    // holds any set the chain check above admitted.
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        if (fillingTransient == ~std::size_t{0}) {
+            if (!resetTransient.empty()) {
+                fillingTransient = resetTransient.back();
+                resetTransient.pop_back();
+            } else {
+                std::array<VkDescriptorPoolSize, ChainPoolCreateSizes.size()> poolSizes = ChainPoolCreateSizes;
+                for (auto& size : poolSizes) size.descriptorCount *= TransientPoolScale;
+                VkDescriptorPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+                poolInfo.maxSets = ChainPoolSets * TransientPoolScale;
+                poolInfo.poolSizeCount = static_cast<std::uint32_t>(poolSizes.size());
+                poolInfo.pPoolSizes = poolSizes.data();
+                VkDescriptorPool pool = VK_NULL_HANDLE;
+                Check(context.Function<PFN_vkCreateDescriptorPool>("vkCreateDescriptorPool")(context.device, &poolInfo, nullptr, &pool), "vkCreateDescriptorPool");
+                try {
+                    transientPools.push_back({pool});
+                } catch (...) {
+                    destroyPool(context.device, pool, nullptr);
+                    throw;
+                }
+                ++stats.transientPools;
+                fillingTransient = transientPools.size() - 1;
+            }
+        }
+        auto& entry = transientPools[fillingTransient];
+        bool room = entry.sets < ChainPoolSets * TransientPoolScale;
+        for (std::size_t type = 0; type < needs.size(); ++type) room = room && entry.descriptors[type] + needs[type] <= ChainPoolSizes[type].descriptorCount * TransientPoolScale;
+        if (room) {
+            allocation.descriptorPool = entry.pool;
+            VkDescriptorSet set = VK_NULL_HANDLE;
+            const auto result = allocate(context.device, &allocation, &set);
+            if (result == VK_SUCCESS) {
+                ++entry.live;
+                ++entry.sets;
+                for (std::size_t type = 0; type < needs.size(); ++type) entry.descriptors[type] += needs[type];
+                ++stats.transientSets;
+                return {set, entry.pool, true};
+            }
+            if (result != VK_ERROR_OUT_OF_POOL_MEMORY && result != VK_ERROR_FRAGMENTED_POOL) Check(result, "vkAllocateDescriptorSets");
+        }
+        // No room: no longer filled, and reset once its last set is released.
+        const auto full = fillingTransient;
+        fillingTransient = ~std::size_t{0};
+        retireTransient(full);
+    }
+    return {};
 }
 
 DescriptorCache::SetAllocation DescriptorCache::Allocate(VkDescriptorSetLayout layout, std::span<const VkDescriptorPoolSize> sizes, bool updateAfterBind) {
@@ -2692,7 +2802,19 @@ void DescriptorCache::Free(const SetAllocation& allocation) noexcept {
         destroyPool(context.device, allocation.pool, nullptr);
         return;
     }
-    static_cast<void>(freeSets(context.device, allocation.pool, 1, &allocation.set));
+    if (!allocation.transient) {
+        static_cast<void>(freeSets(context.device, allocation.pool, 1, &allocation.set));
+        return;
+    }
+    // A handful of pools: the scan is shorter than a map lookup.
+    for (std::size_t index = 0; index < transientPools.size(); ++index) {
+        auto& entry = transientPools[index];
+        if (entry.pool != allocation.pool) continue;
+        if (entry.live != 0) --entry.live;
+        // The pool being filled stays filled; a full one is whole again once its last set went.
+        if (entry.live == 0 && entry.full) retireTransient(index);
+        return;
+    }
 }
 
 DescriptorCache::Stats DescriptorCache::Counters() const {
@@ -3147,8 +3269,10 @@ void ShaderResources::resolveImageBinding(const ShaderRecompiler::DescriptorBind
             const auto guestBytes = record != nullptr && record->decoded ? record->guestBytes : DescribeSurface(resource).guestBytes;
             std::shared_ptr<Texture> texture;
             const bool depthCompare = !binding.imageDepthCompare.empty() && binding.imageDepthCompare.at(element);
+            const bool depthArray = resource.tileMode == TextureTileMode::kZ64KBX && resource.dimension == TextureDimension::k2DArray && resource.depthOrLastArray != 0 && DepthSurfaceAt(resource.baseAddress);
+            if (depthArray) touchesDepthSurface = true;
             if (previousSampled.texture != nullptr && previousSampled.depthCompare == depthCompare && words.size() == 8 && std::equal(words.begin(), words.end(), previousSampled.words.begin())) texture = previousSampled.texture;
-            if (texture == nullptr && record != nullptr && record->texture != nullptr) {
+            if (texture == nullptr && !depthArray && record != nullptr && record->texture != nullptr) {
                 texture = fastTexture(*record);
                 (texture != nullptr ? counters.fastHits : counters.fastMisses).fetch_add(1, std::memory_order_relaxed);
             }
@@ -3205,11 +3329,26 @@ void ShaderResources::resolveImageBinding(const ShaderRecompiler::DescriptorBind
         Require(resource.minLod <= mip * 256u, "guest storage texture descriptor clamps its minimum LOD above the level it addresses, which is not implemented");
         const auto guestBytes = record != nullptr && record->decoded ? record->guestBytes : DescribeSurface(resource).guestBytes;
         // The same surface as the previous element: its image was just looked up and refreshed.
+        const bool depthSurface = resource.tileMode == TextureTileMode::kZ64KBX && DepthSurfaceAt(resource.baseAddress);
+        if (depthSurface) touchesDepthSurface = true;
         if (sameAsPrevious && StorageDedupeEnabled()) storageTextures.push_back(storageTextures.back());
-        else storageTextures.push_back(cachedStorageTexture(context, words, resource, mip, guestBytes));
+        else {
+            storageTextures.push_back(cachedStorageTexture(context, words, resource, mip, guestBytes, depthSurface));
+            if (depthSurface) TransferDepthSurface(context, resource.baseAddress, *storageTextures.back(), true);
+        }
         storageMips.push_back(mip);
         storageKeys.push_back(resource.dccAddress);
-        storageFirstLayer.push_back(firstLayer);
+        // The image may have been made for the other kind of the same surface (SurfaceDimension):
+        // the view follows the shape the shader declares.
+        bool useFirstLayer = firstLayer;
+        bool useArray = false;
+        if (const auto& own = storageTextures.back()->Descriptor(); own.dimension != resource.dimension && SurfaceDimension(own) == SurfaceDimension(resource)) {
+            const bool wantArray = binding.imageShape.has_value() ? *binding.imageShape == ShaderRecompiler::DescriptorImageShape::Image2DArray : resource.dimension == TextureDimension::k2DArray;
+            useFirstLayer = own.dimension == TextureDimension::k2DArray && !wantArray;
+            useArray = own.dimension == TextureDimension::k2D && wantArray;
+        }
+        storageFirstLayer.push_back(useFirstLayer);
+        storageArrayView.push_back(useArray);
         // Images the shader only reads have nothing to store back.
         storageWritten.push_back(element >= binding.imageWritten.size() || binding.imageWritten[element]);
         storageAtomic.push_back(element < binding.imageAtomic.size() && binding.imageAtomic[element]);
@@ -3291,28 +3430,30 @@ ShaderResources::DrawBindings::~DrawBindings() {
     if (cache != nullptr && allocation.set != VK_NULL_HANDLE) cache->Free(allocation);
 }
 
-std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::MovedReadOnlyBuffers(std::span<const CompiledShader> shaders, Recorder& recorder) const {
-    std::vector<MovedBuffer> moved;
-    if (_set == VK_NULL_HANDLE || usesBda) return moved;
+bool ShaderResources::MovedReadOnlyBuffers(std::span<const CompiledShader> shaders, Recorder& recorder, std::vector<MovedBuffer>& moved) const {
+    // At most one entry per allocation: reserved with the first one, not grown push by push.
+    moved.clear();
+    if (_set == VK_NULL_HANDLE || usesBda) return true;
     for (const auto& shader : shaders) {
-        if (shader.program == nullptr) return std::nullopt;
+        if (shader.program == nullptr) return false;
         for (const auto& binding : shader.program->bindings) {
             if (DataRole(binding.role)) {
                 const auto kept = std::find_if(bindings.begin(), bindings.end(), [&](const Binding& item) { return item.layout.binding == binding.binding; });
-                if (kept == bindings.end() || kept->allocations.size() != 1) return std::nullopt;
+                if (kept == bindings.end() || kept->allocations.size() != 1) return false;
                 const auto index = kept->allocations.front();
                 const auto& item = allocations[index];
-                if (item.guest || item.buffer == nullptr || item.size != binding.guestDescriptor.size() * sizeof(std::uint32_t)) return std::nullopt;
+                if (item.guest || item.buffer == nullptr || item.size != binding.guestDescriptor.size() * sizeof(std::uint32_t)) return false;
                 const bool patched = std::any_of(dataPatches.begin(), dataPatches.end(), [&](const DataPatch& patch) { return patch.allocation == index; });
                 const bool same = !item.dataWords.empty() ? item.dataWords == binding.guestDescriptor : !patched && std::memcmp(item.buffer->Bytes().data(), binding.guestDescriptor.data(), item.size) == 0;
                 if (same) continue;
-                if (item.dataWords.empty() && patched) return std::nullopt;
+                if (item.dataWords.empty() && patched) return false;
+                if (moved.empty()) moved.reserve(allocations.size());
                 moved.push_back({index, 0, item.size, binding.guestDescriptor});
                 continue;
             }
             if (binding.role != ShaderRecompiler::DescriptorRole::GuestBuffers) continue;
             const auto kept = std::find_if(bindings.begin(), bindings.end(), [&](const Binding& item) { return item.layout.binding == binding.binding; });
-            if (kept == bindings.end() || kept->allocations.size() != binding.count || binding.guestDescriptor.size() != static_cast<std::size_t>(binding.count) * 4u) return std::nullopt;
+            if (kept == bindings.end() || kept->allocations.size() != binding.count || binding.guestDescriptor.size() != static_cast<std::size_t>(binding.count) * 4u) return false;
             for (std::uint32_t element = 0; element < binding.count; ++element) {
                 const auto* words = binding.guestDescriptor.data() + static_cast<std::size_t>(element) * 4u;
                 const ShaderRecompiler::ShaderBufferResource descriptor{{words[0], words[1], words[2], words[3]}};
@@ -3323,73 +3464,229 @@ std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::MovedR
                 const bool empty = size == 0 || address == 0;
                 if (!item.guest) {
                     if (empty) continue;
-                    return std::nullopt;
+                    return false;
                 }
                 if (item.address == address && item.size == size) continue;
                 const bool written = element >= binding.bufferWritten.size() || binding.bufferWritten[element];
-                if (written || empty || item.written || size > context.limits.maxStorageBufferRange) return std::nullopt;
+                if (written || empty || item.written || size > context.limits.maxStorageBufferRange) return false;
                 const auto begin = address - item.adjustment;
                 const auto bytes = static_cast<std::size_t>(GuestBufferMemory::ViewBytes(size, item.adjustment));
-                if (!GuestMemory::Accessible(reinterpret_cast<const void*>(begin), bytes)) return std::nullopt;
-                if (guestMemory.WritesOverlap(begin, bytes) || recorder.PendingWriteOverlaps(begin, bytes) || PendingStorageOverlaps(begin, bytes, nullptr) || AnyShadowedOverlaps(begin, bytes)) return std::nullopt;
+                if (!GuestMemory::Accessible(reinterpret_cast<const void*>(begin), bytes)) return false;
+                if (guestMemory.WritesOverlap(begin, bytes) || recorder.PendingWriteOverlaps(begin, bytes) || PendingStorageOverlaps(begin, bytes, nullptr) || AnyShadowedOverlaps(begin, bytes)) return false;
+                if (moved.empty()) moved.reserve(allocations.size());
                 moved.push_back({index, address, static_cast<std::size_t>(size)});
             }
         }
     }
-    return moved;
+    return true;
+}
+
+namespace {
+
+// APS5_PROFILE_DRAW_PHASES: PrepareDrawBindings' parts per call, every 10 s.
+struct BindingParts {
+    enum Part { Moved, Snapshots, Checks, Collect, Lookup, Make, Allocate, Copy, Write, Count };
+    static constexpr const char* Names[Count] = {"moved copies", "setup", "checks", "collect", "lookup", "make", "set allocation", "set build", "set writes+keep"};
+    std::array<double, Count> us{};
+    std::uint64_t calls = 0, sets = 0, moved = 0, reused = 0, made = 0, uploaded = 0;
+    // Snapshot ranges by size: <=256, <=1K, <=4K, <=16K, <=64K, larger (count and bytes).
+    std::array<std::uint64_t, 6> sizeCount{};
+    std::array<std::uint64_t, 6> sizeBytes{};
+    void noteSize(std::size_t bytes) {
+        const std::size_t bucket = bytes <= 256 ? 0 : bytes <= 1024 ? 1 : bytes <= 4096 ? 2 : bytes <= 16384 ? 3 : bytes <= 65536 ? 4 : 5;
+        ++sizeCount[bucket];
+        sizeBytes[bucket] += bytes;
+    }
+    std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
+    std::chrono::steady_clock::time_point lap{};
+    bool enabled = std::getenv("APS5_PROFILE_DRAW_PHASES") != nullptr;
+    void mark(Part part) {
+        if (!enabled) return;
+        const auto now = std::chrono::steady_clock::now();
+        us[part] += std::chrono::duration<double, std::micro>(now - lap).count();
+        lap = now;
+    }
+    void report() {
+        const auto now = std::chrono::steady_clock::now();
+        if (now - lastReport < std::chrono::seconds(10)) return;
+        lastReport = now;
+        std::string line;
+        for (std::size_t i = 0; i < Count; ++i) {
+            char text[64];
+            std::snprintf(text, sizeof(text), " %s %.2f", Names[i], calls != 0 ? us[i] / static_cast<double>(calls) : 0.0);
+            line += text;
+        }
+        std::string sizes;
+        static constexpr const char* SizeNames[6] = {"<=256", "<=1K", "<=4K", "<=16K", "<=64K", ">64K"};
+        for (std::size_t i = 0; i < sizeCount.size(); ++i) {
+            char text[64];
+            std::snprintf(text, sizeof(text), " %s %llu (%.1f MiB)", SizeNames[i], static_cast<unsigned long long>(sizeCount[i]), static_cast<double>(sizeBytes[i]) / 1048576.0);
+            sizes += text;
+        }
+        std::fprintf(stderr, "[draw-bindings] %llu calls (%llu made a set; %llu moved buffers, %llu copies uploaded, %llu snapshots reused, %llu made), us per call:%s; snapshot sizes:%s\n", static_cast<unsigned long long>(calls), static_cast<unsigned long long>(sets), static_cast<unsigned long long>(moved), static_cast<unsigned long long>(uploaded), static_cast<unsigned long long>(reused), static_cast<unsigned long long>(made), line.c_str(), sizes.c_str());
+        us = {};
+        calls = sets = moved = reused = made = uploaded = 0;
+        sizeCount = {};
+        sizeBytes = {};
+    }
+};
+
+BindingParts& bindingParts() {
+    static BindingParts parts;
+    return parts;
+}
+
+// A list whose first N elements live on the stack: the per-draw scratch lists of
+// PrepareDrawBindings hold a handful of entries, and a heap allocation each cost more than filling them.
+template <typename T, std::size_t N>
+class InlineList {
+public:
+    void push_back(const T& value) {
+        if (count < N) {
+            local[count] = value;
+        } else {
+            if (heap.empty()) heap.assign(local.begin(), local.end());
+            heap.push_back(value);
+        }
+        ++count;
+    }
+    T* data() { return count <= N ? local.data() : heap.data(); }
+    std::size_t size() const { return count; }
+    bool empty() const { return count == 0; }
+    T& operator[](std::size_t index) { return data()[index]; }
+    T* begin() { return data(); }
+    T* end() { return data() + count; }
+
+private:
+    std::array<T, N> local{};
+    std::vector<T> heap;
+    std::size_t count = 0;
+};
+
+}
+
+std::size_t ShaderResources::DrawUploadLimit() {
+    // APS5_DRAW_UPLOAD_MAX=<bytes>: the largest snapshot copied into the recorder's upload chunk on
+    // every draw (larger ones keep their own buffer, reused while the range is unchanged); 0 gives
+    // every snapshot and moved data buffer its own buffer as before.
+    static const std::size_t limit = [] {
+        const char* value = std::getenv("APS5_DRAW_UPLOAD_MAX");
+        return value != nullptr ? static_cast<std::size_t>(std::strtoull(value, nullptr, 10)) : std::size_t{4096};
+    }();
+    return limit;
 }
 
 std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved) const {
     if (_set == VK_NULL_HANDLE || usesBda) return {};
-    const auto reads = guestMemory.InPlaceReads();
+    auto& parts = bindingParts();
+    if (parts.enabled) {
+        parts.lap = std::chrono::steady_clock::now();
+        ++parts.calls;
+    }
+    struct Report {
+        BindingParts& parts;
+        ~Report() {
+            if (parts.enabled) parts.report();
+        }
+    } report{parts};
+    const auto uploadLimit = DrawUploadLimit();
     auto result = std::make_shared<DrawBindings>();
-    std::vector<std::size_t> selected;
+    InlineList<std::size_t, 16> selected;
+    // A copy the draw reads: a slice of the upload chunk when small enough, else a buffer of its own.
+    const auto ownCopy = [&](std::uint64_t address, std::size_t bytes) {
+        if (bytes <= uploadLimit) {
+            auto slice = recorder.DrawUpload(bytes);
+            if (parts.enabled) ++parts.uploaded;
+            return DrawBindings::Snapshot{address, std::move(slice.buffer), slice.offset, bytes};
+        }
+        return DrawBindings::Snapshot{address, std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT), 0, bytes};
+    };
+    // At most one snapshot per allocation: reserved with the first one, not grown push by push.
+    const auto keep = [&](DrawBindings::Snapshot snapshot) {
+        if (result->snapshots.empty()) result->snapshots.reserve(allocations.size());
+        result->snapshots.push_back(std::move(snapshot));
+    };
     for (std::size_t index = 0; index < allocations.size(); ++index) {
         const auto& item = allocations[index];
         const auto override = std::find_if(moved.begin(), moved.end(), [&](const MovedBuffer& entry) { return entry.allocation == index; });
         if (override != moved.end() && !override->words.empty()) {
-            auto buffer = std::make_shared<Buffer>(context, override->size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-            std::memcpy(buffer->Bytes().data(), override->words.data(), override->size);
+            if (parts.enabled) parts.mark(BindingParts::Snapshots);
+            auto snapshot = ownCopy(0, override->size);
+            const auto bytes = snapshot.Bytes();
+            std::memcpy(bytes.data(), override->words.data(), override->size);
             for (const auto& patch : dataPatches) {
-                if (patch.allocation == index && patch.byte < override->size) buffer->Bytes()[patch.byte] = static_cast<std::byte>(patch.adjustment);
+                if (patch.allocation == index && patch.byte < override->size) bytes[patch.byte] = static_cast<std::byte>(patch.adjustment);
             }
             selected.push_back(index);
-            result->snapshots.push_back({0, std::move(buffer)});
+            keep(std::move(snapshot));
+            if (parts.enabled) {
+                ++parts.moved;
+                parts.mark(BindingParts::Moved);
+            }
             continue;
         }
         std::uint64_t address = item.address;
         std::size_t size = item.size;
+        if (parts.enabled) parts.mark(BindingParts::Snapshots);
         if (override != moved.end()) {
             address = override->address;
             size = override->size;
-        } else {
-            if (!item.guest || item.written || guestMemory.WritesOverlap(item.address, item.size)) continue;
-            const bool direct = std::any_of(reads.begin(), reads.end(), [&](const auto& range) { return item.address >= range.first && item.address < range.second && item.size <= range.second - item.address; });
-            if (!direct || recorder.PendingWriteOverlaps(item.address, item.size)) continue;
+        } else if (!item.guest || item.written || guestMemory.WritesOverlap(item.address, item.size) || !guestMemory.ReadInPlace(item.address, item.size) || recorder.PendingWriteOverlaps(item.address, item.size)) {
+            if (parts.enabled) parts.mark(BindingParts::Checks);
+            continue;
         }
+        if (parts.enabled) parts.mark(BindingParts::Checks);
         const auto begin = address - item.adjustment;
         const auto bytes = static_cast<std::size_t>(GuestBufferMemory::ViewBytes(size, item.adjustment));
-        const auto registryGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
-        const auto generation = GuestMemory::CollectWrites(begin, bytes);
-        auto buffer = recorder.ReusableDrawSnapshot(begin, bytes, Recorder::SnapshotUse::Storage, nullptr, generation);
-        if (buffer == nullptr) {
-            buffer = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
-            std::memcpy(buffer->Bytes().data(), reinterpret_cast<const void*>(begin), bytes);
-            recorder.KeepDrawSnapshot(begin, bytes, generation, registryGeneration, buffer);
+        if (parts.enabled) parts.noteSize(bytes);
+        if (bytes <= uploadLimit) {
+            // Copied on every draw: no collect, no lookup, nothing kept between draws.
+            auto snapshot = ownCopy(begin, bytes);
+            std::memcpy(snapshot.Bytes().data(), reinterpret_cast<const void*>(begin), bytes);
+            keep(std::move(snapshot));
+        } else {
+            const auto registryGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+            const auto generation = GuestMemory::CollectWrites(begin, bytes);
+            if (parts.enabled) parts.mark(BindingParts::Collect);
+            auto buffer = recorder.ReusableDrawSnapshot(begin, bytes, Recorder::SnapshotUse::Storage, nullptr, generation);
+            if (parts.enabled) parts.mark(BindingParts::Lookup);
+            if (buffer == nullptr) {
+                buffer = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+                std::memcpy(buffer->Bytes().data(), reinterpret_cast<const void*>(begin), bytes);
+                recorder.KeepDrawSnapshot(begin, bytes, generation, registryGeneration, buffer);
+                if (parts.enabled) ++parts.made;
+            } else if (parts.enabled) {
+                ++parts.reused;
+            }
+            keep({begin, std::move(buffer), 0, bytes});
         }
         selected.push_back(index);
-        result->snapshots.push_back({begin, std::move(buffer)});
         CaptureTrace::Log("draw-snapshot batch=%llu address=%llx bytes=%zu", static_cast<unsigned long long>(recorder.Submissions() + 1), static_cast<unsigned long long>(begin), bytes);
+        if (parts.enabled) parts.mark(BindingParts::Make);
     }
+    if (parts.enabled) parts.mark(BindingParts::Snapshots);
     if (selected.empty()) return {};
     Require(context.descriptorCache != nullptr, "draw snapshots require a descriptor cache");
-    std::map<VkDescriptorType, std::uint32_t> counts;
-    for (const auto& binding : bindings) counts[binding.layout.descriptorType] += binding.layout.descriptorCount;
-    std::vector<VkDescriptorPoolSize> sizes;
-    for (const auto& [type, count] : counts) sizes.push_back({type, count});
+    // The set's descriptor counts by type (a handful of types; no map per draw).
+    std::array<VkDescriptorPoolSize, 16> sizes{};
+    std::size_t sizeCount = 0;
+    for (const auto& binding : bindings) {
+        auto* const last = sizes.data() + sizeCount;
+        auto* found = std::find_if(sizes.data(), last, [&](const VkDescriptorPoolSize& entry) { return entry.type == binding.layout.descriptorType; });
+        if (found == last) {
+            Require(sizeCount < sizes.size(), "a draw set uses more descriptor types than expected");
+            *found = {binding.layout.descriptorType, 0};
+            ++sizeCount;
+        }
+        found->descriptorCount += binding.layout.descriptorCount;
+    }
     result->cache = context.descriptorCache;
-    result->allocation = result->cache->Allocate(_layout, sizes);
+    result->allocation = result->cache->AllocateTransient(_layout, std::span<const VkDescriptorPoolSize>(sizes.data(), sizeCount));
     Require(result->allocation.set != VK_NULL_HANDLE, "draw snapshot descriptor allocation failed");
+    if (parts.enabled) {
+        ++parts.sets;
+        parts.mark(BindingParts::Allocate);
+    }
     auto buffers = descriptorBuffers;
     auto writes = descriptorWrites;
     std::vector<std::size_t> snapshotIndices(allocations.size(), selected.size());
@@ -3405,12 +3702,14 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
             const auto snapshotIndex = snapshotIndices[binding.allocations[element]];
             if (snapshotIndex == selected.size()) continue;
             const auto& snapshot = result->snapshots[snapshotIndex];
-            buffers[offset + element] = {snapshot.buffer->Handle(), 0, snapshot.buffer->Bytes().size()};
+            buffers[offset + element] = {snapshot.buffer->Handle(), snapshot.offset, snapshot.bytes};
         }
     }
+    if (parts.enabled) parts.mark(BindingParts::Copy);
     context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets")(context.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
     recorder.Keep(result);
     for (const auto& snapshot : result->snapshots) recorder.KeepBytes(snapshot.buffer.get(), snapshot.buffer->Bytes().size());
+    if (parts.enabled) parts.mark(BindingParts::Write);
     return result;
 }
 
@@ -3427,7 +3726,17 @@ bool SkipWriteBack() {
 }
 }
 
+void ShaderResources::copyWrittenDepthSurfaces() {
+    if (!touchesDepthSurface) return;
+    for (std::size_t index = 0; index < storageTextures.size(); ++index) {
+        if (!storageWritten[index] || (index != 0 && storageTextures[index] == storageTextures[index - 1])) continue;
+        const auto address = storageTextures[index]->Descriptor().baseAddress;
+        if (storageTextures[index]->Descriptor().tileMode == TextureTileMode::kZ64KBX && DepthSurfaceAt(address)) TransferDepthSurface(context, address, *storageTextures[index], false);
+    }
+}
+
 void ShaderResources::WriteBack() {
+    copyWrittenDepthSurfaces();
     WriteBackBuffers();
     if (SkipWriteBack()) return;
     for (std::size_t index = 0; index < storageTextures.size(); ++index) {
@@ -3440,6 +3749,7 @@ void ShaderResources::MarkGpuWrites(Recorder& recorder) {
     // alike, and an address-based build's whole leased heaps), before the writes: a CPU store into
     // one of them (the copy HLE) must not land before the recorded work read it.
     recorder.NotePendingReads(guestMemory.InPlaceReads(), guestMemory.HoldsLease() ? Recorder::ReadKind::AddressBased : Recorder::ReadKind::DispatchElement);
+    copyWrittenDepthSurfaces();
     if (SkipWriteBack()) return;
     for (std::size_t index = 0; index < storageTextures.size(); ++index) {
         if (storageWritten[index]) storageTextures[index]->MarkDirty();

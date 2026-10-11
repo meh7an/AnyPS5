@@ -2,6 +2,7 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_SHADERRESOURCES_HPP
 
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BdaResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Sampler.hpp"
@@ -73,8 +74,17 @@ public:
     struct SetAllocation {
         VkDescriptorSet set = VK_NULL_HANDLE;
         VkDescriptorPool pool = VK_NULL_HANDLE;
+        // From a transient pool (AllocateTransient): Free only counts it released.
+        bool transient = false;
     };
     SetAllocation Allocate(VkDescriptorSetLayout layout, std::span<const VkDescriptorPoolSize> sizes, bool updateAfterBind = false);
+    // The same for a set that lives as long as one batch (a draw's own set, see
+    // ShaderResources::PrepareDrawBindings): taken from pools made without FREE_DESCRIPTOR_SET (a
+    // bump allocation in the driver, where a freeable pool searches its free list on every
+    // allocation) and never freed one by one: a pool counts its live sets, and once it is full and
+    // its last set was released it is reset whole and filled again. APS5_NO_TRANSIENT_SETS=1 takes
+    // these sets from the freeable chain as before.
+    SetAllocation AllocateTransient(VkDescriptorSetLayout layout, std::span<const VkDescriptorPoolSize> sizes);
     void Free(const SetAllocation& allocation) noexcept;
     // APS5_PROFILE_DRAW counters: layouts served from the map / created, sets allocated, pools opened.
     struct Stats {
@@ -83,19 +93,42 @@ public:
         std::uint64_t sets = 0;
         std::uint64_t pools = 0;
         std::uint64_t dedicatedPools = 0;
+        std::uint64_t transientSets = 0;
+        std::uint64_t transientPools = 0;
+        std::uint64_t transientResets = 0;
     };
     Stats Counters() const;
 
 private:
+    // Whether a freeable pool holds `sizes` at all (the chain's pool sizes).
+    static bool fitsChainPool(std::span<const VkDescriptorPoolSize> sizes);
     Context context;
     PFN_vkDestroyDescriptorSetLayout destroyLayout;
     PFN_vkDestroyDescriptorPool destroyPool;
     PFN_vkFreeDescriptorSets freeSets;
-    mutable std::mutex mutex;
+    PFN_vkResetDescriptorPool resetPool;
+    mutable AgcDriver::Mutex mutex;
     std::map<std::vector<std::uint32_t>, VkDescriptorSetLayout> layouts;
     std::vector<VkDescriptorPool> pools;
     std::vector<VkDescriptorPool> updateAfterBindPools;
     std::vector<VkDescriptorPool> dedicated;
+    // Transient pools (AllocateTransient): their live set counts, the sets and descriptors (by
+    // chain pool type) taken since the last reset, whether each is full (no longer filled; reset
+    // once its live count drops to zero), the one being filled and the reset ones waiting. The
+    // pool counts its own capacity: a driver may hand out sets past the pool's sizes, and a pool
+    // that never reports full would never be reset.
+    struct TransientPool {
+        VkDescriptorPool pool = VK_NULL_HANDLE;
+        std::uint32_t live = 0;
+        std::uint32_t sets = 0;
+        std::array<std::uint32_t, 4> descriptors{};
+        bool full = false;
+    };
+    // Marks the pool full, resetting it at once when no set of it lives.
+    void retireTransient(std::size_t index);
+    std::vector<TransientPool> transientPools;
+    std::size_t fillingTransient = ~std::size_t{0};
+    std::vector<std::size_t> resetTransient;
     Stats stats;
 };
 
@@ -121,23 +154,36 @@ public:
         DrawBindings() = default;
         DrawBindings(const DrawBindings&) = delete;
         DrawBindings& operator=(const DrawBindings&) = delete;
+        // The copy a draw reads instead of guest memory: the snapshot's own buffer (reused while the
+        // range is unchanged), or the recorder's upload chunk it was copied into, at `offset`.
         struct Snapshot {
             std::uint64_t address;
             std::shared_ptr<Buffer> buffer;
+            VkDeviceSize offset = 0;
+            std::size_t bytes = 0;
+            std::span<std::byte> Bytes() const { return buffer->Bytes().subspan(static_cast<std::size_t>(offset), bytes); }
         };
         DescriptorCache* cache = nullptr;
         DescriptorCache::SetAllocation allocation;
         std::vector<Snapshot> snapshots;
         ~DrawBindings();
     };
+    // A data buffer's new words point into the draw's compiled stage (its binding's guest
+    // descriptor), which outlives the draw's PrepareDrawBindings, the only reader.
     struct MovedBuffer {
         std::size_t allocation;
         std::uint64_t address;
         std::size_t size;
-        std::vector<std::uint32_t> words;
+        std::span<const std::uint32_t> words;
     };
     std::shared_ptr<DrawBindings> PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved = {}) const;
-    std::optional<std::vector<MovedBuffer>> MovedReadOnlyBuffers(std::span<const CompiledShader> shaders, Recorder& recorder) const;
+    // The largest draw snapshot (and moved data buffer) PrepareDrawBindings copies into the
+    // recorder's upload chunk on every draw instead of keeping a buffer of its own (see
+    // Recorder::DrawUpload); APS5_DRAW_UPLOAD_MAX, default 4096, 0 keeps every copy in its own buffer.
+    static std::size_t DrawUploadLimit();
+    // Whether this object can serve the stages with only read-only buffers moved; `moved` (emptied
+    // first) receives them, at most one entry per allocation.
+    bool MovedReadOnlyBuffers(std::span<const CompiledShader> shaders, Recorder& recorder, std::vector<MovedBuffer>& moved) const;
     void WriteBack();
     // Deferred completion: MarkGpuWrites registers the results the recorded work leaves on the GPU
     // (storage images stay there; buffer ranges are noted so CPU reads wait); WriteBackBuffers runs
@@ -177,6 +223,8 @@ public:
     // (their count and size remain): a compute template then serves dispatches whose constants
     // differ, and the hit refreshes its data buffers with the dispatch's words (RefreshData).
     static std::vector<std::uint32_t> ContentKey(const CompiledShader& shader, bool dataWords = true, bool movableBuffers = false);
+    // ContentKey's words appended to `key`.
+    static void AppendContentKey(std::vector<std::uint32_t>& key, const CompiledShader& shader, bool dataWords = true, bool movableBuffers = false);
     // Records the shader's ShaderData and FlattenedSrt words into this object's data buffers
     // (vkCmdUpdateBuffer, a transfer write the caller's pre-dispatch barrier makes visible; a
     // buffer already holding the words is left alone). Returns whether anything was recorded. With
@@ -357,6 +405,7 @@ private:
     void prepareAddressBindings(std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots);
     VkDescriptorBufferInfo descriptor(Allocation& allocation);
     void noteReusable();
+    void copyWrittenDepthSurfaces();
     void reportDescriptorCaches() const;
     // What a sampled texture was proved current against when the build (or the last full Revalidate)
     // looked it up, so the next Revalidate can repeat the proof from write stamps and the DCC keys
@@ -440,6 +489,7 @@ private:
     std::vector<std::uint32_t> storageMips;
     std::vector<std::uint64_t> storageKeys;
     std::vector<bool> storageFirstLayer;
+    std::vector<bool> storageArrayView;
     std::vector<bool> storageWritten;
     std::vector<bool> storageAtomic;
     std::vector<bool> storageAtomic64;
@@ -455,6 +505,9 @@ private:
     };
     std::vector<SamplerSource> samplerSources;
     bool reusable = false;
+    // A storage image over a depth surface (DepthSurface.hpp TransferDepthSurface) or a sampled
+    // array of depth surfaces: their copies are recorded per build, so the set is never reused.
+    bool touchesDepthSurface = false;
     std::vector<DirectRegion> directRegions;
     std::vector<ValidatedSurface> validatedTextures;
     // The pending registry's serial at the last Revalidate that proved this object, taken before
@@ -543,7 +596,7 @@ private:
             return static_cast<std::size_t>(hash);
         }
     };
-    mutable std::mutex mutex;
+    mutable AgcDriver::Mutex mutex;
     std::list<std::pair<Key, std::shared_ptr<ShaderResources>>> entries;
     std::unordered_map<Key, decltype(entries)::iterator, KeyHash> index;
 };

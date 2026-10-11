@@ -130,6 +130,7 @@ std::vector<std::uint32_t> GuestSamplersDescriptor(const std::vector<std::uint32
         }
         if (i == 0u) {
             dwordCount = value.dwordCount;
+            result.reserve(resources.size() * dwordCount);
         } else if (value.dwordCount != dwordCount) {
             fail("DescriptorBindingBuilder::Populate guest sampler descriptors have inconsistent widths");
         }

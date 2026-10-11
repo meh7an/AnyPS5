@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/WorkerSampler.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -31,7 +32,7 @@ std::jthread workerSamplerThread;
 struct Sampler {
     HANDLE target = nullptr;
     std::string path;
-    std::mutex mutex;
+    AgcDriver::Mutex mutex;
     std::map<std::uint64_t, std::pair<std::uint64_t, std::uint64_t>> counts;
     std::uint64_t samples = 0;
 

@@ -2,6 +2,7 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_DRIVER_DRIVER_HPP
 
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/Submission.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/DeviceAccess.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Packets/PacketHistory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Dispatch/DispatchCache.hpp"
@@ -108,6 +109,15 @@ private:
     void dispatch(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::uint64_t indirectArguments = 0);
     void verifyDataHit(const ShaderSnapshot& snapshot, std::size_t codeOffset, ShaderRecompiler::RecompileRequest request, std::span<const ShaderRecompiler::MemoryRegion> memory, std::uint64_t address, const DispatchVariant& variant, std::span<const std::uint32_t> liveWords, const ShaderRecompiler::RecompileResult& patched);
     static bool drawEntries();
+    // Whether this draw uses the draw cache (key, lookup, insertion). A title that writes its per-draw
+    // constants to fresh addresses every frame changes the user data words of every draw, so the
+    // register key never repeats and the cache only costs: a probe window of lookups hitting under
+    // 1 in 32 parks the cache for DrawCacheParkDraws draws, then another window probes again.
+    // APS5_DRAW_CACHE_ALWAYS=1 never parks it.
+    bool drawCacheActive();
+    void noteDrawCacheLookup(bool hit);
+    static constexpr std::uint32_t DrawCacheProbeLookups = 2048;
+    static constexpr std::uint64_t DrawCacheParkDraws = 60000;
     static bool verifyDrawEntries();
     static bool registerKeyEnabled();
     static bool verifyDrawRecipe();
@@ -119,12 +129,20 @@ private:
     void attachDrawRecipe(std::uint64_t key, const std::vector<std::shared_ptr<DispatchVariant>>& stages, std::shared_ptr<const DrawRecipe> recipe);
     void reportDrawCache(DrawEntryCounters& counters);
     static std::uint64_t drawRegisterKey(const QueueState& queue, const ShaderRegistry& registry, std::uint64_t deviceSerial);
+    // The draw key without the user data words of the pixel, geometry and hull programs.
+    static std::uint64_t structuralDrawKey(const QueueState& queue, const ShaderRegistry& registry, std::uint64_t deviceSerial);
+    // APS5_TRACE_DRAWKEY: how often a missed draw key differs from an earlier draw's only in the
+    // user data words, and in which of them.
+    static void traceDrawKey(const QueueState& queue, const ShaderRegistry& registry, std::uint64_t deviceSerial, bool hit);
+    // APS5_TRACE_DRAW_RELOC: for a draw repeating an earlier draw's structural key, how its stages'
+    // captured memory compares with the earlier draw's (moved, same words, differing words).
+    static void traceDrawRelocation(std::uint64_t structuralKey, const std::vector<DrawProgram>& programs, const std::vector<StageCapture>& captures);
     static bool sameVertexInfo(const ShaderRecompiler::ShaderVertexStageInfo& a, const ShaderRecompiler::ShaderVertexStageInfo& b);
     static bool sameDecode(const DrawDecode& a, const DrawDecode& b);
     std::shared_ptr<DrawDecode> decodeDraw(const QueueState& queue, const Submission& submission);
     void resolveDrawDecode(const QueueState& queue, const Submission& submission, std::shared_ptr<const DrawDecode>& decode, bool registerKey, std::uint64_t drawKey, bool profile);
     void lookupDraw(const Submission& submission, const std::shared_ptr<VulkanDevice>& localDevice, const Graphics::State& graphics, const ShaderRecompiler::ShaderPixelStageInfo& pixel, const std::vector<DrawProgram>& programs, const std::vector<ShaderRecompiler::ProgramRole>& roles, const std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>>& vertexInfos, bool useDrawEntries, bool registerKey, bool profile, std::uint64_t& drawKey, std::shared_ptr<DrawEntry>& entry, std::vector<std::shared_ptr<DispatchVariant>>& matched, std::vector<std::vector<ShaderRecompiler::MemoryRegion>>& matchedRegions, bool& drawHit, bool& verifyHit, DrawPhaseTiming& phaseTiming, std::array<double, DrawDriverPhaseCount>& phaseMs);
-    ShaderRecompiler::RecompileResult materializeDrawStage(std::size_t i, std::uint32_t pushOffset, const QueueState& queue, const Submission& submission, const std::vector<DrawProgram>& programs, const Graphics::State& graphics, const ShaderRecompiler::ShaderPixelStageInfo& pixel, const std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>>& vertexInfos, std::vector<ShaderRecompiler::MemoryRegion>& memory, const std::vector<ShaderRecompiler::LinkedProgram>& linked, const Pm4::DrawParameters& drawParameters, const std::shared_ptr<VulkanDevice>& localDevice, ShaderMemory& shaderMemory, std::vector<StageCapture>& stageCaptures, std::vector<bool>& recompiled, bool drawHit, const std::vector<std::shared_ptr<DispatchVariant>>& matched, const std::vector<std::vector<ShaderRecompiler::MemoryRegion>>& matchedRegions, bool profile, std::uint64_t dumpTarget, std::uint64_t dumpSlot1, std::uint64_t& captures, DrawPhaseTiming& phaseTiming, std::array<double, DrawDriverPhaseCount>& phaseMs, std::string& rejected);
+    std::shared_ptr<const ShaderRecompiler::RecompileResult> materializeDrawStage(std::size_t i, std::uint32_t pushOffset, const QueueState& queue, const Submission& submission, const std::vector<DrawProgram>& programs, const Graphics::State& graphics, const ShaderRecompiler::ShaderPixelStageInfo& pixel, const std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>>& vertexInfos, std::vector<ShaderRecompiler::MemoryRegion>& memory, const std::vector<ShaderRecompiler::LinkedProgram>& linked, const Pm4::DrawParameters& drawParameters, const std::shared_ptr<VulkanDevice>& localDevice, ShaderMemory& shaderMemory, std::vector<StageCapture>& stageCaptures, std::vector<bool>& recompiled, bool drawHit, bool wantRegions, const std::vector<std::shared_ptr<DispatchVariant>>& matched, const std::vector<std::vector<ShaderRecompiler::MemoryRegion>>& matchedRegions, bool profile, std::uint64_t dumpTarget, std::uint64_t dumpSlot1, std::uint64_t& captures, DrawPhaseTiming& phaseTiming, std::array<double, DrawDriverPhaseCount>& phaseMs, std::string& rejected);
     void cacheDrawStages(bool useDrawEntries, bool drawHit, const Pm4::DrawParameters& drawParameters, const std::optional<Graphics::IndirectDrawPath>& indirectCpu, const std::vector<DrawProgram>& programs, const std::vector<StageCapture>& stageCaptures, const std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>>& vertexInfos, const std::vector<std::vector<Graphics::DecodeRead>>& decodeReads, bool verifyHit, const std::vector<std::shared_ptr<DispatchVariant>>& matched, std::vector<std::shared_ptr<DispatchVariant>>& fresh, std::uint64_t drawKey, bool registerKey, const std::shared_ptr<const DrawDecode>& decode, DrawPhaseTiming& phaseTiming);
     static bool drawPrecheck();
     std::optional<DrawVerdict> precheckDraw(const QueueState& queue, const Submission& submission, std::span<const std::uint32_t> packet, const Pm4::DrawParameters& drawParameters, std::string& rejected, bool& traceIndirect);
@@ -271,7 +289,7 @@ private:
     void run(std::uint32_t id) noexcept;
 
     std::mutex mutex;
-    std::mutex shutdownMutex;
+    AgcDriver::Mutex shutdownMutex;
     std::condition_variable changed;
 
     std::map<std::uint32_t, QueueWorker> workers;
@@ -291,7 +309,7 @@ private:
     std::unordered_map<std::uint64_t, std::shared_ptr<DispatchEntry>> dispatchCache;
 
     std::list<std::uint64_t> dispatchOrder;
-    std::mutex dispatchCacheMutex;
+    AgcDriver::Mutex dispatchCacheMutex;
     std::uint64_t dispatchCacheHits = 0;
     std::uint64_t dispatchCacheEvictions = 0;
 
@@ -307,23 +325,30 @@ private:
 
     std::unordered_map<std::uint64_t, std::shared_ptr<DrawEntry>> drawCache;
     std::list<std::uint64_t> drawOrder;
-    std::mutex drawCacheMutex;
+    AgcDriver::Mutex drawCacheMutex;
     std::uint64_t drawCacheHits = 0, drawCacheEvictions = 0, drawCacheVariants = 0, drawCacheVariantBytes = 0;
+    // The draw cache parks itself while it does not pay (drawCacheActive): draws counted, the draw
+    // count the park lasts until, and the current probe window's lookups and hits.
+    std::atomic<std::uint64_t> drawCacheDraws{0};
+    std::atomic<std::uint64_t> drawCacheParkedUntil{0};
+    std::atomic<std::uint32_t> drawCacheWindowLookups{0};
+    std::atomic<std::uint32_t> drawCacheWindowHits{0};
+    std::atomic<std::uint64_t> drawCacheParks{0};
 
     DrawEntryCounters drawEntryCounters;
 
-    std::mutex driverPhasesMutex;
+    AgcDriver::Mutex driverPhasesMutex;
     std::array<DriverPhaseTotals, DispatchClassCount> driverPhaseTotals{};
     std::chrono::steady_clock::time_point driverPhasesReport = std::chrono::steady_clock::now();
 
-    std::mutex drawPhasesMutex;
+    AgcDriver::Mutex drawPhasesMutex;
     DrawPhaseTotals drawPhaseTotals;
 
     std::map<std::uint32_t, QueueState> queues;
     std::map<std::uint32_t, std::shared_ptr<IVideoOutput>> outputs;
     DevicePointer device;
 
-    std::mutex labelStoresMutex;
+    AgcDriver::Mutex labelStoresMutex;
     std::unordered_map<std::uint64_t, std::array<LabelStore, LabelStoreHistory>> labelStores;
 
     std::vector<std::shared_ptr<VulkanDevice>> replacedDevices;
@@ -351,7 +376,7 @@ private:
     std::atomic<std::uint64_t> evidenceReads{0};
     std::atomic<std::uint64_t> evidenceValidations{0};
 
-    std::mutex writtenBuffersMutex;
+    AgcDriver::Mutex writtenBuffersMutex;
     std::deque<WrittenBuffer> writtenBuffers;
     std::uint64_t writtenBufferSerial = 0;
     std::unordered_map<std::uint64_t, DwordEvidence> dwordEvidence;
@@ -361,7 +386,7 @@ private:
     std::atomic<std::uint64_t> observationsNoWait{0};
     std::atomic<std::uint64_t> observationsNotReached{0};
 
-    std::mutex validateMutex;
+    AgcDriver::Mutex validateMutex;
     ValidateCounters validateCounters;
 
 };

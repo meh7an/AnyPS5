@@ -56,7 +56,8 @@ public:
     static std::optional<PreparedShaderInvocation> TryCreate(const RecompileRequest& request, const std::shared_ptr<const SourceHandle>& handle, std::span<const std::uint64_t> key);
     const RecompileRequest& Request() const { return request; }
     std::shared_ptr<const ResourceCapture> Capture(const SrtRuntime& runtime) const;
-    std::shared_ptr<const RecompileResult> Materialize(const ResourceCapture& capture) const;
+    // `memoHit` (optional) reports a result memo hit.
+    std::shared_ptr<const RecompileResult> Materialize(const ResourceCapture& capture, bool* memoHit = nullptr) const;
 
 private:
     PreparedShaderInvocation(const RecompileRequest& request, const std::shared_ptr<const SourceHandle>& handle);

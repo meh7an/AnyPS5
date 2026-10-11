@@ -74,6 +74,7 @@ AgcDriver::QueueState makeState() {
     queue.context[0x114] = 0;
     queue.context[0xb4] = 0;
     queue.context[0xb5] = std::bit_cast<std::uint32_t>(1.0f);
+    // A pixel program address: unwritten, as at reset, it reads as no pixel program (PixelProgramSkipped).
     queue.shader[0x008] = 0x100;
     queue.shader[0x009] = 0;
     return queue;
@@ -120,7 +121,8 @@ void stateTests() {
     queue.context[0x1b3] = 2;
     queue.context[0x1b4] = 2;
     (void)AgcDriver::Graphics::DecodeState(queue);
-    Require(AgcDriver::Graphics::DrawRejection(queue, false).empty(), "primitive restart rejected a non-indexed draw");
+    const auto restartRejection = AgcDriver::Graphics::DrawRejection(queue, false);
+    Require(restartRejection.empty(), "primitive restart rejected a non-indexed draw: " + restartRejection);
     queue.userConfig[0x242] = 9;
     Require(AgcDriver::Graphics::DrawRejection(queue, true).find("point, line and triangle") != std::string::npos, "primitive restart was accepted for patches");
     queue.userConfig[0x242] = 6;
@@ -235,13 +237,14 @@ void stateTests() {
     // the draw key otherwise), and nothing is recorded without a log pointer.
     queue = makeState();
     std::vector<AgcDriver::Graphics::RegisterRead> log;
-    AgcDriver::Graphics::RegisterReadLog() = &log;
-    queue.context[0x1b3] = 2;
-    queue.context[0x1b4] = 2;
-    state = AgcDriver::Graphics::DecodeState(queue);
-    Require(AgcDriver::Graphics::DrawRejection(queue, true).empty(), "precheck rejected the reference state");
-    static_cast<void>(AgcDriver::Graphics::DecodePixelStageInfo(queue.context, AgcDriver::Graphics::ExportMappings(state)));
-    AgcDriver::Graphics::RegisterReadLog() = nullptr;
+    {
+        const AgcDriver::Graphics::RegisterReadLogScope logScope(&log);
+        queue.context[0x1b3] = 2;
+        queue.context[0x1b4] = 2;
+        state = AgcDriver::Graphics::DecodeState(queue);
+        Require(AgcDriver::Graphics::DrawRejection(queue, true).empty(), "precheck rejected the reference state");
+        static_cast<void>(AgcDriver::Graphics::DecodePixelStageInfo(queue.context, AgcDriver::Graphics::ExportMappings(state)));
+    }
     Require(!log.empty(), "the register facade recorded nothing");
     for (const auto read : log) Require(AgcDriver::Graphics::DrawKeyCovers(read), "DrawKeyRegisters lacks a register the decoders read: " + std::string(AgcDriver::Graphics::RegisterBankName(read.bank)) + " " + std::to_string(read.offset));
     Require(!AgcDriver::Graphics::DrawKeyCovers({AgcDriver::Graphics::RegisterBank::Context, 0x100}) && AgcDriver::Graphics::DrawKeyCovers({AgcDriver::Graphics::RegisterBank::Shader, 0xab}) && !AgcDriver::Graphics::DrawKeyCovers({AgcDriver::Graphics::RegisterBank::Shader, 0xac}), "DrawKeyRegisters coverage changed");
@@ -278,6 +281,10 @@ void stateTests() {
     queue.shader[0x008] = 0;
     queue.shader[0x009] = 0;
     Require(AgcDriver::Graphics::DrawRejection(queue, true).empty(), "a depth-only draw without a pixel program was rejected");
+    queue.shader.erase(0x008);
+    queue.shader.erase(0x009);
+    Require(AgcDriver::Graphics::PixelProgramSkipped(queue), "an unwritten pixel program address was not read as unset");
+    Require(AgcDriver::Graphics::DrawRejection(queue, true).empty(), "a depth-only draw with an unwritten pixel program was rejected");
     state = AgcDriver::Graphics::DecodeState(queue);
     Require(!state.hasColorTarget, "a depth-only draw without a pixel program decoded a color target");
     const auto unset = AgcDriver::Graphics::DecodePixelStageInfo(queue.context, AgcDriver::Graphics::ExportMappings(state), true);
@@ -890,9 +897,10 @@ void DepthStencilTests() {
     queue.context[0x10d] = 0x01000001;
     queue.context[0x200] = 0x00700711;
     std::vector<AgcDriver::Graphics::RegisterRead> log;
-    AgcDriver::Graphics::RegisterReadLog() = &log;
-    auto state = AgcDriver::Graphics::DecodeState(queue);
-    AgcDriver::Graphics::RegisterReadLog() = nullptr;
+    auto state = [&] {
+        const AgcDriver::Graphics::RegisterReadLogScope logScope(&log);
+        return AgcDriver::Graphics::DecodeState(queue);
+    }();
     for (const auto read : log) Require(AgcDriver::Graphics::DrawKeyCovers(read), "DrawKeyRegisters lacks a depth register the decoder reads: " + std::to_string(read.offset));
     queue.context[0x1b3] = 2;
     queue.context[0x1b4] = 2;
@@ -931,9 +939,10 @@ void DepthStencilTests() {
     queue.context[0x005] = 0x300;
     queue.context[0x01e] = 0x01;
     log.clear();
-    AgcDriver::Graphics::RegisterReadLog() = &log;
-    state = AgcDriver::Graphics::DecodeState(queue);
-    AgcDriver::Graphics::RegisterReadLog() = nullptr;
+    {
+        const AgcDriver::Graphics::RegisterReadLogScope logScope(&log);
+        state = AgcDriver::Graphics::DecodeState(queue);
+    }
     for (const auto read : log) Require(AgcDriver::Graphics::DrawKeyCovers(read), "DrawKeyRegisters lacks an HTILE register the decoder reads: " + std::to_string(read.offset));
     Require(state.depth->htileAddress == (0x30000ull | (1ull << 40u)), "the HTILE address was not decoded from DB_HTILE_DATA_BASE and its high byte");
     queue.context[0x010] &= ~0x20000000u;
@@ -1407,9 +1416,10 @@ void cmaskTests() {
     const auto target = DecodeColorBuffer(queue.context, 0);
     Require(target.cmaskAddress == cmaskAddress && target.cmaskBytes == cmaskMemory.size(), "the fast-clear target lost its CMASK");
     std::vector<AgcDriver::Graphics::RegisterRead> log;
-    AgcDriver::Graphics::RegisterReadLog() = &log;
-    static_cast<void>(DecodeColorBuffer(queue.context, 0));
-    AgcDriver::Graphics::RegisterReadLog() = nullptr;
+    {
+        const AgcDriver::Graphics::RegisterReadLogScope logScope(&log);
+        static_cast<void>(DecodeColorBuffer(queue.context, 0));
+    }
     Require(!log.empty(), "the register facade recorded nothing for a fast-clear target");
     for (const auto read : log) Require(AgcDriver::Graphics::DrawKeyCovers(read), "DrawKeyRegisters lacks a register the fast-clear target decode reads: " + std::to_string(read.offset));
     Require(DecodeColorBuffer(makeState().context, 0).cmaskAddress == 0, "a target without FAST_CLEAR got a CMASK");
@@ -1785,6 +1795,10 @@ VKAPI_ATTR void VKAPI_CALL mockDestroyDescriptorPool(VkDevice, VkDescriptorPool,
     --mock.live;
 }
 
+VKAPI_ATTR VkResult VKAPI_CALL mockResetDescriptorPool(VkDevice, VkDescriptorPool, VkDescriptorPoolResetFlags) {
+    return VK_SUCCESS;
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL mockAllocateDescriptorSets(VkDevice, const VkDescriptorSetAllocateInfo* info, VkDescriptorSet* sets) {
     Require(info->descriptorSetCount == 1, "exactly one descriptor set must be allocated");
     sets[0] = makeHandle<VkDescriptorSet>();
@@ -1937,6 +1951,7 @@ PFN_vkVoidFunction VKAPI_CALL mockProc(VkDevice, const char* name) {
         {"vkDestroyDescriptorSetLayout", reinterpret_cast<PFN_vkVoidFunction>(mockDestroyDescriptorSetLayout)},
         {"vkCreateDescriptorPool", reinterpret_cast<PFN_vkVoidFunction>(mockCreateDescriptorPool)},
         {"vkDestroyDescriptorPool", reinterpret_cast<PFN_vkVoidFunction>(mockDestroyDescriptorPool)},
+        {"vkResetDescriptorPool", reinterpret_cast<PFN_vkVoidFunction>(mockResetDescriptorPool)},
         {"vkAllocateDescriptorSets", reinterpret_cast<PFN_vkVoidFunction>(mockAllocateDescriptorSets)},
         {"vkFreeDescriptorSets", reinterpret_cast<PFN_vkVoidFunction>(mockFreeDescriptorSets)},
         {"vkUpdateDescriptorSets", reinterpret_cast<PFN_vkVoidFunction>(mockUpdateDescriptorSets)},

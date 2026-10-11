@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
@@ -122,7 +123,7 @@ struct ThreadSyncs {
     std::array<double, 5> waitedMs;
 };
 std::vector<ThreadSyncs> threadSyncs;
-std::mutex threadSyncsMutex;
+AgcDriver::Mutex threadSyncsMutex;
 
 // This thread's fence and timeline waits in total (Recorder::ThreadWaitedMs): a caller times a span
 // of its own work and reads the difference to learn how much of it was waiting for the GPU.
@@ -170,7 +171,7 @@ std::atomic<int> unlockedWaiters[WaiterSlots]{};
 std::atomic<int>& WaitersOf(std::uint64_t id) { return unlockedWaiters[id % WaiterSlots]; }
 // Recorders alive, by id (own mutex, taken under the GpuMutex or with nothing held): a thread that
 // released the GpuMutex around a wait learns whether its recorder still exists before touching it.
-std::mutex liveRecordersMutex;
+AgcDriver::Mutex liveRecordersMutex;
 std::vector<std::uint64_t> liveRecorders;
 std::atomic<std::uint64_t> nextRecorderId{1};
 std::atomic<std::uint64_t> samplesPassed{0};
@@ -187,7 +188,7 @@ std::atomic<std::uint64_t> dumpsQueued{0}, dumpsQueuedInPass{0}, dumpsAtOnce{0},
 struct SamplePoolCache {
     VkDevice device;
     PFN_vkDestroyQueryPool destroy;
-    std::mutex mutex;
+    AgcDriver::Mutex mutex;
     std::vector<VkQueryPool> free;
     bool closed = false;
     void put(VkQueryPool pool) {
@@ -410,7 +411,7 @@ struct ReleaseQueue {
     // Set by a joiner under `mutex` until the thread was joined: the thread leaves once the queue
     // is empty, and hand-offs meanwhile destroy inline (nothing may be queued without a taker).
     bool stop = false;
-    std::mutex joinMutex;
+    AgcDriver::Mutex joinMutex;
 };
 
 ReleaseQueue& ReleaseThreadQueue() {
@@ -533,7 +534,7 @@ bool ProcTable() {
 // instead of queueing behind a dispatch. `labelTableOwner` is the active recorder while it lives,
 // set and cleared under this mutex, so a lookup never touches a table being destroyed. Nothing
 // under this mutex takes the GPU mutex (no lock-order cycle).
-std::mutex labelTableMutex;
+AgcDriver::Mutex labelTableMutex;
 Recorder* labelTableOwner = nullptr;
 // The ranges of the calling worker's queued labels (NoteQueuedLabel, cleared by
 // ForgetQueuedLabels): the flush hook, on the same thread, has them recorded before an access that
@@ -654,12 +655,16 @@ bool SnapshotOverlaps(std::uint64_t address, std::size_t bytes) {
     return SnapshotOverlaps(snapshot.get(), address, bytes);
 }
 
-// Whether one merged range of the snapshot contains [address, end) entirely.
-bool SnapshotCovers(std::uint64_t address, std::uint64_t end) {
-    const auto snapshot = pendingWrites.load(std::memory_order_acquire);
+// Whether one merged range of `snapshot` contains [address, end) entirely.
+bool SnapshotCovers(const WriteRanges* snapshot, std::uint64_t address, std::uint64_t end) {
     if (snapshot == nullptr || snapshot->empty()) return false;
     const auto it = std::partition_point(snapshot->begin(), snapshot->end(), [&](const auto& range) { return range.second <= address; });
     return it != snapshot->end() && it->first <= address && end <= it->second;
+}
+
+bool SnapshotCovers(std::uint64_t address, std::uint64_t end) {
+    const auto snapshot = pendingWrites.load(std::memory_order_acquire);
+    return SnapshotCovers(snapshot.get(), address, end);
 }
 
 // Attribution of the pending-write syncs the hook makes (the [hooksync] line every 10 s, under
@@ -886,7 +891,7 @@ struct RecordedStoreTotals {
 };
 
 struct RecordedStoreStats {
-    std::mutex mutex;
+    AgcDriver::Mutex mutex;
     std::map<HookSyncKey, RecordedStoreTotals> byKey;
     RecordedStoreTotals totals;
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
@@ -996,11 +1001,42 @@ private:
     std::chrono::steady_clock::time_point start;
 };
 
+#ifdef _WIN32
+extern "C" {
+__declspec(dllimport) unsigned short __stdcall RtlCaptureStackBackTrace(unsigned long, unsigned long, void**, unsigned long*);
+__declspec(dllimport) int __stdcall GetModuleHandleExA(unsigned long, const char*, void**);
+__declspec(dllimport) unsigned long __stdcall GetModuleFileNameA(void*, char*, unsigned long);
+}
+#endif
+
+// APS5_TRACE_HOOK_STORE: the first accesses that store pending images and wait for the GPU, with the
+// return addresses (module-relative) of the code that made them.
+void TraceRecordedStoreAccess(std::uint64_t address, std::size_t bytes, bool store) {
+    static const bool trace = std::getenv("APS5_TRACE_HOOK_STORE") != nullptr;
+    static std::atomic<int> printed{0};
+    if (!trace || printed.fetch_add(1, std::memory_order_relaxed) >= 40) return;
+    std::string line = "[hook-store] " + std::string(store ? "store" : "read") + " 0x" + [&] { char text[32]; std::snprintf(text, sizeof(text), "%llx", static_cast<unsigned long long>(address)); return std::string(text); }() + " +" + std::to_string(bytes) + " from";
+#ifdef _WIN32
+    void* frames[16];
+    const auto count = RtlCaptureStackBackTrace(1, 16, frames, nullptr);
+    for (unsigned short i = 0; i < count; ++i) {
+        void* module = nullptr;
+        char name[260] = "?";
+        if (GetModuleHandleExA(0x6u, static_cast<const char*>(frames[i]), &module)) GetModuleFileNameA(module, name, sizeof(name));
+        const char* base = std::strrchr(name, '\\');
+        char text[300];
+        std::snprintf(text, sizeof(text), " %s+0x%llx", base ? base + 1 : name, static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(frames[i]) - reinterpret_cast<std::uintptr_t>(module)));
+        line += text;
+    }
+#endif
+    std::fprintf(stderr, "%s\n", line.c_str());
+}
+
 // GuestMemory flush hook: a CPU access to memory that recorded GPU work will write waits for that
 // work first; then storage image results pending for the range are stored. The recorder is only
 // dereferenced under the GpuMutex (it is destroyed with its device under that lock).
 void FlushForAccess(std::uint64_t address, std::size_t bytes) {
-    hookCalls.fetch_add(1, std::memory_order_relaxed);
+    if (DrawProfiled()) hookCalls.fetch_add(1, std::memory_order_relaxed);
     // A label this worker queued but has not recorded writes the range: in queue order the label
     // precedes this access, so the group is recorded first (it then notes the range as a pending
     // write of the open batch, and the check below syncs on it like any recorded store). Not from
@@ -1017,7 +1053,7 @@ void FlushForAccess(std::uint64_t address, std::size_t bytes) {
         }
     }
     if (!HookSnapshotEnabled() || SnapshotOverlaps(address, bytes)) {
-        hookLocks.fetch_add(1, std::memory_order_relaxed);
+        if (DrawProfiled()) hookLocks.fetch_add(1, std::memory_order_relaxed);
         GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Hook);
         std::lock_guard gpu(GuestMemory::GpuMutex());
         if (auto* recorder = Recorder::Active(); recorder != nullptr && recorder->PendingWriteOverlaps(address, bytes)) {
@@ -1052,6 +1088,7 @@ void FlushForAccess(std::uint64_t address, std::size_t bytes) {
         stored = StorageTexture::FlushPending(address, bytes, nullptr, "memory access", scope, &published);
     }
     if (stored || published) {
+        TraceRecordedStoreAccess(address, bytes, site == GuestMemory::ReadSite::Store);
         // Stores into imported memory were only recorded; the CPU is about to read them. The wait
         // targets the batch holding them (the open one: SyncThrough submits it) and runs with the
         // mutex released when this acquisition is the outermost; a nested hook waits locked through
@@ -1745,7 +1782,7 @@ std::atomic<std::uint64_t> timingPresents{0};
 std::atomic<std::uint64_t> presentSerial{0};
 std::atomic<std::uint64_t> timingDropped{0};
 struct TimingTotals { std::uint64_t count = 0; double ms = 0; std::uint64_t bytes = 0; };
-std::mutex timingMutex;
+AgcDriver::Mutex timingMutex;
 std::map<std::uint64_t, TimingTotals> timingByKey;
 double timingProgramMs = 0, timingClassMs = 0, timingUnionMs = 0, timingBatchMs = 0;
 std::uint64_t timingBatches = 0;
@@ -2561,6 +2598,17 @@ void Recorder::KeepDrawSnapshot(std::uint64_t address, std::size_t bytes, std::u
     pool.bytes += bytes;
 }
 
+Recorder::UploadSlice Recorder::DrawUpload(std::size_t bytes) {
+    const VkDeviceSize alignment = std::max<VkDeviceSize>(context.limits.minStorageBufferOffsetAlignment, 16);
+    auto offset = (drawUploadUsed + alignment - 1) / alignment * alignment;
+    if (drawUpload == nullptr || offset + bytes > drawUpload->Bytes().size()) {
+        drawUpload = std::make_shared<Buffer>(context, std::max(DrawUploadChunk, bytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+        offset = 0;
+    }
+    drawUploadUsed = offset + bytes;
+    return {drawUpload, offset, drawUpload->Bytes().data() + offset};
+}
+
 void Recorder::OnComplete(std::function<void()> action) {
     ensureOpen();
     open->completions.push_back(std::move(action));
@@ -2575,6 +2623,7 @@ bool Recorder::noteWrite(std::uint64_t address, std::size_t bytes, bool ownLabel
     const auto end = address + bytes;
     open->writes.emplace_back(address, end);
     open->writeNotes.push_back(++writeNoteCount);
+    if (published != nullptr && !SnapshotCovers(published.get(), address, end)) published = nullptr;
     open->writeValues.push_back(static_cast<std::int16_t>(value));
     if (!ownLabel) markOverwritten(address, end);
     // A poller waiting on this range learns that the open batch may now hold its producer.
@@ -2601,6 +2650,7 @@ void Recorder::noteWriteOn(Batch& batch, std::uint64_t address, std::size_t byte
     // moves as well, so a poller re-consults the label table for a completion label.
     batch.writes.emplace_back(address, address + bytes);
     batch.writeNotes.push_back(++writeNoteCount);
+    if (published != nullptr && !SnapshotCovers(published.get(), address, address + bytes)) published = nullptr;
     batch.writeValues.push_back(-1);
     if (!ownLabel) markOverwritten(address, address + bytes);
     if (activeRecorder == this) writeGeneration.fetch_add(1, std::memory_order_release);
@@ -2655,6 +2705,7 @@ void Recorder::publishPendingWrites() const {
         else (*merged)[out++] = {begin, end};
     }
     merged->resize(out);
+    published = merged;
     pendingWrites.store(std::move(merged), std::memory_order_release);
     publishGeneration.fetch_add(1, std::memory_order_release);
     ++snapshotRebuilds;
@@ -2670,6 +2721,8 @@ bool Recorder::overlaps(const Batch& batch, std::uint64_t address, std::uint64_t
 
 bool Recorder::PendingWriteOverlaps(std::uint64_t address, std::size_t bytes) const {
     if (bytes == 0) return false;
+    // The published union covers every batch's writes: a range clear of it is clear of them.
+    if (published != nullptr && !SnapshotOverlaps(published.get(), address, bytes)) return false;
     const auto end = address + bytes;
     if (open != nullptr && overlaps(*open, address, end)) return true;
     for (const auto& batch : inFlight) {
@@ -3115,7 +3168,7 @@ void Recorder::Submit() {
         submission.signalSemaphoreCount = 1;
         submission.pSignalSemaphores = &timeline;
     }
-    const auto submitStart = std::chrono::steady_clock::now();
+    const auto submitStart = DrawProfiled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     Check(function(queueSubmit, "vkQueueSubmit")(context.queue, 1, &submission, batch->fence), "vkQueueSubmit recorder");
     batch->submitted = true;
     batch->serial = ++submissions;
@@ -3537,7 +3590,7 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
         static double waitedMs = 0;
         static std::uint64_t waits = 0;
         static auto lastReport = std::chrono::steady_clock::now();
-        const auto waitStart = std::chrono::steady_clock::now();
+        const auto waitStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         // A fence still unsignaled here makes this a real GPU wait under the mutex (finish runs
         // under it): the [lock] line's 'locked GPU waits'.
         const bool signaledAtStart = !profile || context.Function<PFN_vkGetFenceStatus>("vkGetFenceStatus")(context.device, batch->fence) == VK_SUCCESS;
@@ -3593,7 +3646,6 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
         entry.gpuStartNs = batch->gpuStartNs;
         entry.gpuEndNs = batch->gpuEndNs;
         entry.submittedAt = batch->submittedAt;
-        entry.fenceSeenAt = std::chrono::steady_clock::now();
         entry.readGeneration = batch->readGeneration;
         entry.reads.clear();
         if (FlipReadCheck()) {
