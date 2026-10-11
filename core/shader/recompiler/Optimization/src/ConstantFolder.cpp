@@ -97,6 +97,44 @@ bool replaceBinaryIdentity(IrValue& inst, IrType type, std::uint64_t identity) {
     return false;
 }
 
+// A bitwise op on a value and itself or its complement, or with an absorbing constant: the lane
+// masks the translator builds fold this way (`~exec | exec` is all ones, and a lane's bit of all
+// ones is set), which frees the selects they guard. Operands match by identity, not structure:
+// two Ballots read in different blocks are not the same mask.
+bool foldBitwiseSelf(IrBuilder& builder, IrValue& inst) {
+    auto& lhs = resolveArg(inst, 0);
+    auto& rhs = resolveArg(inst, 1);
+    const auto opcode = inst.Opcode();
+    const std::uint32_t absorbing = opcode == IrOpcode::BitwiseOr32 ? 0xffffffffu : 0u;
+    if (opcode != IrOpcode::BitwiseXor32 && ((isImmediate(lhs, IrType::U32) && lhs.ImmediateU32() == absorbing) || (isImmediate(rhs, IrType::U32) && rhs.ImmediateU32() == absorbing))) {
+        replaceWith(inst, builder.Constant(absorbing));
+        return true;
+    }
+    if (&lhs == &rhs) {
+        if (opcode == IrOpcode::BitwiseXor32) replaceWith(inst, builder.Constant(0u));
+        else replaceWith(inst, lhs);
+        return true;
+    }
+    const bool complement = (lhs.Opcode() == IrOpcode::BitwiseNot32 && &resolveArg(lhs, 0) == &rhs) || (rhs.Opcode() == IrOpcode::BitwiseNot32 && &resolveArg(rhs, 0) == &lhs);
+    if (!complement) return false;
+    replaceWith(inst, builder.Constant(opcode == IrOpcode::BitwiseAnd32 ? 0u : 0xffffffffu));
+    return true;
+}
+
+// Bit 0 of all ones shifted right by any amount (shifts take the amount mod 32).
+bool foldLowBitOfOnes(IrBuilder& builder, IrValue& inst) {
+    auto& lhs = resolveArg(inst, 0);
+    auto& rhs = resolveArg(inst, 1);
+    const bool lowBit = isImmediate(rhs, IrType::U32) && rhs.ImmediateU32() == 1u;
+    auto& shifted = lowBit ? lhs : rhs;
+    if (!lowBit && !(isImmediate(lhs, IrType::U32) && lhs.ImmediateU32() == 1u)) return false;
+    if (shifted.Opcode() != IrOpcode::ShiftRightLogical32) return false;
+    auto& value = resolveArg(shifted, 0);
+    if (!isImmediate(value, IrType::U32) || value.ImmediateU32() != 0xffffffffu) return false;
+    replaceWith(inst, builder.Constant(1u));
+    return true;
+}
+
 bool foldSelect(IrValue& inst) {
     auto& condition = resolveArg(inst, 0);
     auto& trueValue = resolveArg(inst, 1);
@@ -460,6 +498,11 @@ bool ConstantFolder::tryFoldValue(IrProgram& program, IrValue& value) const {
                 replaceWith(value, resolveArg(value, 0));
                 return true;
             }
+            auto& shifted = resolveArg(value, 0);
+            if (isImmediate(shifted, IrType::U32) && shifted.ImmediateU32() == 0u) {
+                replaceWith(value, shifted);
+                return true;
+            }
             return false;
         }
         case IrOpcode::ShiftRightArithmetic32: {
@@ -494,7 +537,7 @@ bool ConstantFolder::tryFoldValue(IrProgram& program, IrValue& value) const {
             if (foldU32(builder, value, [](std::uint32_t a, std::uint32_t b) { return a & b; })) {
                 return true;
             }
-            return replaceBinaryIdentity(value, IrType::U32, 0xffffffffu);
+            return replaceBinaryIdentity(value, IrType::U32, 0xffffffffu) || foldBitwiseSelf(builder, value) || foldLowBitOfOnes(builder, value);
         }
         case IrOpcode::BitwiseAnd64: {
             if (foldU64(builder, value, [](std::uint64_t a, std::uint64_t b) { return a & b; })) {
@@ -508,7 +551,7 @@ bool ConstantFolder::tryFoldValue(IrProgram& program, IrValue& value) const {
             if (foldU32(builder, value, [opcode](std::uint32_t a, std::uint32_t b) { return opcode == IrOpcode::BitwiseOr32 ? a | b : a ^ b; })) {
                 return true;
             }
-            return replaceBinaryIdentity(value, IrType::U32, 0u);
+            return replaceBinaryIdentity(value, IrType::U32, 0u) || foldBitwiseSelf(builder, value);
         }
         case IrOpcode::BitwiseNot32: {
             auto& operand = resolveArg(value, 0);
