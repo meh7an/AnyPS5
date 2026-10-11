@@ -70,6 +70,8 @@ public:
     // Waits until record `taken` was handed over; false once the thread is to stop with nothing
     // left to record.
     bool AwaitRecord(std::uint32_t taken);
+    // Charges the wait AwaitRecord just made (the waits' profile) to the record that ended it.
+    void ChargeIdle(const PreparedDraw& record);
     // The slot record `taken` was prepared in.
     PreparedDraw& Record(std::uint32_t taken) { return *slots[taken % slots.size()]; }
     // The ring's slots: APS5_DRAW_RING (2 to 64, 8 by default; 2 is one record in flight).
@@ -90,7 +92,7 @@ public:
 private:
     void report();
     // Waits until `count` records are done (wrapping counters compared as differences); the wait
-    // in milliseconds under APS5_PROFILE_DRAW, else 0.
+    // in milliseconds under APS5_PROFILE_DRAW or APS5_PROFILE_DRAW_WAITS, else 0.
     double awaitRecorded(std::uint32_t count, Wait why);
 
     std::vector<std::unique_ptr<PreparedDraw>> slots;
@@ -103,7 +105,12 @@ private:
     std::atomic<bool> frontSleeping{false};
     std::atomic<bool> abandoned{false};
 
-    // The front's waits (APS5_PROFILE_DRAW), reported and reset every 10 s by the front.
+    // The front's waits (APS5_PROFILE_DRAW, or APS5_PROFILE_DRAW_WAITS for these alone), reported
+    // and reset every 10 s by the front, and the back's waits for a record to start, by the record
+    // that ended them: a draw without color targets, a draw with them, a ring record.
+    std::uint64_t lastIdleUs = 0;
+    std::array<std::atomic<std::uint64_t>, 3> idleWaits{};
+    std::array<std::atomic<std::uint64_t>, 3> idleUs{};
     std::uint64_t pushes = 0;
     std::array<std::uint64_t, static_cast<std::size_t>(Wait::Count)> waits{};
     std::array<double, static_cast<std::size_t>(Wait::Count)> waitedMs{};

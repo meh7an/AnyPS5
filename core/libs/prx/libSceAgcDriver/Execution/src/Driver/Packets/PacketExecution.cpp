@@ -9,6 +9,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
+#include "prx/libSceAgcDriver/Execution/include/TimelineTrace.hpp"
 #include "prx/libSceAgcDriver/Eq/include/Event.hpp"
 #include <cstdlib>
 #include <functional>
@@ -191,6 +192,12 @@ void Driver::execute(const Submission& submission) {
         if (APS5_ENABLE_TIMING_LOG && submission.queue == 0 && pendingFrameTiming == nullptr) includeTimingSubmission(submission, false);
         PerformanceContext timingContext(submission.queue == 0 ? pendingFrameTiming.get() : FrameTiming::Async());
         PerformanceTimer timing("Driver.Packet");
+        // The packet's span on the frame timeline (APS5_TIMELINE).
+        struct TimelinePacket {
+            std::uint32_t opcode;
+            explicit TimelinePacket(std::uint32_t value) : opcode(value) { TimelineTrace::Mark(TimelineTrace::Event::PacketBegin, opcode); }
+            ~TimelinePacket() { TimelineTrace::Mark(TimelineTrace::Event::PacketEnd, opcode); }
+        } timelinePacket{header == FlipPacketHeader ? 0xffffu : opcode};
         // The draw thread may still be recording the last draw: any other packet with effects
         // outside the queue state, or a predicated one (its predicate is read), waits for it.
         // With ring writes (DrawThread::RingWrites) a label or a packet store goes to the draw thread as a record when
@@ -303,6 +310,7 @@ void Driver::execute(const Submission& submission) {
             frame->NoteFlipBatches(batchesAtFlip, unsignaledAtFlip);
             CaptureTrace::Log("flip frame=%llu submission=%llu offset=%zu batch=%llu unsignaled=%llu", static_cast<unsigned long long>(frameSerial), static_cast<unsigned long long>(submission.serial), cursor, static_cast<unsigned long long>(batchesAtFlip), static_cast<unsigned long long>(unsignaledAtFlip));
             flipHold.Release();
+            TimelineTrace::Mark(TimelineTrace::Event::Flip);
             submission.flips.at(cursor)->GpuReady(frame);
         } else if (opcode == 0x15 || opcode == 0x16) {
             landPendingWaits(submission.queue);

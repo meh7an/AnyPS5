@@ -5,6 +5,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ThreadScratch.hpp"
+#include "prx/libSceAgcDriver/Execution/include/TimelineTrace.hpp"
 #include <cstdlib>
 
 namespace AgcDriver::DriverDetail {
@@ -125,7 +126,9 @@ void Driver::flushBetweenPackets(std::uint32_t queue, std::uint32_t header, bool
     if (submit || capped) {
 
         if (!Graphics::Recorder::PendingLabelSince().has_value() && (batchCap() == 0 || Graphics::Recorder::RecordedWorkSinceSubmit() < batchCap())) return;
+        TimelineTrace::Mark(TimelineTrace::Event::SubmitBegin);
         localDevice->SubmitRecorded(queue == 0);
+        TimelineTrace::Mark(TimelineTrace::Event::SubmitEnd);
         if (capped) ++capFlushes;
         else if (!labelPacket && packetFlush) ++packetFlushes;
         else ++deadlineFlushes;

@@ -10,6 +10,7 @@
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ThreadScratch.hpp"
+#include "prx/libSceAgcDriver/Execution/include/TimelineTrace.hpp"
 #include "prx/libc/include/HostThreadSlot.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include <algorithm>
@@ -47,6 +48,19 @@ void awaitWord(const std::atomic<std::uint32_t>& word, std::atomic<bool>& sleepi
         WaitWhile(word, seen);
     }
     sleeping.store(false, std::memory_order_relaxed);
+}
+
+// The [draw-thread] waits: with APS5_PROFILE_DRAW, or alone with APS5_PROFILE_DRAW_WAITS (the waits'
+// clock reads, without the draw profile's own cost).
+bool waitsProfiled() {
+    static const bool profiled = std::getenv("APS5_PROFILE_DRAW") != nullptr || std::getenv("APS5_PROFILE_DRAW_WAITS") != nullptr;
+    return profiled;
+}
+
+// A record's kind for the waits' profile and the timeline: 0 a draw without color targets, 1 a draw
+// with them, 2 a ring record.
+std::uint32_t recordKind(const PreparedDraw& record) {
+    return !record.writes.empty() || record.decode == nullptr ? 2u : record.decode->state.colors.empty() ? 0u : 1u;
 }
 
 // Whether a draw's stages may write guest memory besides its render targets: a buffer element not
@@ -148,12 +162,12 @@ bool DrawThread::Push() {
     const auto freed = count + 2u - static_cast<std::uint32_t>(slots.size());
     if (static_cast<std::int32_t>(freed - recorded.load(std::memory_order_acquire)) > 0) awaitRecorded(freed, Wait::Push);
     if (abandoned.load(std::memory_order_acquire)) return false;
+    if (TimelineTrace::Enabled()) TimelineTrace::Mark(TimelineTrace::Event::Pushed, recordKind(*slots[count % slots.size()]));
     pushed.store(count + 1, std::memory_order_seq_cst);
     doorbell.fetch_add(1, std::memory_order_seq_cst);
     if (backSleeping.load(std::memory_order_seq_cst)) WakeAll(doorbell);
     ++pushes;
-    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
-    if (profile) report();
+    if (waitsProfiled()) report();
     return true;
 }
 
@@ -169,10 +183,12 @@ void DrawThread::Drain(Wait why, std::uint32_t opcode) {
 double DrawThread::awaitRecorded(std::uint32_t count, Wait why) {
     // The draw thread needs the mutex to record what it waits for.
     require(!GuestMemory::GpuMutex().HeldByThisThread(), "a queue worker waited for its draw thread holding the GPU mutex");
-    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    const bool profile = waitsProfiled();
     const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    TimelineTrace::Mark(TimelineTrace::Event::WaitBegin, static_cast<std::uint32_t>(why));
     // A draw thread that left early records nothing more.
     awaitWord(recorded, frontSleeping, [&] { return static_cast<std::int32_t>(count - recorded.load(std::memory_order_acquire)) <= 0 || abandoned.load(std::memory_order_acquire); });
+    TimelineTrace::Mark(TimelineTrace::Event::WaitEnd, static_cast<std::uint32_t>(why));
     const auto index = static_cast<std::size_t>(why);
     ++waits[index];
     const auto waited = profile ? std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count() : 0.0;
@@ -195,8 +211,22 @@ void DrawThread::Stop() {
 }
 
 bool DrawThread::AwaitRecord(std::uint32_t taken) {
+    const bool waiting = pushed.load(std::memory_order_acquire) == taken;
+    const bool timed = waitsProfiled() && waiting;
+    const auto start = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    if (waiting) TimelineTrace::Mark(TimelineTrace::Event::IdleBegin);
     awaitWord(doorbell, backSleeping, [&] { return pushed.load(std::memory_order_acquire) != taken || stopping.load(std::memory_order_acquire); });
+    if (waiting) TimelineTrace::Mark(TimelineTrace::Event::IdleEnd);
+    lastIdleUs = timed ? static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count()) + 1 : 0;
     return pushed.load(std::memory_order_acquire) != taken;
+}
+
+void DrawThread::ChargeIdle(const PreparedDraw& record) {
+    if (lastIdleUs == 0) return;
+    const std::size_t kind = recordKind(record);
+    idleWaits[kind].fetch_add(1, std::memory_order_relaxed);
+    idleUs[kind].fetch_add(lastIdleUs - 1, std::memory_order_relaxed);
+    lastIdleUs = 0;
 }
 
 void DrawThread::Recorded(std::uint32_t count) {
@@ -225,7 +255,13 @@ void DrawThread::report() {
         std::snprintf(text, sizeof(text), " 0x%02x %llu (%.0f ms)", opcodes[i], static_cast<unsigned long long>(packetWaits[opcodes[i]]), packetWaitedMs[opcodes[i]]);
         packets += text;
     }
-    std::fprintf(stderr, "[draw-thread] queue 0x%x (%.0f s): %llu draws handed over; the worker waited for the draw thread before a hand-off %llu times (%.0f ms), at its GPU mutex %llu (%.0f ms), before a packet %llu (%.0f ms; by opcode:%s), after a memory-writing draw %llu (%.0f ms), at the end of a submission %llu (%.0f ms)\n", queue, seconds, static_cast<unsigned long long>(pushes), static_cast<unsigned long long>(waits[at(Wait::Push)]), waitedMs[at(Wait::Push)], static_cast<unsigned long long>(waits[at(Wait::Lock)]), waitedMs[at(Wait::Lock)], static_cast<unsigned long long>(waits[at(Wait::Packet)]), waitedMs[at(Wait::Packet)], packets.c_str(), static_cast<unsigned long long>(waits[at(Wait::Writer)]), waitedMs[at(Wait::Writer)], static_cast<unsigned long long>(waits[at(Wait::End)]), waitedMs[at(Wait::End)]);
+    std::array<unsigned long long, 3> idle{};
+    std::array<double, 3> idleMs{};
+    for (std::size_t kind = 0; kind < idle.size(); ++kind) {
+        idle[kind] = idleWaits[kind].exchange(0, std::memory_order_relaxed);
+        idleMs[kind] = static_cast<double>(idleUs[kind].exchange(0, std::memory_order_relaxed)) / 1000.0;
+    }
+    std::fprintf(stderr, "[draw-thread] queue 0x%x (%.0f s): %llu draws handed over; the worker waited for the draw thread before a hand-off %llu times (%.0f ms), at its GPU mutex %llu (%.0f ms), before a packet %llu (%.0f ms; by opcode:%s), after a memory-writing draw %llu (%.0f ms), at the end of a submission %llu (%.0f ms); the draw thread waited for a record before a depth-only draw %llu times (%.0f ms), a color draw %llu (%.0f ms), a ring record %llu (%.0f ms)\n", queue, seconds, static_cast<unsigned long long>(pushes), static_cast<unsigned long long>(waits[at(Wait::Push)]), waitedMs[at(Wait::Push)], static_cast<unsigned long long>(waits[at(Wait::Lock)]), waitedMs[at(Wait::Lock)], static_cast<unsigned long long>(waits[at(Wait::Packet)]), waitedMs[at(Wait::Packet)], packets.c_str(), static_cast<unsigned long long>(waits[at(Wait::Writer)]), waitedMs[at(Wait::Writer)], static_cast<unsigned long long>(waits[at(Wait::End)]), waitedMs[at(Wait::End)], idle[0], idleMs[0], idle[1], idleMs[1], idle[2], idleMs[2]);
     pushes = 0;
     waits.fill(0);
     waitedMs.fill(0);
@@ -713,6 +749,9 @@ void Driver::runDrawThread(DrawThread& back) noexcept {
     try {
         for (std::uint32_t taken = 0; back.AwaitRecord(taken); ++taken) {
             auto& prepared = back.Record(taken);
+            back.ChargeIdle(prepared);
+            const auto kind = TimelineTrace::Enabled() ? recordKind(prepared) : 0u;
+            TimelineTrace::Mark(TimelineTrace::Event::RecordBegin, kind);
             GuestMemory::AdoptCollectEpoch(prepared.collectEpoch);
             PerformanceTimer timing("Driver.Draw");
             std::unique_lock gpuLock(GuestMemory::GpuMutex(), std::defer_lock);
@@ -729,6 +768,7 @@ void Driver::runDrawThread(DrawThread& back) noexcept {
             if (!gpuLock.owns_lock()) gpuLock.lock();
             prepared.Clear();
             gpuLock.unlock();
+            TimelineTrace::Mark(TimelineTrace::Event::RecordEnd, kind);
             back.Recorded(taken + 1);
         }
     } catch (...) {

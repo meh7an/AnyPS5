@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
+#include "prx/libSceAgcDriver/Execution/include/TimelineTrace.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineSpecialization.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
@@ -1529,7 +1530,11 @@ void VulkanDevice::SubmitRecorded(bool reapFirst) {
     // after a completing batch already finished can go to the GPU instead of behind a completion.
     // Not for cross-queue submitters: a retired batch's write-back may sync a later batch under the
     // mutex (see the header), which a poller or compute worker must never do for queue 0.
-    if (reapFirst && OpportunisticReap()) state->recorder->Reap();
+    if (reapFirst && OpportunisticReap()) {
+        TimelineTrace::Mark(TimelineTrace::Event::ReapBegin);
+        state->recorder->Reap();
+        TimelineTrace::Mark(TimelineTrace::Event::ReapEnd);
+    }
     state->recorder->Submit();
 }
 

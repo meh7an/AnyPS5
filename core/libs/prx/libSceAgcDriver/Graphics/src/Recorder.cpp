@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
+#include "prx/libSceAgcDriver/Execution/include/TimelineTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
@@ -3483,8 +3484,12 @@ void Recorder::Submit() {
     const auto submitStart = DrawProfiled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     {
         // The presenter may be queueing a presentation without the GpuMutex (GuestMemory::QueueMutex).
+        TimelineTrace::Mark(TimelineTrace::Event::QueueLockBegin);
         std::lock_guard queue(GuestMemory::QueueMutex());
+        TimelineTrace::Mark(TimelineTrace::Event::QueueLockEnd);
+        TimelineTrace::Mark(TimelineTrace::Event::QueueSubmitBegin);
         Check(function(queueSubmit, "vkQueueSubmit")(context.queue, 1, &submission, batch->fence), "vkQueueSubmit recorder");
+        TimelineTrace::Mark(TimelineTrace::Event::QueueSubmitEnd);
     }
     batch->submitted = true;
     batch->serial = ++submissions;

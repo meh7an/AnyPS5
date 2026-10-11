@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
+#include "prx/libSceAgcDriver/Execution/include/TimelineTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/WorkerAffinity.hpp"
@@ -150,7 +151,9 @@ void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buff
             static const bool lockedPresent = std::getenv("APS5_NO_UNLOCKED_PRESENT") != nullptr;
             std::unique_lock queue(GuestMemory::QueueMutex(), std::defer_lock);
             const auto queuePresent = [&] {
+                TimelineTrace::Mark(TimelineTrace::Event::PresentBegin);
                 presenting->QueuePresent();
+                TimelineTrace::Mark(TimelineTrace::Event::PresentEnd);
                 queue.unlock();
                 timing.Mark("queue_present");
                 if (pacing) Pacing().Mark(PresentPacing::Queue);
@@ -194,7 +197,9 @@ void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buff
             timing.Mark("render_fence_wait");
 
             std::lock_guard queue(GuestMemory::QueueMutex());
+            TimelineTrace::Mark(TimelineTrace::Event::PresentBegin);
             presenting->QueuePresent();
+            TimelineTrace::Mark(TimelineTrace::Event::PresentEnd);
             timing.Mark("queue_present");
         }
         gpuReady(context);
