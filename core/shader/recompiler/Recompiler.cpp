@@ -33,6 +33,7 @@
 #include "Optimization/ResourceProgram.hpp"
 #include "Optimization/include/Optimization/ResourceTracker.hpp"
 #include "Optimization/include/Optimization/ShaderInfoCollector.hpp"
+#include "Optimization/include/Optimization/SingleLaneAnalysis.hpp"
 #include "Optimization/include/Optimization/SrtWalker.hpp"
 #include "Optimization/include/Optimization/SsaBuilder.hpp"
 #include "SpirvBackend/include/SpirvBackend/SpirvEmitter.hpp"
@@ -88,6 +89,21 @@ std::uint32_t HostSubgroupSize(const RecompileRequest& request) {
         if (list.find(address) != std::string::npos) return 64u;
     }
     return request.target.subgroupSize;
+}
+
+// Whether SingleLaneAnalysis picks this request's layout: a wave64 compute program laid out for a
+// 32-wide host runs at one lane per invocation where that gives every lane the same results, and
+// at two otherwise. Debug aid: APS5_NO_SINGLE_LANE_RULE=1 keeps every such program at two.
+bool SingleLaneCandidate(const RecompileRequest& request) {
+    static const bool enabled = std::getenv("APS5_NO_SINGLE_LANE_RULE") == nullptr;
+    return enabled && request.shader.stage == ShaderStage::Compute && request.context.waveSize == 64u && HostSubgroupSize(request) == 32u;
+}
+
+// The disk cache key's layout word: the host subgroup size, with bit 8 set where the single-lane
+// rule picks the layout (the cached result holds its choice, which a run without the rule must not
+// load).
+std::uint32_t CacheLayout(const RecompileRequest& request) {
+    return HostSubgroupSize(request) | (SingleLaneCandidate(request) ? 0x100u : 0u);
 }
 
 ShaderStageInputInfo RequestInputInfo(const RecompileRequest& request) {
@@ -663,6 +679,7 @@ CompiledVariant compileVariant(const RecompileRequest& request, IrProgram progra
     constexpr ResourceMaterializer resourceMaterializer;
     resourceMaterializer.Apply(program, resourceSpecialization);
 
+    ResolveControlFlowIdentities(program);
     deadCodeEliminator.RemoveIdentities(program);
     deadCodeEliminator.Eliminate(program);
 
@@ -674,6 +691,27 @@ CompiledVariant compileVariant(const RecompileRequest& request, IrProgram progra
 
     constexpr DescriptorBindingBuilder descriptorBindingBuilder;
     descriptorBindingBuilder.Populate(bindings, program, resourceSnapshot, partialThreads(request));
+
+    // The layout the emitter lays the program out for (see SingleLaneCandidate). Debug aid:
+    // APS5_TRACE_SINGLE_LANE=1 prints each candidate's verdict.
+    auto emitInfo = inputInfo;
+    ShaderComputeInputInfo singleLane;
+    auto hostSubgroupSize = HostSubgroupSize(request);
+    if (SingleLaneCandidate(request) && inputInfo.compute != nullptr) {
+        const auto verdict = AnalyzeSingleLane(program, *inputInfo.compute);
+        static const bool trace = std::getenv("APS5_TRACE_SINGLE_LANE") != nullptr;
+        if (trace) {
+            const auto& threads = inputInfo.compute->threadsNum;
+            const std::string at = verdict.at == nullptr ? std::string() : " at " + DescribeValue(verdict.at, 3);
+            std::fprintf(stderr, "[single-lane] program 0x%llx (%ux%ux%u threads): %s%s%s\n", static_cast<unsigned long long>(request.shader.codeAddress), threads[0], threads[1], threads[2], verdict.eligible ? "one lane per invocation" : "two lanes per invocation: ", verdict.eligible ? "" : verdict.reason, at.c_str());
+        }
+        if (verdict.eligible) {
+            singleLane = *inputInfo.compute;
+            singleLane.hostSubgroupSize = 64u;
+            emitInfo.compute = &singleLane;
+            hostSubgroupSize = 64u;
+        }
+    }
 
     SpirvTargetOptions targetOptions {};
     targetOptions.vulkanVersion = request.target.vulkanVersion;
@@ -688,7 +726,7 @@ CompiledVariant compileVariant(const RecompileRequest& request, IrProgram progra
     RecompileResult result;
     result.variantId = nextVariantId();
     try {
-        result.spirv = spirvEmitter.Emit(program, inputInfo, bindings, targetOptions);
+        result.spirv = spirvEmitter.Emit(program, emitInfo, bindings, targetOptions);
 #if ANYPS5_ENABLE_SPIRV_TOOLS
         result.spirv = ValidateAndOptimizeSpirv(result.spirv, request.target.vulkanVersion, request.target.spirvVersion, request.target.nonConstantImageOffsets);
 #endif
@@ -701,7 +739,7 @@ CompiledVariant compileVariant(const RecompileRequest& request, IrProgram progra
 
     result.bdaAbiVersion = program.Info().usesDma ? request.target.bdaAbiVersion : 0u;
     result.memoryOffsetDword = bindings.layout.memoryOffsetDword;
-    result.hostSubgroupSize = HostSubgroupSize(request);
+    result.hostSubgroupSize = hostSubgroupSize;
     result.vertexOffsetSgpr = program.Info().vertexOffsetSgpr;
     result.instanceOffsetSgpr = program.Info().instanceOffsetSgpr;
     result.vertexOffsetShared = program.Info().vertexOffsetShared;
@@ -758,7 +796,7 @@ std::shared_ptr<const CompiledVariant> findOrCompileVariant(SourceEntry& source,
     std::vector<std::byte> diskKey;
     std::shared_ptr<const CompiledVariant> variant;
     if (disk) {
-        ShaderDiskCache::BuildKey(request, HostSubgroupSize(request), specialization, diskKey);
+        ShaderDiskCache::BuildKey(request, CacheLayout(request), specialization, diskKey);
         CompiledVariant loaded;
         if (ShaderDiskCache::Load(diskKey, loaded)) {
             loaded.specialization = specialization;

@@ -16,6 +16,7 @@
 #include <spirv/unified1/spirv.hpp>
 #include <algorithm>
 #include <array>
+#include <cstdlib>
 #include <cstring>
 #include <initializer_list>
 #include <iostream>
@@ -1538,6 +1539,13 @@ void verifyFunctionLdsBound() {
 }
 
 int main() {
+    // The wave64 compute checks here read the two-lane emitter's output; the single-lane rule would
+    // take the programs that qualify to one lane per invocation (tests/SingleLane.cpp covers it).
+#ifdef _WIN32
+    _putenv_s("APS5_NO_SINGLE_LANE_RULE", "1");
+#else
+    setenv("APS5_NO_SINGLE_LANE_RULE", "1", 1);
+#endif
     try {
         using namespace ShaderRecompiler;
         verifyRegisterSources();

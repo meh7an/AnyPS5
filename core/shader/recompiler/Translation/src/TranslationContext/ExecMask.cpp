@@ -180,6 +180,10 @@ void TranslationContext::AddBranchCondition(const BasicBlock& source, BlockInfo&
     }
     info.condition = &condition.Value();
     (void)ir.Emit(IrOpcode::Reference, IrType::Void, {info.condition});
+    if (source.terminator.condition == BranchCondition::VccZero || source.terminator.condition == BranchCondition::VccNonZero) {
+        info.exec = &ir.GetExec();
+        (void)ir.Emit(IrOpcode::Reference, IrType::Void, {info.exec});
+    }
 }
 
 }

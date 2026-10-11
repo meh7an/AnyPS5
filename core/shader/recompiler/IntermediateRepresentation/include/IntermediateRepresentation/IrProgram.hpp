@@ -45,6 +45,8 @@ private:
 };
 
 std::string ProgramToString(const IrProgram& program);
+// A value as `Opcode(arguments...)` to `depth` levels of arguments, for diagnostics.
+std::string DescribeValue(const IrValue* value, std::uint32_t depth);
 void ValidateProgram(const IrProgram& program, bool requireSsa);
 void ResolveControlFlowIdentities(IrProgram& program);
 bool EquivalentValue(const IrResourcePlan& program, const IrValue* left, const IrValue* right);
