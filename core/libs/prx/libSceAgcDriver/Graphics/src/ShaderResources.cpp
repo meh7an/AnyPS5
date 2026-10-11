@@ -3918,14 +3918,18 @@ bool ShaderResources::ReadsOverlap(std::uint64_t address, std::size_t bytes) con
 }
 
 std::vector<std::pair<VkImage, bool>> ShaderResources::StorageImages() const {
-    std::vector<std::pair<VkImage, bool>> images;
+    InlineList<std::pair<VkImage, bool>, 8> images;
+    AppendStorageImages(images);
+    return {images.begin(), images.end()};
+}
+
+void ShaderResources::AppendStorageImages(InlineList<std::pair<VkImage, bool>, 8>& out) const {
     for (std::size_t index = 0; index < storageTextures.size(); ++index) {
-        if (storageTextures[index] != nullptr) images.emplace_back(storageTextures[index]->Image(), storageWritten[index]);
+        if (storageTextures[index] != nullptr) out.push_back({storageTextures[index]->Image(), storageWritten[index]});
     }
     for (const auto& texture : textures) {
-        if (texture != nullptr && texture->StorageSource() != nullptr) images.emplace_back(texture->StorageSource()->Image(), false);
+        if (texture != nullptr && texture->StorageSource() != nullptr) out.push_back({texture->StorageSource()->Image(), false});
     }
-    return images;
 }
 
 bool ShaderResources::ReadsImage(const StorageTexture* image) const {

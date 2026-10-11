@@ -226,7 +226,9 @@ public:
     const std::vector<std::pair<std::uint64_t, std::uint64_t>>& GpuWrites() const { return guestMemory.Writes(); }
     std::vector<std::pair<std::uint64_t, std::uint64_t>> InPlaceReads() const { return guestMemory.InPlaceReads(); }
     std::vector<std::pair<VkImage, bool>> StorageImages() const;
-    std::vector<std::pair<std::uint64_t, std::uint64_t>> DeviceReads() const { return guestMemory.DeviceReads(); }
+    // The per-draw forms, appended to lists a draw keeps inline.
+    void AppendStorageImages(InlineList<std::pair<VkImage, bool>, 8>& out) const;
+    void AppendDeviceReads(InlineList<std::pair<std::uint64_t, std::uint64_t>, 16>& out) const { guestMemory.AppendDeviceReads(out); }
     bool ReadsImage(const StorageTexture* image) const;
     const std::vector<std::uint32_t>& LayoutKey() const { return layoutKey; }
     // Debug aid: each bound guest resource with the fraction of sampled bytes that are nonzero.

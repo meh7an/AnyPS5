@@ -1390,7 +1390,8 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         rangeOffsets.push_back(copy.offset);
         inputs.vertexBuffers.push_back(std::move(copy.buffer));
     }
-    std::vector<VkBuffer> soloHandles(fetches.size(), VK_NULL_HANDLE);
+    InlineList<VkBuffer, 16> soloHandles;
+    soloHandles.assign(fetches.size(), VK_NULL_HANDLE);
     for (const auto f : soloFetches) {
         const auto begin = fetches[f].begin;
         const auto bytes = static_cast<std::size_t>(fetches[f].end - begin);
@@ -2060,19 +2061,21 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     const bool capture = CaptureInputsEnabled();
     const bool meshIndirect = state.stages.mesh && args != nullptr;
     const bool addressBased = resources.HoldsLease();
-    auto passReads = addressBased ? std::vector<std::pair<std::uint64_t, std::uint64_t>>{} : resources.DeviceReads();
+    // The pass's hazard lists, kept inline: a draw has a few of each.
+    InlineList<std::pair<std::uint64_t, std::uint64_t>, 16> passReads;
+    if (!addressBased) resources.AppendDeviceReads(passReads);
     if (gpuIndirect) {
-        passReads.emplace_back(args->arguments, args->arguments + args->RangeBytes());
-        if (args->countIndirect) passReads.emplace_back(args->countAddress, args->countAddress + 4);
+        passReads.push_back({args->arguments, args->arguments + args->RangeBytes()});
+        if (args->countIndirect) passReads.push_back({args->countAddress, args->countAddress + 4});
     }
-    const auto passImages = resources.StorageImages();
-    std::vector<std::pair<VkImage, bool>> passAttachments;
-    passAttachments.reserve(record.targets.size());
+    InlineList<std::pair<VkImage, bool>, 8> passImages;
+    resources.AppendStorageImages(passImages);
+    InlineList<std::pair<VkImage, bool>, 8> passAttachments;
     for (const auto& target : record.targets) {
-        if (target != nullptr) passAttachments.emplace_back(target->Image(), true);
+        if (target != nullptr) passAttachments.push_back({target->Image(), true});
     }
     const bool unknownMemory = addressBased || resources.UsesAddressTable() || resources.HasCopiedWrites();
-    const PassAccess passAccess{passReads, resources.GpuWrites(), passImages, passAttachments, unknownMemory, unknownMemory};
+    const PassAccess passAccess{{passReads.data(), passReads.size()}, resources.GpuWrites(), {passImages.data(), passImages.size()}, {passAttachments.data(), passAttachments.size()}, unknownMemory, unknownMemory};
     const bool fenced = state.depth.has_value() || !record.proxies.empty();
     const auto start = recorder->StartDrawPass(passKey, capture || readsTarget || gpuIndirect || meshIndirect, fenced, passAccess);
     const bool continued = start.continued;
@@ -2293,7 +2296,9 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     const int dumpLimit = DumpTargetLimit();
     static AgcDriver::Mutex dumpMutex;
     static std::map<std::uint64_t, int> dumped;
-    std::vector<TargetBinding> targets(state.colors.size());
+    // Kept inline for the usual one or two color targets.
+    InlineList<TargetBinding, 2> targets;
+    for (std::size_t index = 0; index < state.colors.size(); ++index) targets.push_back(TargetBinding{});
     // A view per color target and one for the depth surface.
     InlineList<VkImageView, 9> targetViews;
     for (std::size_t index = 0; index < state.colors.size(); ++index) {
