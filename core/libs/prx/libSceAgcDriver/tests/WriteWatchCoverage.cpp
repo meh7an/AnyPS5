@@ -53,6 +53,16 @@ int main() {
         coverage.Exclude(base, block, 7);
         require(!coverage.Restore(base, block, 6) && !coverage.Covers(base, block), "a delayed mapping notification erased a repeated import");
         require(coverage.Restore(base, block, 8), "a fresh replacement did not restore the latest import exclusion");
+        // Ranges over whole 64-block chunks are checked by the chunks' counts of excluded blocks.
+        constexpr std::size_t chunk = 64 * block;
+        coverage.Initialize(base, 4 * chunk + block);
+        require(coverage.Covers(base, 4 * chunk + block), "a fresh arena of several chunks is not watched");
+        require(coverage.Exclude(base + 2 * chunk + 17 * block, 1), "a page inside a chunk was not excluded");
+        require(!coverage.Covers(base, 4 * chunk + block) && !coverage.Covers(base + chunk, 2 * chunk), "a range over the chunk of an excluded block is watched");
+        require(!coverage.Covers(base + 2 * chunk + 3 * block, 30 * block), "a partial range over an excluded block is watched");
+        require(coverage.Covers(base, 2 * chunk) && coverage.Covers(base + 3 * chunk, chunk + block) && coverage.Covers(base + 2 * chunk, 17 * block), "blocks around an excluded block lost write watching");
+        require(coverage.Restore(base + 2 * chunk + 17 * block, block) && coverage.Covers(base, 4 * chunk + block), "restoring the only excluded block of a chunk left the chunk excluded");
+        require(coverage.Exclude(base + chunk - block, 2 * block) && !coverage.Covers(base, chunk) && !coverage.Covers(base + chunk, chunk), "an import across a chunk boundary left a chunk watched");
         std::cout << "write watch coverage passed\n";
         return 0;
     } catch (const std::exception& error) {
