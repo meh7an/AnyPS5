@@ -1128,6 +1128,12 @@ static void CheckFailedCollectKeepsWrites() {
     Require(sceKernelMprotect(const_cast<unsigned char*>(shared + page), page, 0) == 0);
     Require(!collect(mapped, page * 2, count));
     Require(collect(mapped, page, count) && count == 4);
+    // The first page is clean now: the check skips it, the NOACCESS page still refuses the range,
+    // and the clean page keeps reporting nothing until it is written again.
+    Require(!collect(mapped, page * 2, count));
+    Require(collect(mapped, page, count) && count == 0);
+    shared[8] = 3;
+    Require(collect(mapped, page, count) && count == 4);
     Require(sceKernelMunmap(mapped, page * 2) == 0);
     Require(sceKernelReleaseDirectMemory(phys, page * 2) == 0);
 #endif

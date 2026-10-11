@@ -369,13 +369,9 @@ public:
         const auto end = address + bytes;
         if (clear && !collectable(address, end)) return false;
         for (auto cursor = address; cursor < end;) {
-            const auto nextClean = cleanRanges.upper_bound(cursor);
-            if (nextClean != cleanRanges.begin()) {
-                const auto clean = std::prev(nextClean);
-                if (cursor < clean->second) {
-                    cursor = std::min(end, clean->second);
-                    continue;
-                }
+            if (const auto clean = cleanEnd(cursor, end); clean != cursor) {
+                cursor = clean;
+                continue;
             }
             const auto base = cursor & ~(pageBytes - 1);
             const auto found = views.find(base);
@@ -423,8 +419,22 @@ public:
     }
 
 private:
+    // The end (at most `end`) of the clean range holding `cursor`, or `cursor` outside every one.
+    std::uintptr_t cleanEnd(std::uintptr_t cursor, std::uintptr_t end) const {
+        const auto next = cleanRanges.upper_bound(cursor);
+        if (next == cleanRanges.begin()) return cursor;
+        const auto clean = std::prev(next);
+        return cursor < clean->second ? std::min(end, clean->second) : cursor;
+    }
+
     bool collectable(std::uintptr_t address, std::uintptr_t end) {
         for (auto cursor = address; cursor < end;) {
+            // A clean range holds only views collected since their protection last changed
+            // (invalidate forgets it), which Collect skips: no page of it can refuse the range.
+            if (const auto clean = cleanEnd(cursor, end); clean != cursor) {
+                cursor = clean;
+                continue;
+            }
             const auto base = cursor & ~(pageBytes - 1);
             if (const auto found = views.find(base); found != views.end()) {
                 if (found->second.protection == PAGE_NOACCESS) return false;
