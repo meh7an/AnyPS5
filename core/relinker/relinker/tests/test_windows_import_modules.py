@@ -298,6 +298,23 @@ def main():
             run = subprocess.run([str(output)], capture_output=True, text=True, timeout=30)
             assert run.returncode == 11, (run.returncode, run.stdout, run.stderr)
 
+        result, shared = convert('shared-host-provider', 'a.prx')
+        assert result.returncode == 0, result.stderr
+        host_provider = shared.parent / 'app0' / 'prx' / 'a.prx.guest.prx'
+        for filename, module_name in [('libSceJson2.prx', 'libSceJson'), ('libSceAppContent.prx', 'libSceAppContentUtil')]:
+            case = work / ('host-library-' + module_name)
+            case.mkdir()
+            source = case / 'input.elf'
+            source.write_bytes(executable(filename, module_name=module_name))
+            output = case / 'output.exe'
+            result = subprocess.run([str(relinker), '--windows', '--skip-sce-module', str(source), str(output)], capture_output=True, text=True, timeout=30)
+            assert result.returncode == 0, (module_name, result.stdout, result.stderr)
+            (case / 'libs').mkdir()
+            (case / 'libs' / filename).write_bytes(host_provider.read_bytes())
+            if os.name == 'nt':
+                run = subprocess.run([str(output)], capture_output=True, text=True, timeout=30)
+                assert run.returncode == 11, (module_name, run.returncode, run.stdout, run.stderr)
+
         for symbol, message in [('shared#A#C', 'Unknown import module ID'),
                                 ('shared#A#', 'Invalid qualified import'),
                                 ('shared#A#?', 'Invalid import module ID'),
