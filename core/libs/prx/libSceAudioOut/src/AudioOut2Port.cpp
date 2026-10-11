@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <cstdio>
@@ -106,11 +107,21 @@ AudioOut2Grain AudioOut2CaptureGrain(const AudioOut2Context& context) {
         auto& port = g_ports[index];
         if (!port.used || port.context != &context || port.channels == 0) continue;
         const void* data = port.repeatedData;
-        if (!port.queuedData.empty()) {
+        std::vector<std::byte> queued;
+        const bool dequeued = !port.queuedData.empty();
+        if (dequeued) {
             data = port.queuedData.front();
             port.queuedData.pop_front();
+            queued = std::move(port.queuedPcm.front());
+            port.queuedPcm.pop_front();
         }
-        if (data != nullptr) grain.push_back({index, port.generation, data});
+        if (data == nullptr) continue;
+        const bool shared = std::any_of(g_ports.begin(), g_ports.end(), [&](const AudioOut2Port& other) {
+            return &other != &port && other.used && other.context == &context && other.data == data;
+        });
+        if (!shared) grain.push_back({index, port.generation, data, {}});
+        else if (dequeued) grain.push_back({index, port.generation, nullptr, std::move(queued)});
+        else grain.push_back({index, port.generation, nullptr, port.pcm});
     }
     return grain;
 }
@@ -118,10 +129,11 @@ AudioOut2Grain AudioOut2CaptureGrain(const AudioOut2Context& context) {
 std::uint32_t AudioOut2MixPorts(const AudioOut2Context& context, const AudioOut2Grain& grain, float* out, float* padOut, std::uint32_t frames) {
     std::lock_guard lock(g_portsLock);
     std::uint32_t mixed = 0;
-    for (const auto& [index, generation, data] : grain) {
-        if (index >= g_ports.size()) continue;
-        const auto& port = g_ports[index];
-        if (!port.used || port.generation != generation || port.context != &context || port.channels == 0) continue;
+    for (const auto& captured : grain) {
+        if (captured.index >= g_ports.size()) continue;
+        const auto& port = g_ports[captured.index];
+        if (!port.used || port.generation != captured.generation || port.context != &context || port.channels == 0) continue;
+        const void* data = captured.data != nullptr ? captured.data : static_cast<const void*>(captured.bytes.data());
         auto route = AudioOut2RouteForPort(port.type, port.channels);
         if (padOut == nullptr) {
             if (route == AudioOut2Route::PadVibration) continue;
@@ -132,6 +144,26 @@ std::uint32_t AudioOut2MixPorts(const AudioOut2Context& context, const AudioOut2
         mixed++;
     }
     return mixed;
+}
+
+void AudioOut2TracePortData(const AudioOut2Context& context, std::uint32_t frames) {
+    std::lock_guard lock(g_portsLock);
+    for (std::size_t index = 0; index < g_ports.size(); index++) {
+        const auto& port = g_ports[index];
+        if (!port.used || port.context != &context || port.data == nullptr || port.pcm.empty()) continue;
+        std::size_t nonzero = 0;
+        float peak = 0.0f;
+        float in[AUDIO_OUT2_PORT_CHANNELS_MAX];
+        for (std::uint32_t frame = 0; frame < frames; frame++) {
+            ReadFrame(port, port.pcm.data(), frame, in);
+            for (std::uint32_t c = 0; c < port.channels; c++) {
+                nonzero += in[c] != 0.0f;
+                peak = std::max(peak, std::fabs(in[c]));
+            }
+        }
+        std::fprintf(stderr, "[audioout2]   port %zu (%u ch, %llu data sets): %zu of %zu samples non-zero, peak %.4f\n", index + 1, port.channels,
+            static_cast<unsigned long long>(port.dataSets), nonzero, static_cast<std::size_t>(frames) * port.channels, static_cast<double>(peak));
+    }
 }
 
 bool AudioOut2HasPadPorts(const AudioOut2Context& context) {
@@ -244,9 +276,21 @@ int APS5_VABI sceAudioOut2PortSetAttributes(AudioOut2PortHandle port, const Audi
         if (attribute.value == nullptr) {
             verdict = "null value";
         } else if (attribute.attribute_id == ATTRIBUTE_DATA && attribute.value_size == sizeof(entry->data)) {
-            std::memcpy(&entry->data, attribute.value, sizeof(entry->data));
+            // The grain is copied now as well: the buffer may be refilled for another port before the push.
+            const void* source = nullptr;
+            std::memcpy(&source, attribute.value, sizeof(source));
+            entry->data = source;
+            if (source != nullptr) {
+                const auto bytes = static_cast<std::size_t>(entry->context->grain) * entry->channels * (entry->int16 ? sizeof(std::int16_t) : sizeof(float));
+                entry->pcm.resize(bytes);
+                std::memcpy(entry->pcm.data(), source, bytes);
+            }
             entry->queuedData.push_back(entry->data);
-            if (entry->queuedData.size() > QUEUED_DATA_MAX) entry->queuedData.pop_front();
+            entry->queuedPcm.push_back(source != nullptr ? entry->pcm : std::vector<std::byte>{});
+            if (entry->queuedData.size() > QUEUED_DATA_MAX) {
+                entry->queuedData.pop_front();
+                entry->queuedPcm.pop_front();
+            }
             entry->repeatedData = entry->data != nullptr && (entry->lastBuffer == nullptr || entry->lastBuffer == entry->data) ? entry->data : nullptr;
             if (entry->data != nullptr) entry->lastBuffer = entry->data;
             entry->dataSets++;

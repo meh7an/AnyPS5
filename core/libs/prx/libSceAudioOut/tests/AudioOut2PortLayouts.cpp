@@ -100,11 +100,31 @@ struct PortData {
     std::vector<float> volume;
 };
 
-std::vector<float> Play(const std::vector<PortData>& inputs) {
+std::filesystem::path CapturePath() {
     const auto path = std::filesystem::temp_directory_path() / ("anyps5_audio_out2_port_layouts-" + std::to_string(std::random_device{}()) + ".raw");
     std::filesystem::remove(path);
     SetEnvironment("SDL_DISKAUDIOFILE", path.string());
+    return path;
+}
 
+// The samples the disk audio driver wrote to `path`, without the silence around them.
+std::vector<float> Played(const std::filesystem::path& path) {
+    std::ifstream file(path, std::ios::binary);
+    const std::vector<char> bytes{std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>()};
+    file.close();
+    std::filesystem::remove(path);
+    Require(bytes.size() % sizeof(float) == 0);
+
+    const auto* samples = reinterpret_cast<const float*>(bytes.data());
+    std::size_t first = 0;
+    std::size_t last = bytes.size() / sizeof(float);
+    while (first < last && samples[first] == 0.0f) first++;
+    while (last > first && samples[last - 1] == 0.0f) last--;
+    return {samples + first, samples + last};
+}
+
+std::vector<float> Play(const std::vector<PortData>& inputs) {
+    const auto path = CapturePath();
     const auto context = CreateContext();
     std::vector<AudioOut2PortHandle> ports;
     for (const auto& input : inputs) {
@@ -119,19 +139,7 @@ std::vector<float> Play(const std::vector<PortData>& inputs) {
     for (std::uint32_t push = 0; push < silentGrains; push++) Require(sceAudioOut2ContextPush(context, 1) == 0);
     for (const auto port : ports) Require(sceAudioOut2PortDestroy(port) == 0);
     Require(sceAudioOut2ContextDestroy(context) == 0);
-
-    std::ifstream file(path, std::ios::binary);
-    const std::vector<char> bytes{std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>()};
-    file.close();
-    std::filesystem::remove(path);
-    Require(bytes.size() % sizeof(float) == 0);
-
-    const auto* samples = reinterpret_cast<const float*>(bytes.data());
-    std::size_t first = 0;
-    std::size_t last = bytes.size() / sizeof(float);
-    while (first < last && samples[first] == 0.0f) first++;
-    while (last > first && samples[last - 1] == 0.0f) last--;
-    return {samples + first, samples + last};
+    return Played(path);
 }
 
 std::vector<float> Play(std::uint32_t format, const void* data, const std::vector<float>& volume) {
@@ -233,6 +241,35 @@ void TestPadPortsWithoutPadDevice() {
     Require(Play({{portTypePadVibration, Format(stereo.channels, formatFloat), vibration.data(), unity}}).empty());
 }
 
+// A title may hand every port the same scratch buffer, refilling it for each port's set and reusing it
+// before the push (CRI ADX2 in Sonic Origins): each port plays what the buffer held at its own set.
+void TestSharedBuffer() {
+    const auto first = FloatGrain(2);
+    std::vector<float> second(first.size());
+    std::vector<float> expected(first.size());
+    for (std::size_t sample = 0; sample < first.size(); sample++) {
+        second[sample] = -0.5f * first[sample];
+        expected[sample] = first[sample] + second[sample];
+    }
+
+    const auto path = CapturePath();
+    const auto context = CreateContext();
+    AudioOut2PortHandle ports[2] = {};
+    for (auto& port : ports) Require(CreatePort(context, Format(2, formatFloat), &port) == 0);
+    std::vector<float> buffer(first.size());
+    std::copy(first.begin(), first.end(), buffer.begin());
+    SetData(ports[0], buffer.data());
+    std::copy(second.begin(), second.end(), buffer.begin());
+    SetData(ports[1], buffer.data());
+    std::fill(buffer.begin(), buffer.end(), 0.0f);
+    Require(sceAudioOut2ContextPush(context, 1) == 0);
+    for (const auto port : ports) SetData(port, nullptr);
+    for (std::uint32_t push = 0; push < silentGrains; push++) Require(sceAudioOut2ContextPush(context, 1) == 0);
+    for (const auto port : ports) Require(sceAudioOut2PortDestroy(port) == 0);
+    Require(sceAudioOut2ContextDestroy(context) == 0);
+    RequireFold(Played(path), stereo, expected, {1.0f, 1.0f}, 1.0f);
+}
+
 void TestMeasuredMainPortFormats() {
     struct Case {
         std::uint32_t format;
@@ -300,6 +337,7 @@ int main() {
     TestHeightChannels();
     TestDroppedLfe();
     TestPadPortsWithoutPadDevice();
+    TestSharedBuffer();
     TestMeasuredMainPortFormats();
     return 0;
 }
