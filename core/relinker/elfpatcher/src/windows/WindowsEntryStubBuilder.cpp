@@ -115,13 +115,14 @@ WindowsEntryStub WindowsEntryStubBuilder::Build(const std::uint32_t dataRva, con
     // (it imports the redirection module ahead of the C runtime) gives, before any PRX brings the C
     // runtime in. From the libraries' folder; optional: a folder without it starts as before.
     std::vector<std::uint32_t> allocatorPaths;
-    std::vector<std::string> allocatorNames;
+    std::vector<std::size_t> allocatorUnits;
     for (const std::string library : {"mimalloc.dll"}) {
-        auto name = path + library;
-        if (name.size() + 1 >= PathCapacity)
+        const auto name = path + library;
+        const auto wideName = toUtf16(name);
+        if (wideName.size() + 1 >= PathCapacity)
             throw Domain::RelinkerException("Windows library path exceeds the startup buffer: " + name);
-        allocatorPaths.push_back(addString(name));
-        allocatorNames.push_back(std::move(name));
+        allocatorPaths.push_back(addWideString(wideName));
+        allocatorUnits.push_back(wideName.size());
     }
 
     std::vector<std::uint32_t> libraryPaths;
@@ -375,28 +376,29 @@ WindowsEntryStub WindowsEntryStubBuilder::Build(const std::uint32_t dataRva, con
         writeUtf8(programText);
     }
 
-    // The allocator DLLs, before any library: built into modulePath as the libraries' paths are,
-    // loaded with the same search flags, and a failure ignored.
+    // The allocator DLLs, before any library: built into the UTF-16 modulePath as the libraries'
+    // paths are, loaded with the same search flags, and a failure ignored.
     for (std::size_t index = 0; index < allocatorPaths.size(); ++index) {
         std::optional<std::size_t> tooLong;
         if (absolutePath) {
             code.Rip({0x48, 0x8d, 0x0d}, allocatorPaths[index]);
         } else {
-            // rax = r12 - rbx + length: the joined path's size; past the buffer, skip the load.
+            // rax = r12 - rbx + bytes: the joined path's size; past the buffer, skip the load.
+            const auto units = CheckedRva(allocatorUnits[index] + 1);
             code.Emit({0x4c, 0x89, 0xe0, 0x48, 0x29, 0xd8, 0x48, 0x05});
-            code.U32(CheckedRva(allocatorNames[index].size() + 1));
+            code.U32(units * 2);
             code.Emit({0x48, 0x3d});
-            code.U32(PathCapacity);
+            code.U32(PathCapacity * 2);
             tooLong = code.Branch({0x0f, 0x87});
             code.Emit({0x4c, 0x89, 0xe7});
             code.Rip({0x48, 0x8d, 0x35}, allocatorPaths[index]);
             code.Emit({0xb9});
-            code.U32(CheckedRva(allocatorNames[index].size() + 1));
-            code.Emit({0xf3, 0xa4});
+            code.U32(units);
+            code.Emit({0x66, 0xf3, 0xa5});
             code.Rip({0x48, 0x8d, 0x0d}, modulePath);
         }
         code.Emit({0x31, 0xd2, 0x41, 0xb8, 0, 0x11, 0, 0});
-        call("LoadLibraryExA");
+        call("LoadLibraryExW");
         if (tooLong) code.PatchBranch(*tooLong, code.GetRva());
     }
 
