@@ -807,10 +807,12 @@ DWORD WINAPI SampleProfiler(LPVOID param) {
     std::sort(threads.begin(), threads.end(), [](const Sampled& a, const Sampled& b) { return a.busy > b.busy; });
     emit("[sample] %llu rounds over %llu s; threads by samples running / in other kernel calls / blocked in a wait (of all):\n", rounds, seconds);
     std::unordered_map<DWORD, bool> busyThread;
+    std::unordered_map<DWORD, bool> heavyThread;
     for (std::size_t i = 0; i < threads.size() && i < 24 && threads[i].busy != 0; ++i) {
         const auto& kind = kinds[threads[i].id];
         emit("[sample]   thread %lu '%s' run %llu kernel %llu wait %llu / %llu\n", static_cast<unsigned long>(threads[i].id), threads[i].name.c_str(), kind.run, kind.kernel, kind.wait, threads[i].total);
         busyThread[threads[i].id] = threads[i].busy * 50 >= threads[i].total;
+        heavyThread[threads[i].id] = threads[i].busy * 5 >= threads[i].total;
     }
     std::unordered_map<std::string, unsigned long long> byOffset;
     unsigned long long busy = 0;
@@ -824,18 +826,24 @@ DWORD WINAPI SampleProfiler(LPVOID param) {
     std::sort(ranked.begin(), ranked.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
     emit("[sample] hottest instructions (%llu busy samples):\n", busy);
     for (std::size_t i = 0; i < ranked.size() && i < 80; ++i) emit("[sample]   %6llu %5.2f%% %s\n", ranked[i].second, busy != 0 ? 100.0 * static_cast<double>(ranked[i].second) / static_cast<double>(busy) : 0.0, ranked[i].first.c_str());
-    // Every stack of a thread busy at least 2% of its samples (its waits too: they show what it
-    // blocks on), then the other threads' most common waits.
+    // The stacks of the threads busy at least 2% of their samples (their waits too: they show what
+    // they block on), then the other threads' most common waits. A thread busy at least 20% of
+    // the time gets every stack, the ones seen once included: without them a pipeline thread lost
+    // about a third of its work samples, while its spin waits (one repeated stack) were all kept,
+    // so the listed shares overstated its waits. Other busy threads keep stacks seen twice or more,
+    // 3000 at most.
     std::vector<std::pair<std::string, unsigned long long>> rankedStacks(stacks.begin(), stacks.end());
     std::sort(rankedStacks.begin(), rankedStacks.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
     const auto threadOf = [](const std::string& key) { return static_cast<DWORD>(std::strtoul(key.c_str(), nullptr, 10)); };
     emit("[sample] stacks of the busy threads (thread, kind, leaf <- return addresses: system frames up to the first emulator or game frame, then emulator and game frames):\n");
     std::size_t emitted = 0;
     for (const auto& [key, count] : rankedStacks) {
-        if (emitted >= 3000) break;
-        if (!busyThread[threadOf(key)] || count < 2) continue;
+        const auto thread = threadOf(key);
+        if (!busyThread[thread]) continue;
+        const bool heavy = heavyThread[thread];
+        if (!heavy && (count < 2 || emitted >= 3000)) continue;
         emit("[sample-stack] %6llu %s\n", count, key.c_str());
-        ++emitted;
+        if (!heavy) ++emitted;
     }
     emit("[sample] other threads' stacks:\n");
     emitted = 0;

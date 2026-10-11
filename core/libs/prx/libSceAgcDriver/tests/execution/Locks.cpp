@@ -229,14 +229,15 @@ void GpuLockFront() {
 void DrawThreadHandOff() {
     using AgcDriver::DriverDetail::DrawThread;
     DrawThread back(0);
-    // What each of the two slots holds: written by the front before a Push, cleared by the back.
-    std::array<std::uint32_t, 2> sequence{};
+    const auto slots = static_cast<std::uint32_t>(back.Slots());
+    // What each slot of the ring holds: written by the front before a Push, cleared by the back.
+    std::vector<std::uint32_t> sequence(slots, 0);
     std::atomic<bool> ordered{true};
     back.thread = std::thread([&] {
         for (std::uint32_t taken = 0; back.AwaitRecord(taken); ++taken) {
-            if (&back.Record(taken) != &back.Record(taken + 2) || sequence[taken % 2] != taken + 1) ordered = false;
+            if (&back.Record(taken) != &back.Record(taken + slots) || sequence[taken % slots] != taken + 1) ordered = false;
             if (taken % 7919 == 0) std::this_thread::sleep_for(std::chrono::microseconds(300));
-            sequence[taken % 2] = 0;
+            sequence[taken % slots] = 0;
             back.Recorded(taken + 1);
         }
     });
@@ -246,8 +247,8 @@ void DrawThreadHandOff() {
     bool drained = true;
     bool locked = true;
     for (std::uint32_t i = 1; i <= 100000; ++i) {
-        if (&back.Slot() != &back.Record(i - 1) || sequence[(i - 1) % 2] != 0) reused = true;
-        sequence[(i - 1) % 2] = i;
+        if (&back.Slot() != &back.Record(i - 1) || sequence[(i - 1) % slots] != 0) reused = true;
+        sequence[(i - 1) % slots] = i;
         if (!back.Push()) reused = true;
         if (i % 4999 == 0) std::this_thread::sleep_for(std::chrono::milliseconds(1));
         if (i % 1000 == 0) {

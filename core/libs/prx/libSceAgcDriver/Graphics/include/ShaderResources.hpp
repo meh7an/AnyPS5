@@ -516,6 +516,8 @@ private:
     std::vector<bool> storageFirstLayer;
     std::vector<bool> storageArrayView;
     std::vector<bool> storageWritten;
+    // Whether any storage image is written: kept as they are added, for WritesMemory at every draw.
+    bool anyStorageWritten = false;
     std::vector<bool> storageAtomic;
     std::vector<bool> storageAtomic64;
     std::vector<std::shared_ptr<Sampler>> samplers;
@@ -540,6 +542,12 @@ private:
     // no image other than the object's own sources has results pending over its surfaces and
     // regions, so those checks are skipped (see fastRevalidate).
     std::uint64_t pendingSerialSeen = 0;
+    // The collect epoch and tracker generation of the last proof that took the fast path, kept only
+    // when neither the generation nor the pending serial moved through the whole call (0: none).
+    // While the calling thread's epoch, the generation and pendingSerialSeen are still those, every
+    // stamp, key and registry check of that proof answers as it did, and Revalidate skips them.
+    std::uint64_t provedEpoch = 0;
+    std::uint64_t provedGeneration = 0;
     // The import table's identity when the direct regions' serials were last proved.
     HostImportsProof importsProof;
     // FNV-1a offset basis: the hash of no data buffers (DataWordsHash).

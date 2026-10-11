@@ -12,10 +12,17 @@
 #include <map>
 #include <array>
 #include <optional>
+#include <span>
 #include <string>
 #include <vector>
 
 namespace AgcDriver {
+
+// The shader registers a draw reads again every time (QueueState::decodeGeneration): the user
+// words of the pixel, vertex/geometry and hull stages and the merged stages' user pointers.
+inline bool PerDrawShaderRegister(std::uint32_t offset) {
+    return offset - 0x0cu < 32u || offset - 0x8cu < 32u || offset - 0x10cu < 32u || offset - 0x82u < 2u || offset - 0x102u < 2u;
+}
 
 class Registers {
 public:
@@ -60,6 +67,12 @@ public:
     Registers(std::initializer_list<std::pair<std::uint32_t, std::uint32_t>> entries) {
         for (const auto& [offset, value] : entries) emplace(offset, value);
     }
+    // A bank whose Digest() leaves out the per-draw shader registers (PerDrawShaderRegister): a
+    // queue's shader bank, whose digest keys the decode cache without them (DrawDecode.cpp). Their
+    // writes, about one SET_SH_REG word per draw and stage, then skip the digest's hashing too.
+    struct ExcludePerDrawWords {};
+    explicit Registers(ExcludePerDrawWords) : perDrawExcluded(true) {}
+    bool PerDrawWordsExcluded() const { return perDrawExcluded; }
 
     const_iterator begin() const { return {this, nextPresent(0)}; }
     const_iterator end() const { return {this, End}; }
@@ -74,34 +87,79 @@ public:
         values.clear();
         present.clear();
         entries = 0;
+        digest = 0;
+        digestStale = false;
     }
     std::pair<const_iterator, bool> emplace(std::uint32_t offset, std::uint32_t value) {
         if (contains(offset)) return {const_iterator{this, offset}, false};
         mark(offset) = value;
+        if (inDigest(offset)) digest ^= EntryDigest(offset, value);
         return {const_iterator{this, offset}, true};
     }
     std::pair<const_iterator, bool> insert_or_assign(std::uint32_t offset, std::uint32_t value) {
         if (contains(offset)) {
+            // An unchanged value leaves the digest as it is (the two entry digests would cancel).
+            if (values[offset] == value) return {const_iterator{this, offset}, false};
+            if (inDigest(offset)) digest ^= EntryDigest(offset, values[offset]) ^ EntryDigest(offset, value);
             values[offset] = value;
             return {const_iterator{this, offset}, false};
         }
         mark(offset) = value;
+        if (inDigest(offset)) digest ^= EntryDigest(offset, value);
         return {const_iterator{this, offset}, true};
     }
+    // The references handed out for writing leave the digest to be taken again.
     std::uint32_t& operator[](std::uint32_t offset) {
+        digestStale = true;
         if (contains(offset)) return values[offset];
         return mark(offset) = 0;
     }
     std::uint32_t& at(std::uint32_t offset) {
         if (!contains(offset)) throw std::out_of_range("register is not set");
+        digestStale = true;
         return values[offset];
+    }
+    // The XOR of EntryDigest over every entry (the per-draw shader registers left out in a bank made
+    // with ExcludePerDrawWords), kept with each change: equal registers have equal digests (the
+    // decode cache's key, DrawDecode.cpp).
+    std::uint64_t Digest() const {
+        if (digestStale) {
+            digest = 0;
+            for (const auto& [offset, value] : *this) {
+                if (inDigest(offset)) digest ^= EntryDigest(offset, value);
+            }
+            digestStale = false;
+        }
+        return digest;
+    }
+    // MurmurHash3's 64-bit finalizer over the offset and value: a bijection, so no two entries mix
+    // to the same word.
+    static std::uint64_t EntryDigest(std::uint32_t offset, std::uint32_t value) {
+        auto word = (static_cast<std::uint64_t>(offset) << 32u) | value;
+        word ^= word >> 33u;
+        word *= 0xff51afd7ed558ccdull;
+        word ^= word >> 33u;
+        word *= 0xc4ceb9fe1a85ec53ull;
+        word ^= word >> 33u;
+        return word;
     }
     const std::uint32_t& at(std::uint32_t offset) const {
         if (!contains(offset)) throw std::out_of_range("register is not set");
         return values[offset];
     }
+    // The values of the registers from `offset` on into `out`, one pass over the bank: false (with
+    // `out` partly written) when one of them is not set.
+    bool ReadRange(std::uint32_t offset, std::span<std::uint32_t> out) const {
+        for (std::size_t i = 0; i < out.size(); ++i) {
+            const auto index = offset + static_cast<std::uint32_t>(i);
+            if (!contains(index)) return false;
+            out[i] = values[index];
+        }
+        return true;
+    }
     std::size_t erase(std::uint32_t offset) {
         if (!contains(offset)) return 0;
+        if (inDigest(offset)) digest ^= EntryDigest(offset, values[offset]);
         present[offset / 64] &= ~(std::uint64_t{1} << (offset % 64));
         --entries;
         return 1;
@@ -117,6 +175,7 @@ public:
 
 private:
     static constexpr std::size_t End = ~std::size_t{0};
+    bool inDigest(std::uint32_t offset) const { return !perDrawExcluded || !PerDrawShaderRegister(offset); }
     std::uint32_t& mark(std::uint32_t offset) {
         if (offset >= values.size()) {
             const auto words = static_cast<std::size_t>(offset) / 64 + 1;
@@ -138,6 +197,9 @@ private:
     std::vector<std::uint32_t> values;
     std::vector<std::uint64_t> present;
     std::size_t entries = 0;
+    mutable std::uint64_t digest = 0;
+    mutable bool digestStale = false;
+    bool perDrawExcluded = false;
 };
 
 inline Registers BuildInitialContextRegisters() {
@@ -190,7 +252,7 @@ inline std::uint64_t NextDecodeGeneration() {
 }
 
 struct QueueState {
-    Registers shader;
+    Registers shader{Registers::ExcludePerDrawWords{}};
     Registers context = InitialContextRegisters();
     Registers userConfig{{0x24a, 0}, {0x24b, 0}};
     std::optional<Registers> savedContext;

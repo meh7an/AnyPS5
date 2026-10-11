@@ -12,6 +12,7 @@
 #include "prx/libSceAgcDriver/Eq/include/Event.hpp"
 #include <cstdlib>
 #include <functional>
+#include <span>
 #include <shared_mutex>
 
 namespace AgcDriver::DriverDetail {
@@ -37,10 +38,17 @@ void Driver::timed(double WorkerProfile::*bucket, TWork&& work) {
 
 namespace {
 
-// Packets a draw thread may go on recording across (DrawThread): draws, and packets that only
-// change the queue's state (registers, index and instance state, predication setup, constant RAM,
-// markers, context state).
-bool drawThreadPassesOver(std::uint32_t header, std::uint32_t opcode) {
+// Packets a draw thread may go on recording across (DrawThread): draws, packets that only change
+// the queue's state (registers, index and instance state, predication setup, constant RAM,
+// markers, context state), and EVENT_WRITE's partial and cache flushes and ACQUIRE_MEM, which the
+// driver does nothing for (its barriers order the work; whatever a packet records still takes the
+// GPU mutex, whose front drains first). EVENT_WRITE was nearly every drain on the S3K menu, about
+// 38 per frame. APS5_DRAIN_EVENT_WRITES=1 drains before both again.
+bool drawThreadPassesOver(std::span<const std::uint32_t> packet, std::uint32_t opcode) {
+    const auto header = packet[0];
+    static const bool drainEvents = std::getenv("APS5_DRAIN_EVENT_WRITES") != nullptr;
+    if (opcode == 0x46) return !drainEvents && packet.size() >= 2 && (packet[1] & 0x3fu) != 0x39u;
+    if (opcode == 0x58) return !drainEvents;
     switch (opcode) {
         case 0x10:
             switch ((header >> 2u) & 0x3fu) {
@@ -52,6 +60,17 @@ bool drawThreadPassesOver(std::uint32_t header, std::uint32_t opcode) {
             return true;
         default:
             return Pm4::DrawOpcode(opcode);
+    }
+}
+
+// A packet that only changes the queue state: register writes (an indirect list's registers were
+// read at submission), index and instance state, the indirect bases and constant RAM.
+bool statePacket(std::uint32_t opcode) {
+    switch (opcode) {
+        case 0x11: case 0x13: case 0x26: case 0x2a: case 0x2f: case 0x63: case 0x64: case 0x69: case 0x76: case 0x79: case 0x7a: case 0x81: case 0x9f:
+            return true;
+        default:
+            return false;
     }
 }
 
@@ -139,6 +158,14 @@ void Driver::execute(const Submission& submission) {
     auto& packetProfile = ShaderRecompiler::ThreadOwned(packetProfileSlot);
     ++packetProfile.submissions;
 
+    // A pure state packet (statePacket, about 81% of the packets on the S2 menu page) that is not
+    // predicated changes the queue state and nothing else: it skips the drain test (it passes over
+    // the draw thread), the device-use gate, the packet tag, the flush decision (made at the next
+    // other packet instead, well under a microsecond later), the packet memory pass and the progress
+    // counters. Every packet takes the full path while a mode needs to see each one, or with
+    // APS5_NO_STATE_FAST_PATH=1.
+    static const bool stateFastPath = std::getenv("APS5_NO_STATE_FAST_PATH") == nullptr && std::getenv("APS5_DRAIN_ALL") == nullptr && !profilePackets && !traceGpu && dumpQueue < 0 && !packetEpoch() && !CaptureTrace::Enabled();
+
     bumpEpoch(&EpochBumps::submissions);
     clearResolvedAhead();
     gateOpened() = true;
@@ -154,12 +181,25 @@ void Driver::execute(const Submission& submission) {
         const auto packet = std::span(submission.commands).subspan(cursor, count);
         const auto opcode = (header >> 8u) & 0xffu;
         auto nextCursor = cursor + count;
+        if (stateFastPath && statePacket(opcode) && !(Pm4::Predicated(header) && queue.predication.operation != 0)) {
+            recent.Record(cursor);
+            if (Pm4::IndirectRegisterOpcode(opcode)) Pm4::ExecuteIndirectRegisters(packet, submission.registerLists.at(cursor), queue);
+            else Pm4::Execute(packet, queue);
+            cursor = nextCursor;
+            continue;
+        }
         if (APS5_ENABLE_TIMING_LOG && submission.queue == 0 && pendingFrameTiming == nullptr) includeTimingSubmission(submission, false);
         PerformanceContext timingContext(submission.queue == 0 ? pendingFrameTiming.get() : FrameTiming::Async());
         PerformanceTimer timing("Driver.Packet");
         // The draw thread may still be recording the last draw: any other packet with effects
         // outside the queue state, or a predicated one (its predicate is read), waits for it.
-        if (back != nullptr && back->Busy() && (!drawThreadPassesOver(header, opcode) || (Pm4::Predicated(header) && queue.predication.operation != 0))) back->Drain(DrawThread::Wait::Packet);
+        // With ring writes (DrawThread::RingWrites) a label or a packet store goes to the draw thread as a record when
+        // it can (Driver::ringWrite); one that cannot takes the GPU mutex, whose front drains, or
+        // drains on its own (a deferred label). A wait that a pending or recorded write satisfies
+        // at once passes over too.
+        const bool ringPacket = DrawThread::RingWrites() && (opcode == 0x49 || opcode == 0x37 || opcode == 0x50 || opcode == 0x40 || opcode == 0x83);
+        const bool ringWait = DrawThread::RingWrites() && opcode == 0x3c && packet.size() >= 4 && (ringWaitSatisfied(packet, submission.received) || storedSince(packet, packet[2] | (static_cast<std::uint64_t>(packet[3]) << 32u), Pm4::WaitAwaitedBytes(packet), submission.received));
+        if (back != nullptr && back->Busy() && ((!drawThreadPassesOver(packet, opcode) && !ringPacket && !ringWait) || (Pm4::Predicated(header) && queue.predication.operation != 0))) back->Drain(DrawThread::Wait::Packet, opcode);
         std::shared_lock deviceUse(deviceReplacement, std::defer_lock);
         if (opcode != 0x3c && opcode != 0x93 && header != RenderingWaitPacketHeader && header != FlipPacketHeader) deviceUse.lock();
 

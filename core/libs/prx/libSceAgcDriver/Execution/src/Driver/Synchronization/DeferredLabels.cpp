@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawThread.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
@@ -160,6 +161,8 @@ bool Driver::recordLabelsForPacket(VulkanDevice* localDevice, std::uint32_t queu
 }
 
 void Driver::recordQueuedLabelsBeforeRead(std::uint32_t queue) {
+    // Writes handed to the draw thread are recorded before the read, as queued labels are.
+    if (ringWritesPending()) FrontDrawThread()->Drain(DrawThread::Wait::Lock);
     if (deferredLabels().labels.empty()) return;
     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Label);
     std::lock_guard gpuLock(GuestMemory::GpuMutex());
@@ -168,6 +171,13 @@ void Driver::recordQueuedLabelsBeforeRead(std::uint32_t queue) {
 }
 
 bool Driver::recordQueuedLabelsAfterCapture(std::uint32_t queue, std::span<const ShaderRecompiler::MemoryRegion> regions) {
+    // A capture over a write handed to the draw thread is taken again once it is recorded, as one
+    // over a queued label is.
+    if (ringWritesOverlap(regions)) {
+        FrontDrawThread()->Drain(DrawThread::Wait::Lock);
+        ++captureRetries;
+        return true;
+    }
     const auto& labels = deferredLabels().labels;
     if (labels.empty()) return false;
     for (const auto& label : labels) {

@@ -60,6 +60,19 @@ struct PreparedDraw {
     std::optional<ShaderMemory> shaderMemory;
     std::vector<std::vector<Graphics::DecodeRead>> decodeReads;
 
+    // A record of writes instead of a draw (stage 4, Driver::ringWrite): the end-of-pipe labels and
+    // small packet stores the worker handed over, written in order by Driver::recordRingWrites.
+    struct Write {
+        std::uint64_t address = 0;
+        std::uint64_t stamp = 0;
+        std::uint32_t size = 0;
+        // A packet store: storage images over its range are stored first, and the bytes go to
+        // guest memory one at a time when it falls back to the CPU (a label's go a dword at a time).
+        bool store = false;
+        std::array<std::byte, 64> bytes{};
+    };
+    std::vector<Write> writes;
+
     bool busy = false;
 
     // Empties the record, keeping every list's capacity (the inner ones of decodeReads and
@@ -91,6 +104,7 @@ struct PreparedDraw {
         }
         shaderMemory.reset();
         for (auto& reads : decodeReads) reads.clear();
+        writes.clear();
     }
 };
 

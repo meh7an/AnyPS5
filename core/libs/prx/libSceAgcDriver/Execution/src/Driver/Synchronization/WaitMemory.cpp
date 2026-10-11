@@ -132,13 +132,24 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
         }
     } epochPoint;
     GuestMemory::CheckRange(reinterpret_cast<const void*>(awaited), awaitedBytes, awaitedBytes);
+    // A write this worker handed to its draw thread (Driver::ringWrite) lands ahead of whatever the
+    // worker records next, as a recorded one does.
+    if (ringWaitSatisfied(packet, received)) {
+        ++outcomes.fromRecorderSameQueue;
+        epochPoint.bump = false;
+        return;
+    }
     if (Pm4::WaitSatisfiedUnchecked(packet)) {
         ++outcomes.atEntry;
         return;
     }
     if (heldAtSubmit) return;
-    if (std::uint32_t writer = queue; !requireMemory && storedSince(packet, awaited, awaitedBytes, received, &writer)) {
+    // A store this queue recorded itself orders no CPU write: the epoch stays, as for a write the
+    // draw thread still holds above (a value another queue stored still moves it).
+    bool ownStore = false;
+    if (std::uint32_t writer = queue; !requireMemory && storedSince(packet, awaited, awaitedBytes, received, &writer, queue, &ownStore)) {
         if (writer != queue) notePendingWait(packet, queue, received);
+        if (ownStore && ownLabelWaitsKeepEpoch()) epochPoint.bump = false;
         return;
     }
 
@@ -329,8 +340,9 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
     bool spinning = pauseSpin;
     std::uint32_t polls = 0;
     while (!Pm4::WaitSatisfiedUnchecked(packet)) {
-        if (std::uint32_t writer = queue; !requireMemory && storedSince(packet, awaited, awaitedBytes, received, &writer)) {
+        if (std::uint32_t writer = queue; !requireMemory && storedSince(packet, awaited, awaitedBytes, received, &writer, queue, &ownStore)) {
             if (writer != queue) notePendingWait(packet, queue, received);
+            if (ownStore && ownLabelWaitsKeepEpoch()) epochPoint.bump = false;
             return;
         }
         ++polls;

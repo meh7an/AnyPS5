@@ -124,12 +124,17 @@ private:
     // Whether this draw uses the draw cache (key, lookup, insertion). A title that writes its per-draw
     // constants to fresh addresses every frame changes the user data words of every draw, so the
     // register key never repeats and the cache only costs: a probe window of lookups hitting under
-    // 1 in 32 parks the cache for DrawCacheParkDraws draws, then another window probes again.
-    // APS5_DRAW_CACHE_ALWAYS=1 never parks it.
+    // 1 in 32 parks the cache for DrawCacheParkDraws draws, then another window probes again. Each
+    // window that fails again in a row doubles the park, up to DrawCacheParkDoublings times, and a
+    // park also ends after DrawCacheParkMaxFlips flips: a window costs about 9 ms on a 2,900-draw
+    // frame, so on such a page the fixed park made it a stutter every 0.45 s.
+    // APS5_DRAW_CACHE_PARK_BACKOFF=0 keeps the fixed park; APS5_DRAW_CACHE_ALWAYS=1 never parks it.
     bool drawCacheActive();
     void noteDrawCacheLookup(bool hit);
     static constexpr std::uint32_t DrawCacheProbeLookups = 2048;
     static constexpr std::uint64_t DrawCacheParkDraws = 60000;
+    static constexpr std::uint32_t DrawCacheParkDoublings = 6;
+    static constexpr std::uint64_t DrawCacheParkMaxFlips = 600;
     static bool verifyDrawEntries();
     static bool registerKeyEnabled();
     static bool verifyDrawRecipe();
@@ -163,7 +168,7 @@ private:
     // result's user data copies cannot be named or do not hold, when its reads are not write-watched,
     // or when they changed under the capture. Under APS5_VERIFY_STAGE_MEMO `memoResult` (what the memo
     // would have served) is compared with the capture's result first.
-    void insertStageMemo(std::uint64_t hash, const std::shared_ptr<const ShaderRecompiler::SourceHandle>& handle, std::uint32_t pushOffset, const std::vector<std::uint32_t>& key, std::uint64_t mappings, const std::shared_ptr<const ShaderRecompiler::RecompileResult>& result, const std::shared_ptr<const ShaderRecompiler::RecompileResult>& memoResult, std::span<const std::uint32_t> userData, std::span<const ShaderRecompiler::MemoryRegion> recent, std::uint64_t codeAddress);
+    void insertStageMemo(std::uint64_t hash, const std::shared_ptr<const ShaderRecompiler::SourceHandle>& handle, std::uint32_t pushOffset, const std::vector<std::uint32_t>& key, std::uint64_t mappings, const std::shared_ptr<const ShaderRecompiler::RecompileResult>& result, const std::shared_ptr<const ShaderRecompiler::RecompileResult>& memoResult, std::span<const std::uint32_t> userData, std::span<const ShaderRecompiler::MemoryRegion> recent, std::uint64_t codeAddress, const ShaderRecompiler::ResourceCapture* capture);
     std::shared_ptr<const ShaderRecompiler::RecompileResult> materializeDrawStage(std::size_t i, std::uint32_t pushOffset, const QueueState& queue, const Submission& submission, const std::vector<DrawProgram>& programs, const Graphics::State& graphics, const ShaderRecompiler::ShaderPixelStageInfo& pixel, const std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>>& vertexInfos, std::vector<ShaderRecompiler::RecompileRequest>& requests, std::vector<ShaderRecompiler::MemoryRegion>& memory, const std::vector<ShaderRecompiler::LinkedProgram>& linked, const Pm4::DrawParameters& drawParameters, const std::shared_ptr<VulkanDevice>& localDevice, ShaderMemory& shaderMemory, std::vector<StageCapture>& stageCaptures, std::vector<bool>& recompiled, bool drawHit, bool wantRegions, const std::vector<std::shared_ptr<DispatchVariant>>& matched, const std::vector<std::vector<ShaderRecompiler::MemoryRegion>>& matchedRegions, bool profile, std::uint64_t dumpTarget, std::uint64_t dumpSlot1, std::uint64_t& captures, DrawPhaseTiming& phaseTiming, std::array<double, DrawDriverPhaseCount>& phaseMs, std::string& rejected);
     void cacheDrawStages(bool useDrawEntries, bool drawHit, const Pm4::DrawParameters& drawParameters, const std::optional<Graphics::IndirectDrawPath>& indirectCpu, const std::vector<DrawProgram>& programs, const std::vector<StageCapture>& stageCaptures, const std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>>& vertexInfos, const std::vector<std::vector<Graphics::DecodeRead>>& decodeReads, bool verifyHit, const std::vector<std::shared_ptr<DispatchVariant>>& matched, std::vector<std::shared_ptr<DispatchVariant>>& fresh, std::uint64_t drawKey, bool registerKey, const std::shared_ptr<const DrawDecode>& decode, DrawPhaseTiming& phaseTiming);
     static bool drawPrecheck();
@@ -180,6 +185,19 @@ private:
     void recordPrepared(PreparedDraw& prepared, std::unique_lock<GuestMemory::GpuMutexType>& gpuLock, PerformanceTimer& timing, DrawPhaseTiming& phaseTiming);
     // A queue's draw back thread (DrawThread): records the draws its worker hands over.
     void runDrawThread(DrawThread& back) noexcept;
+    // Stage 4 of the split (APS5_NO_RING_WRITES=1 turns it off): an end-of-pipe label or a packet store of up to 64
+    // bytes goes to the draw thread as a record of its own while the thread is busy, instead of
+    // being recorded under the GPU mutex after waiting for the draws in flight. False: the caller
+    // records it as before (the thread idle or gone, labels deferred before it, too large). The
+    // worker keeps the writes it handed over until they are recorded: its own WAIT_REG_MEM on one
+    // is satisfied by it (ringWaitSatisfied), and a capture or read over one drains the thread
+    // first (ringWritesOverlap, recordQueuedLabelsBeforeRead). The label tables learn of a write
+    // only when the draw thread records it, so another queue never runs ahead of it.
+    bool ringWrite(std::uint32_t queue, std::uint64_t address, std::span<const std::byte> bytes, bool store);
+    bool ringWaitSatisfied(std::span<const std::uint32_t> packet, std::uint64_t received);
+    bool ringWritesPending();
+    bool ringWritesOverlap(std::span<const ShaderRecompiler::MemoryRegion> regions);
+    void recordRingWrites(PreparedDraw& prepared, std::unique_lock<GuestMemory::GpuMutexType>& gpuLock);
     void addDriverPhases(DispatchClass which, const std::array<double, DriverPhaseCount>& ms, bool hit, bool validated);
     static PendingDispatchPhases& pendingDispatchPhases();
     static std::chrono::steady_clock::time_point& packetStartedAt();
@@ -188,7 +206,13 @@ private:
     static DrawVerdict drawnVerdict(DrawPhaseTiming& phaseTiming, std::uint64_t captures);
     void addDrawPhases(const std::array<double, DrawDriverPhaseCount>& ms, bool drawn, std::uint64_t captures);
     void noteLabelStore(std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t stamp, std::uint32_t queue);
-    bool storedSince(std::span<const std::uint32_t> packet, std::uint64_t address, std::size_t bytes, std::uint64_t received, std::uint32_t* writer = nullptr);
+    // Whether a store recorded after `received` holds a value the wait compares true to; `byQueue`
+    // (when given) tells whether every such store was `queue`'s own.
+    bool storedSince(std::span<const std::uint32_t> packet, std::uint64_t address, std::size_t bytes, std::uint64_t received, std::uint32_t* writer = nullptr, std::uint32_t queue = 0, bool* byQueue = nullptr);
+    // Whether a wait satisfied by a store its own queue recorded leaves the collect epoch as it is
+    // (GuestMemory::BumpCollectEpoch: such a label orders no CPU write); APS5_BUMP_OWN_LABEL_WAITS=1
+    // bumps it, as before.
+    static bool ownLabelWaitsKeepEpoch();
     static void traceLabel(std::span<const std::uint32_t> packet, std::uint32_t queue);
     static std::array<WriteRecord, 16384>& writeHistory();
     static std::size_t& writeCursor();
@@ -363,9 +387,12 @@ private:
     AgcDriver::Mutex drawCacheMutex;
     std::uint64_t drawCacheHits = 0, drawCacheEvictions = 0, drawCacheVariants = 0, drawCacheVariantBytes = 0;
     // The draw cache parks itself while it does not pay (drawCacheActive): draws counted, the draw
-    // count the park lasts until, and the current probe window's lookups and hits.
+    // count and the flip count the park lasts until, the failed windows in a row, and the current
+    // probe window's lookups and hits.
     std::atomic<std::uint64_t> drawCacheDraws{0};
     std::atomic<std::uint64_t> drawCacheParkedUntil{0};
+    std::atomic<std::uint64_t> drawCacheParkedUntilFlip{0};
+    std::atomic<std::uint32_t> drawCacheFailedWindows{0};
     std::atomic<std::uint32_t> drawCacheWindowLookups{0};
     std::atomic<std::uint32_t> drawCacheWindowHits{0};
     std::atomic<std::uint64_t> drawCacheParks{0};
@@ -380,10 +407,12 @@ private:
         const void* source = nullptr;
         std::uint32_t pushOffset = 0;
         std::list<std::uint64_t>::iterator order;
-        // The result the slot last served, patched in place by the next hit while no draw holds it
-        // (a copy of the entry's result per hit cost a few dozen allocations). A hit that finds it
-        // held (the draw cache's variants keep theirs until evicted) copies, and the copy replaces it.
-        std::shared_ptr<ShaderRecompiler::RecompileResult> served;
+        // The results the slot served, each patched in place by a later hit while no draw holds it
+        // (a copy of the entry's result per hit cost a few dozen allocations). Several, because the
+        // draws in the draw thread's ring hold theirs (as the draw cache's variants do until
+        // evicted): a hit that finds all of them held copies, and the copy joins them
+        // (APS5_STAGE_MEMO_COPIES, 1 to 8, 8 by default).
+        std::array<std::shared_ptr<ShaderRecompiler::RecompileResult>, 8> served;
         // The entry's misses in a row (its words changed): a key whose words keep changing is
         // validated and stored again only at powers of two of them, then every 64th.
         std::uint32_t misses = 0;

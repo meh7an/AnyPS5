@@ -157,6 +157,63 @@ void testRegisterFile() {
     check(threw, "register file read an unset register");
 }
 
+// The digest the decode cache keys on: equal registers digest equally whatever wrote them, and every
+// change, a write through a reference included, moves it.
+void testRegisterDigest() {
+    AgcDriver::Registers registers{{0x300, 3}, {0x10, 1}, {0x41, 2}};
+    AgcDriver::Registers reordered;
+    reordered.insert_or_assign(0x41, 9);
+    reordered.emplace(0x300, 3);
+    reordered.insert_or_assign(0x10, 1);
+    reordered.insert_or_assign(0x41, 2);
+    check(reordered == registers && reordered.Digest() == registers.Digest(), "register digest depends on the order of the writes");
+    const auto before = registers.Digest();
+    registers.insert_or_assign(0x41, 4);
+    check(registers.Digest() != before, "register digest missed an assignment");
+    registers.insert_or_assign(0x41, 2);
+    check(registers.Digest() == before, "register digest did not come back with the value");
+    registers.emplace(0x7000, 0);
+    check(registers.Digest() != before, "register digest missed a new register");
+    registers.erase(0x7000);
+    check(registers.Digest() == before, "register digest missed an erase");
+    auto written = registers;
+    written[0x10] = 5;
+    check(written.Digest() != before && registers.Digest() == before, "register digest missed a write through a reference");
+    written.at(0x10) = 1;
+    check(written.Digest() == before, "register digest was not taken again after a write through at");
+    AgcDriver::Registers swapped{{0x10, 0x41}, {0x41, 0x10}, {0x300, 3}};
+    check(swapped.Digest() != before, "register digest confused two registers' values");
+    registers.clear();
+    check(registers.Digest() == AgcDriver::Registers{}.Digest(), "register digest survived a clear");
+}
+
+// A queue's shader bank leaves the per-draw registers (the stages' user words and the merged
+// stages' user pointers) out of its digest: the decode cache's key without them, kept as they
+// change, equal to a plain bank's digest of the other registers.
+void testPerDrawWordsLeftOutOfDigest() {
+    AgcDriver::QueueState state;
+    check(state.shader.PerDrawWordsExcluded(), "a queue's shader bank keeps the per-draw registers in its digest");
+    AgcDriver::Registers plain{{0x4, 7}, {0x200, 9}};
+    state.shader.insert_or_assign(0x4, 7);
+    state.shader.insert_or_assign(0x200, 9);
+    const auto before = state.shader.Digest();
+    check(before == plain.Digest(), "the shader bank's digest differs from the same registers' plain digest");
+    for (const std::uint32_t offset : {0x0cu, 0x2bu, 0x8cu, 0xabu, 0x10cu, 0x12bu, 0x82u, 0x83u, 0x102u, 0x103u}) {
+        state.shader.insert_or_assign(offset, 0x1234);
+        check(state.shader.Digest() == before, "a per-draw register write moved the shader bank's digest");
+    }
+    state.shader.insert_or_assign(0x0c, 0x5678);
+    state.shader.erase(0x8c);
+    check(state.shader.Digest() == before, "a per-draw register change moved the shader bank's digest");
+    state.shader.insert_or_assign(0x2c, 1);
+    check(state.shader.Digest() != before, "the shader bank's digest missed a register next to the user words");
+    state.shader.erase(0x2c);
+    state.shader[0x10c] = 3;
+    check(state.shader.Digest() == before, "a per-draw write through a reference moved the shader bank's digest");
+    state.shader[0x200] = 10;
+    check(state.shader.Digest() != before, "the shader bank's digest missed a write through a reference");
+}
+
 void testContextAndBases() {
     AgcDriver::QueueState state;
     execute(state, makePacket(0x69, {0x10, 17}));
@@ -1112,6 +1169,8 @@ int main(int argc, char** argv) {
         testWriteChangedStoresExactlyTheChangedRuns();
         testRegisters();
         testRegisterFile();
+        testRegisterDigest();
+        testPerDrawWordsLeftOutOfDigest();
         testContextAndBases();
         testIndexedDraw();
         testAutoDraw();

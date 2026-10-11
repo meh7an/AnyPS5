@@ -387,10 +387,7 @@ bool SrtTape::compute(Frame& frame, const Node& node, std::uint64_t& result) con
             // inaccessible word through a loaded handle: such a walk is left to it.
             if (base == 0u && !node.loaded) return false;
             if (node.loaded && frame.runtime.accessible != nullptr && !frame.runtime.accessible(frame.runtime.userContext, address, sizeof(std::uint32_t))) return false;
-            if (auto* trace = frame.runtime.readTrace; trace != nullptr) {
-                if (node.source == trace->leaf) trace->leaves.emplace_back(trace->leafSlot, address);
-                else trace->otherReads.push_back(address);
-            }
+            if (auto* trace = frame.runtime.readTrace; trace != nullptr) trace->NoteRead(node.source, address);
             const auto reader = node.clean ? frame.runtime.readSpecializationMemory : frame.runtime.readMemory;
             std::uint32_t word = 0;
             if (reader != nullptr) {
@@ -491,10 +488,12 @@ bool SrtTape::Run(const IrResourcePlan& plan, const SrtRuntime& runtime, std::ve
     auto* trace = runtime.readTrace;
     const auto leavesBefore = trace != nullptr ? trace->leaves.size() : 0;
     const auto readsBefore = trace != nullptr ? trace->otherReads.size() : 0;
+    const auto copiesBefore = trace != nullptr ? trace->copies.size() : 0;
     const auto refuse = [&] {
         if (trace != nullptr) {
             trace->leaves.resize(leavesBefore);
             trace->otherReads.resize(readsBefore);
+            trace->copies.resize(copiesBefore);
             trace->leaf = nullptr;
         }
         return false;
