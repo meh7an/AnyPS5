@@ -319,6 +319,10 @@ struct SourceEntry {
     std::vector<std::pair<std::uint64_t, std::shared_ptr<const std::vector<UserDataPatch>>>> patches;
     // The memory copies of each variant's results by variant id (MemoryCopiesFor), likewise.
     std::vector<std::pair<std::uint64_t, std::shared_ptr<const std::vector<MemoryCopy>>>> memoryCopies;
+    // Both for results with a binding plan (RecompileResult::bindingPlan), by plan: the plans are
+    // kept for the process, so a plan's address names it.
+    std::vector<std::pair<const void*, std::shared_ptr<const std::vector<UserDataPatch>>>> planPatches;
+    std::vector<std::pair<const void*, std::shared_ptr<const std::vector<MemoryCopy>>>> planMemoryCopies;
     // The code the entry was built for: the key carries only a hash of it, so a candidate entry is
     // accepted only when its code matches word for word. Owned here because the request's span
     // points into a registration the driver may replace while the entry lives on.
@@ -722,6 +726,74 @@ std::vector<MemoryCopy> makeMemoryCopies(const UserDataAnalysis& analysis, const
     const auto buffers = copies.size();
     for (std::size_t b = 0; b < layout.descriptors.size(); ++b) {
         if (layout.descriptors[b].kind != DescriptorBindingKind::FlattenedSrt) continue;
+        for (std::size_t c = 0; c < buffers; ++c) {
+            const auto copy = copies[c];
+            const auto flat = plan.srtReads[copy.slot].flatOffset;
+            const bool listed = std::any_of(copies.begin() + static_cast<std::ptrdiff_t>(buffers), copies.end(), [&](const MemoryCopy& other) { return other.binding == b && other.word == flat; });
+            if (!listed) copies.push_back({static_cast<std::uint32_t>(b), flat, copy.slot, copy.pair});
+        }
+    }
+    return copies;
+}
+
+// As makeUserDataPatches, over a result's binding plan (RecompileResult::bindingPlan) rather than the
+// variant's layout: the plan's bindings are the result's, each element with its resource.
+std::shared_ptr<const std::vector<UserDataPatch>> makePlanUserDataPatches(const UserDataAnalysis& analysis, const CompiledVariant& variant, const DescriptorBindingPlan& plan, std::size_t userWords) {
+    auto patches = std::make_shared<std::vector<UserDataPatch>>();
+    const auto& layout = variant.bindings.layout;
+    const auto base = variant.info.userDataBase;
+    for (std::size_t b = 0; b < plan.bindings.size(); ++b) {
+        const auto& entry = plan.bindings[b];
+        const auto binding = static_cast<std::uint32_t>(b);
+        const auto role = entry.descriptor.role;
+        if (role == DescriptorRole::GuestBuffers) {
+            for (std::size_t e = 0; e < entry.resources.size(); ++e) {
+                const auto resource = entry.resources[e];
+                if (resource >= analysis.bufferCopies.size()) continue;
+                for (std::uint32_t d = 0; d < 4u; ++d) {
+                    if (const auto word = analysis.bufferCopies[resource][d]; word >= 0) patches->push_back({binding, static_cast<std::uint32_t>(e * 4u + d), static_cast<std::uint32_t>(word)});
+                }
+            }
+        } else if (role == DescriptorRole::ShaderData) {
+            for (std::size_t i = 0; i < layout.userDataRegisters.size(); ++i) {
+                const auto reg = layout.userDataRegisters[i];
+                if (reg >= base && reg - base < userWords) patches->push_back({binding, static_cast<std::uint32_t>(i), reg - base});
+            }
+        } else if (role == DescriptorRole::GuestImages) {
+            for (std::size_t e = 0; e < entry.resources.size(); ++e) {
+                const auto resource = entry.resources[e];
+                if (resource >= analysis.imageCopies.size()) continue;
+                for (std::uint32_t d = 0; d < 8u; ++d) {
+                    if (const auto word = analysis.imageCopies[resource][d]; word >= 0) patches->push_back({binding, static_cast<std::uint32_t>(e * 8u + d), static_cast<std::uint32_t>(word)});
+                }
+            }
+        }
+    }
+    if (layout.UsesPushData()) {
+        for (std::size_t i = 0; i < layout.userDataRegisters.size(); ++i) {
+            const auto reg = layout.userDataRegisters[i];
+            if (reg >= base && reg - base < userWords) patches->push_back({UserDataPatch::PushConstants, static_cast<std::uint32_t>(i), reg - base});
+        }
+    }
+    return patches;
+}
+
+// As makeMemoryCopies, over a result's binding plan (see makePlanUserDataPatches).
+std::vector<MemoryCopy> makePlanMemoryCopies(const UserDataAnalysis& analysis, const DescriptorBindingPlan& bindings, const IrResourcePlan& plan) {
+    std::vector<MemoryCopy> copies;
+    for (std::size_t b = 0; b < bindings.bindings.size(); ++b) {
+        const auto& entry = bindings.bindings[b];
+        if (entry.descriptor.role != DescriptorRole::GuestBuffers) continue;
+        for (std::size_t e = 0; e < entry.resources.size(); ++e) {
+            const auto resource = entry.resources[e];
+            if (resource >= analysis.bufferBaseReads.size()) continue;
+            const auto [base, pair] = analysis.bufferBaseReads[resource];
+            if (base >= 0) copies.push_back({static_cast<std::uint32_t>(b), static_cast<std::uint32_t>(e * 4u), static_cast<std::uint32_t>(base), static_cast<std::uint32_t>(pair)});
+        }
+    }
+    const auto buffers = copies.size();
+    for (std::size_t b = 0; b < bindings.bindings.size(); ++b) {
+        if (bindings.bindings[b].descriptor.role != DescriptorRole::FlattenedSrt) continue;
         for (std::size_t c = 0; c < buffers; ++c) {
             const auto copy = copies[c];
             const auto flat = plan.srtReads[copy.slot].flatOffset;
@@ -1153,8 +1225,10 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
         result.specializationId = module->specializationId;
         result.spirv = module->spirv;
         bindingPlan = &entry->bindings;
+        result.bindingPlan = std::shared_ptr<const void>(entry, &entry->bindings);
     } else {
         result.spirv = artifact.spirv;
+        result.bindingPlan = std::shared_ptr<const void>(plan, &plan->bindings);
     }
     BindingAllocationResult bindings;
     DescriptorBindingBuilder{}.Populate(bindings, variant.bindings, *bindingPlan, variant.info.userDataBase, snapshot, partialThreads(request));
@@ -1635,7 +1709,24 @@ std::shared_ptr<const std::vector<UserDataPatch>> UserDataPatchesFor(const Sourc
     std::lock_guard lock(source.mutex);
     if (source.plan == nullptr) return nullptr;
     if (source.userData == nullptr) source.userData = analyzeUserData(*source.plan);
-    // By the result's pipeline variant: the specializations of one variant may bind differently.
+    // By the result's binding plan, whose bindings are the result's: one plan, one set of patches.
+    if (const auto* bindings = static_cast<const DescriptorBindingPlan*>(result.bindingPlan.get())) {
+        for (const auto& [plan, patches] : source.planPatches) {
+            if (plan == bindings) return patches;
+        }
+        if (result.bindings.size() != bindings->bindings.size()) return nullptr;
+        const auto make = [&](const CompiledVariant& variant) {
+            auto patches = makePlanUserDataPatches(*source.userData, variant, *bindings, source.plan->userDataCount);
+            source.planPatches.emplace_back(bindings, patches);
+            return patches;
+        };
+        if (handle.artifact != nullptr && handle.artifact->artifact.variantId == result.variantId) return make(*handle.artifact);
+        for (const auto& variant : source.variants) {
+            if (variant->artifact.variantId == result.variantId) return make(*variant);
+        }
+        return nullptr;
+    }
+    // Otherwise by the result's pipeline variant: the specializations of one variant may bind differently.
     const auto id = result.PipelineVariantId();
     for (const auto& [variantId, patches] : source.patches) {
         if (variantId == id) return patches;
@@ -1662,7 +1753,20 @@ std::shared_ptr<const std::vector<MemoryCopy>> MemoryCopiesFor(const SourceHandl
     if (source.plan == nullptr) return nullptr;
     if (source.userData == nullptr) source.userData = analyzeUserData(*source.plan);
     if (source.userData->copyNodes == nullptr) return nullptr;
-    // By the result's pipeline variant, as UserDataPatchesFor.
+    // By the result's binding plan, as UserDataPatchesFor.
+    if (const auto* bindings = static_cast<const DescriptorBindingPlan*>(result.bindingPlan.get())) {
+        for (const auto& [plan, copies] : source.planMemoryCopies) {
+            if (plan == bindings) return copies;
+        }
+        if (result.bindings.size() != bindings->bindings.size()) return nullptr;
+        const bool own = (handle.artifact != nullptr && handle.artifact->artifact.variantId == result.variantId) || std::ranges::any_of(source.variants, [&](const auto& variant) { return variant->artifact.variantId == result.variantId; });
+        if (!own) return nullptr;
+        auto copies = makePlanMemoryCopies(*source.userData, *bindings, *source.plan);
+        auto shared = copies.empty() ? nullptr : std::make_shared<const std::vector<MemoryCopy>>(std::move(copies));
+        source.planMemoryCopies.emplace_back(bindings, shared);
+        return shared;
+    }
+    // Otherwise by the result's pipeline variant, as UserDataPatchesFor.
     const auto id = result.PipelineVariantId();
     for (const auto& [variantId, copies] : source.memoryCopies) {
         if (variantId == id) return copies;

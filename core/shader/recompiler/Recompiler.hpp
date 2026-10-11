@@ -649,6 +649,10 @@ struct ShaderInvocation {
     std::vector<PipelineSpecializationConstant> specialization;
     std::uint64_t specializationId = 0;
     std::vector<DescriptorBinding> bindings;
+    // The binding plan `bindings` were made from, the recompiler's own (null for results made
+    // otherwise): its bindings are these, in order, with the resource of each element, where a
+    // specialization left the layout's alternative image bindings and inactive elements out.
+    std::shared_ptr<const void> bindingPlan;
     std::vector<std::byte> pushConstants;
     std::vector<VertexAttribute> vertexAttributes;
     std::uint32_t poisonedSrtReads = 0;
