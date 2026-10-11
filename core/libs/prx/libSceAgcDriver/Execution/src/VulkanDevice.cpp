@@ -2936,6 +2936,11 @@ std::optional<std::string> VulkanDevice::KnownDrawRejection(const Graphics::Stat
     return Graphics::KnownValidationFailure(graphicsContext(), shaders, graphics);
 }
 
+void VulkanDevice::PrecomputeDraw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, DrawPrecomputed& out) const {
+    if (const auto* context = cachedContext()) Graphics::PrecomputeDraw(*context, graphics, draw, shaders, out);
+    else Graphics::PrecomputeDraw(graphicsContext(), graphics, draw, shaders, out);
+}
+
 void VulkanDevice::ColorMetadataPass(const Graphics::ColorMetadataPass& pass) {
     const SetupTiming timing(state->recorder.get(), Graphics::Recorder::CommandClass::MetadataPass);
     Graphics::RunColorMetadataPass(graphicsContext(), pass);
@@ -2946,7 +2951,7 @@ void VulkanDevice::DepthClearPass(const Graphics::DepthClearPass& pass) {
     Graphics::ClearDepthSurface(graphicsContext(), pass.target, pass.depth, pass.stencil);
 }
 
-void VulkanDevice::Draw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, std::span<const Graphics::GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipe) {
+void VulkanDevice::Draw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, std::span<const Graphics::GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipe, const DrawPrecomputed* precomputed) {
     for (const auto& shader : shaders) {
         require(shader.program != nullptr, "missing compiled shader");
         ShaderRecompiler::RuntimeAbi::RequireVersion(shader.program->runtimeAbiVersion);
@@ -2955,8 +2960,8 @@ void VulkanDevice::Draw(const Graphics::State& graphics, const Pm4::DrawParamete
     // GPU mutex); APS5_TRACE_DRAWS=1 restores them.
     static const bool trace = std::getenv("APS5_TRACE_DRAWS") != nullptr;
     if (trace) APS5_LOG_OUT("VulkanDevice::Draw indices=%u instances=%u indexSize=%u address=0x%llx shaders=%zu colorTarget=%u", draw.indexCount, draw.instanceCount, draw.indexSize, static_cast<unsigned long long>(draw.indexAddress), shaders.size(), static_cast<unsigned>(graphics.hasColorTarget));
-    if (const auto* context = cachedContext()) Graphics::Draw(*context, graphics, draw, shaders, snapshots, recipe);
-    else Graphics::Draw(graphicsContext(), graphics, draw, shaders, snapshots, recipe);
+    if (const auto* context = cachedContext()) Graphics::Draw(*context, graphics, draw, shaders, snapshots, recipe, precomputed);
+    else Graphics::Draw(graphicsContext(), graphics, draw, shaders, snapshots, recipe, precomputed);
     if (trace) APS5_LOG_CHARS_OUT("VulkanDevice::Draw complete");
 }
 

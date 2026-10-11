@@ -51,6 +51,8 @@ struct PreparedDraw {
     std::uint64_t drawKey = 0;
     std::vector<std::shared_ptr<DispatchVariant>> recipeStages;
     std::shared_ptr<const DrawRecipe> recipe;
+    // The parts of the record made ahead (Graphics::PrecomputeDraw), for a draw no recipe serves.
+    DrawPrecomputed precomputed;
 
     // What the stages and snapshots point into.
     std::vector<std::shared_ptr<const ShaderRecompiler::RecompileResult>> results;
@@ -96,6 +98,7 @@ struct PreparedDraw {
         drawKey = 0;
         recipeStages.clear();
         recipe.reset();
+        precomputed.Clear();
         results.clear();
         matched.clear();
         if (rectList) {

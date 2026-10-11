@@ -87,6 +87,34 @@ struct DrawRecipe {
     VkPipelineStageFlags shaderStages = 0;
 };
 
+// What a draw's preparing thread makes ahead of its record from the draw's stages, state and device
+// (Graphics::PrecomputeDraw: the queue worker, while its draw thread records the draws before):
+// Graphics::Draw takes each part set here instead of making it. A part whose making threw stays
+// unset, for the record to make, and throw, as before.
+struct DrawPrecomputed {
+    // CachedFragmentOutputs and PipelineStages, with the memo's outcome for the [draws] counts.
+    bool outputs = false;
+    std::uint32_t fragmentOutputs = 0;
+    VkPipelineStageFlags shaderStages = 0;
+    bool validateMemoized = false;
+    bool validateHit = false;
+    // BuildVertexInputLayout.
+    bool layout = false;
+    Graphics::VertexInputLayout vertexInput;
+    // A cacheable draw's resource cache key (DrawResourceKey) and its hash: whether the record may
+    // use the cache (a recorder being active) is the record's to judge.
+    bool keyed = false;
+    Graphics::ResourceCache::Key resourceKey;
+    std::uint64_t resourceHash = 0;
+
+    void Clear() {
+        outputs = false;
+        layout = false;
+        keyed = false;
+        resourceKey.clear();
+    }
+};
+
 }
 
 #endif

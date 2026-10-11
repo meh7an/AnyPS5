@@ -2574,8 +2574,11 @@ ResourceCache::Entries::iterator* ResourceCache::lookup(std::uint64_t hash, cons
 }
 
 std::shared_ptr<ShaderResources> ResourceCache::Find(const Key& key) {
+    return Find(key, hashKey(key));
+}
+
+std::shared_ptr<ShaderResources> ResourceCache::Find(const Key& key, std::uint64_t hash) {
     if (CountCacheCalls()) resourceCacheFinds.fetch_add(1, std::memory_order_relaxed);
-    const auto hash = hashKey(key);
     std::lock_guard lock(mutex);
     auto* found = lookup(hash, key);
     if (found == nullptr) {

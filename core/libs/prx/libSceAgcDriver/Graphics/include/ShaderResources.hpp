@@ -605,6 +605,9 @@ class ResourceCache {
 public:
     using Key = std::vector<std::uint32_t>;
     std::shared_ptr<ShaderResources> Find(const Key& key);
+    // With the key's Hash, made ahead (a draw's preparing thread keys it, DrawPrecomputed).
+    std::shared_ptr<ShaderResources> Find(const Key& key, std::uint64_t hash);
+    static std::uint64_t Hash(const Key& key) { return hashKey(key); }
     // `evicted`, when given, receives the objects the insert displaces (the entry replaced under the
     // key, the ones over the bound) instead of their being destroyed here: a caller under the GPU
     // mutex hands them to the recorder so the destruction runs off the lock (VulkanDevice::dispatch).

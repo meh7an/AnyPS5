@@ -1155,7 +1155,23 @@ VertexParts& vertexParts() {
     return parts;
 }
 
-DrawInputs prepareDrawInputs(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawOutcome& outcome, DrawTimer& timer, const DrawRecipe* recipe) {
+// Debug aid: APS5_VERIFY_PRECOMPUTED_DRAWS=1 makes every part a draw's preparing thread made
+// (DrawPrecomputed) again at the record and reports the first that differ.
+bool verifyPrecomputedDraws() {
+    static const bool verify = std::getenv("APS5_VERIFY_PRECOMPUTED_DRAWS") != nullptr;
+    return verify;
+}
+
+void reportPrecomputedMismatch(const char* part) {
+    static std::atomic<int> reports{0};
+    if (reports.fetch_add(1, std::memory_order_relaxed) < 16) std::fprintf(stderr, "[draw] verify: the precomputed %s differs from the record's\n", part);
+}
+
+bool sameVertexInput(const VertexInputLayout& a, const VertexInputLayout& b) {
+    return a.bindings.size() == b.bindings.size() && a.attributes.size() == b.attributes.size() && std::memcmp(a.bindings.data(), b.bindings.data(), a.bindings.size() * sizeof(VkVertexInputBindingDescription)) == 0 && std::memcmp(a.attributes.data(), b.attributes.data(), a.attributes.size() * sizeof(VkVertexInputAttributeDescription)) == 0;
+}
+
+DrawInputs prepareDrawInputs(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawOutcome& outcome, DrawTimer& timer, const DrawRecipe* recipe, const DrawPrecomputed* precomputed = nullptr) {
     DrawInputs inputs;
     APS5_LOG_OUT_DEBUG("Draw indices=%u instances=%u indexSize=%u flags=%u indexAddress=0x%llx", draw.indexCount, draw.instanceCount, draw.indexSize, draw.flags, static_cast<unsigned long long>(draw.indexAddress));
     APS5_LOG_OUT_DEBUG("State colorTarget=%u render=%ux%u colorAddress=0x%llx colorBytes=%llu colorExtent=%ux%u", state.hasColorTarget ? 1u : 0u, state.renderExtent.width, state.renderExtent.height, static_cast<unsigned long long>(state.color.address), static_cast<unsigned long long>(state.color.bytes), state.color.extent.width, state.color.extent.height);
@@ -1193,6 +1209,16 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
     if (recipe != nullptr) {
         inputs.fragmentOutputs = recipe->fragmentOutputs;
         inputs.shaderStages = recipe->shaderStages;
+    } else if (precomputed != nullptr && precomputed->outputs) {
+        inputs.fragmentOutputs = precomputed->fragmentOutputs;
+        inputs.shaderStages = precomputed->shaderStages;
+        outcome.validateMemoized = precomputed->validateMemoized;
+        outcome.validateHit = precomputed->validateHit;
+        if (verifyPrecomputedDraws()) {
+            bool memoized = false;
+            bool hit = false;
+            if (CachedFragmentOutputs(context, shaders, state, memoized, hit) != inputs.fragmentOutputs || PipelineStages(shaders) != inputs.shaderStages) reportPrecomputedMismatch("fragment outputs or stages");
+        }
     } else {
         inputs.fragmentOutputs = CachedFragmentOutputs(context, shaders, state, outcome.validateMemoized, outcome.validateHit);
         inputs.shaderStages = PipelineStages(shaders);
@@ -1290,8 +1316,14 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
     parts.mark(VertexParts::Index);
     const auto& attributes = shaders.front().program->vertexAttributes;
     // Validates the vertex descriptors; the layout also keys and builds the pipeline.
-    if (recipe != nullptr) inputs.vertexInput = recipe->vertexInput;
-    else inputs.vertexInput = BuildVertexInputLayout(context, attributes);
+    if (recipe != nullptr) {
+        inputs.vertexInput = recipe->vertexInput;
+    } else if (precomputed != nullptr && precomputed->layout) {
+        inputs.vertexInput = precomputed->vertexInput;
+        if (verifyPrecomputedDraws() && !sameVertexInput(BuildVertexInputLayout(context, attributes), inputs.vertexInput)) reportPrecomputedMismatch("vertex input layout");
+    } else {
+        inputs.vertexInput = BuildVertexInputLayout(context, attributes);
+    }
     parts.mark(VertexParts::Layout);
     inputs.vertexOffsets.assign(attributes.size(), 0);
     // An indexed draw's vertex offset moves every fetch: the copy must reach the last one.
@@ -1511,32 +1543,51 @@ LookupParts& lookupParts() {
     return parts;
 }
 
-ResolvedResources resolveDrawResources(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::uint64_t indexBytes, bool recordable, bool keepKey, std::vector<ShaderResources::MovedBuffer>& movedStorage, DrawOutcome& outcome, DrawTimer& timer) {
+// Whether a draw whose stages' compiled content repeats an earlier one may bind that build's
+// descriptor set (see ResourceCache; the dispatch path does the same): with the cache on (Revalidate
+// proves a hit by texture identity, which needs the texture caches; APS5_NO_DRAW_RESOURCE_CACHE=1
+// builds every draw's resources as before), every stage compiled with a variant, and none
+// address-based. A synchronous draw never takes part (resolveDrawResources).
+bool cacheableStages(std::span<const CompiledShader> shaders) {
+    static const bool noDrawResourceCache = std::getenv("APS5_NO_DRAW_RESOURCE_CACHE") != nullptr;
+    static const bool noTextureCache = std::getenv("APS5_NO_TEXTURE_CACHE") != nullptr;
+    return !noDrawResourceCache && !noTextureCache && std::all_of(shaders.begin(), shaders.end(), [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->PipelineVariantId() != 0; }) && !ShaderResources::NeverReusable(shaders);
+}
+
+// The render target and index ranges stay out of the key (see DrawResourceKey); a hit repeats the
+// alias checks instead. Debug aid: APS5_NO_DRAW_KEY_TRIM=1 keys them as before.
+bool drawKeyTrimmed() {
+    static const bool trimmed = std::getenv("APS5_NO_DRAW_KEY_TRIM") == nullptr;
+    return trimmed;
+}
+
+// Whether a draw resource key (DrawResourceKey) names `device`.
+bool keyNamesDevice(const ResourceCache::Key& key, VkDevice device) {
+    const auto handle = reinterpret_cast<std::uint64_t>(device);
+    return key.size() > 2 && key[1] == static_cast<std::uint32_t>(handle) && key[2] == static_cast<std::uint32_t>(handle >> 32u);
+}
+
+ResolvedResources resolveDrawResources(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::uint64_t indexBytes, bool recordable, bool keepKey, std::vector<ShaderResources::MovedBuffer>& movedStorage, DrawOutcome& outcome, DrawTimer& timer, const DrawPrecomputed* precomputed) {
     ResolvedResources resolved;
     auto& parts = lookupParts();
     parts.start();
     APS5_LOG_CHARS_OUT_DEBUG("Creating ShaderResources");
-    // A recordable draw whose stages' compiled content repeats an earlier one binds that build's
-    // descriptor set when it is still valid (see ResourceCache; the dispatch path does the same).
     // Only recordable draws take part: a synchronous draw writes its resources back, which a shared
-    // object must never do. Revalidate proves a hit by texture identity, which needs the texture
-    // caches. Push constants still come from this draw's stages. APS5_NO_DRAW_RESOURCE_CACHE=1
-    // builds every draw's resources as before.
-    static const bool noDrawResourceCache = std::getenv("APS5_NO_DRAW_RESOURCE_CACHE") != nullptr;
-    static const bool noTextureCache = std::getenv("APS5_NO_TEXTURE_CACHE") != nullptr;
-    // The render target and index ranges stay out of the key (see DrawResourceKey); a hit repeats
-    // the alias checks instead. Debug aid: APS5_NO_DRAW_KEY_TRIM=1 keys them as before.
-    static const bool trimKey = std::getenv("APS5_NO_DRAW_KEY_TRIM") == nullptr;
-    resolved.cacheable = recordable && !noDrawResourceCache && !noTextureCache && std::all_of(shaders.begin(), shaders.end(), [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->PipelineVariantId() != 0; }) && !ShaderResources::NeverReusable(shaders);
+    // object must never do. Push constants still come from this draw's stages.
+    resolved.cacheable = recordable && cacheableStages(shaders);
+    const bool trimKey = drawKeyTrimmed();
     if (resolved.cacheable) {
-        // Built in the thread's buffer: a template hit keys its lookup without allocating.
+        // Built in the thread's buffer: a template hit keys its lookup without allocating. A key the
+        // draw's preparing thread made for this device is taken as made (DrawPrecomputed).
         struct KeyTag {};
         ThreadScratchLease<ResourceCache::Key, KeyTag> scratch;
-        const auto& key = scratch.value;
-        DrawResourceKey(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, indexBytes, !trimKey, scratch.value);
+        const bool given = precomputed != nullptr && precomputed->keyed && keyNamesDevice(precomputed->resourceKey, context.device);
+        if (!given || verifyPrecomputedDraws()) DrawResourceKey(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, indexBytes, !trimKey, scratch.value);
+        if (given && verifyPrecomputedDraws() && (scratch.value != precomputed->resourceKey || ResourceCache::Hash(scratch.value) != precomputed->resourceHash)) reportPrecomputedMismatch("resource key");
+        const auto& key = given ? precomputed->resourceKey : scratch.value;
         if (parts.enabled) parts.keyWords += key.size();
         parts.mark(LookupParts::Key);
-        if (auto cached = SharedResourceCache().Find(key)) {
+        if (auto cached = given ? SharedResourceCache().Find(key, precomputed->resourceHash) : SharedResourceCache().Find(key)) {
             parts.mark(LookupParts::Find);
             const bool valid = cached->Revalidate(shaders);
             parts.mark(LookupParts::Revalidate);
@@ -2246,7 +2297,7 @@ std::optional<std::string> KnownValidationFailure(const Context& context, std::s
     return std::nullopt;
 }
 
-void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipeOut) {
+void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipeOut, const DrawPrecomputed* precomputed) {
     if (context.recorder != nullptr) context.recorder->BoundKeptBytes();
     PerformanceTimer timing("Graphics.Draw");
     const DrawSetupTiming setupTiming;
@@ -2266,7 +2317,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     const auto waitedBefore = profile ? Recorder::ThreadWaitedMs() : 0.0;
     double ownWaitedMs = 0;
     const auto report = [&](const char* suffix) { reportDrawEnd(state, timer, built, outcome, waitedBefore, ownWaitedMs, suffix); };
-    auto inputs = prepareDrawInputs(context, state, draw, shaders, outcome, timer, nullptr);
+    auto inputs = prepareDrawInputs(context, state, draw, shaders, outcome, timer, nullptr, precomputed);
     if (inputs.nothing) return;
     const auto* args = draw.indirect ? &*draw.indirect : nullptr;
     const auto indexBytes = inputs.indexBytes;
@@ -2375,7 +2426,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     // A hit's moved buffers, in the thread's list: PrepareDrawBindings reads them within this draw.
     struct MovedTag {};
     ThreadScratchLease<std::vector<ShaderResources::MovedBuffer>, MovedTag> movedList;
-    auto resolved = resolveDrawResources(context, state, draw, shaders, snapshots, indexBytes, recordable, recipeOut != nullptr && DrawRecipes(), movedList.value, outcome, timer);
+    auto resolved = resolveDrawResources(context, state, draw, shaders, snapshots, indexBytes, recordable, recipeOut != nullptr && DrawRecipes(), movedList.value, outcome, timer, precomputed);
     auto& resources = resolved.resources;
     const auto& contentKey = resolved.contentKey;
     const bool cacheable = resolved.cacheable;
@@ -2808,6 +2859,29 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         report(" synchronous");
     }
     APS5_LOG_CHARS_OUT_DEBUG("Draw finished");
+}
+
+void PrecomputeDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawPrecomputed& out) {
+    out.Clear();
+    // A part that throws is left to the record, which makes it again and reports the failure.
+    try {
+        out.fragmentOutputs = CachedFragmentOutputs(context, shaders, state, out.validateMemoized, out.validateHit);
+        out.shaderStages = PipelineStages(shaders);
+        out.outputs = true;
+    } catch (const std::exception&) {
+    }
+    if (!shaders.empty() && shaders.front().program != nullptr) {
+        try {
+            out.vertexInput = BuildVertexInputLayout(context, shaders.front().program->vertexAttributes);
+            out.layout = true;
+        } catch (const std::exception&) {
+        }
+    }
+    // As resolveDrawResources keys a cacheable draw, over prepareDrawInputs' index bytes.
+    if (!cacheableStages(shaders)) return;
+    DrawResourceKey(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, static_cast<std::uint64_t>(draw.indexCount) * draw.indexSize, !drawKeyTrimmed(), out.resourceKey);
+    out.resourceHash = ResourceCache::Hash(out.resourceKey);
+    out.keyed = true;
 }
 
 DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, const DrawRecipe& recipe) {

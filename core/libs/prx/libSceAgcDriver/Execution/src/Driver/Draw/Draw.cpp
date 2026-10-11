@@ -647,6 +647,10 @@ std::optional<DrawVerdict> Driver::prepareDraw(PreparedDraw& prepared, QueueStat
             rejected = std::move(*known);
             return DrawVerdict::Rejected;
         }
+        // What the record would make from the stages alone, made here: the draw thread is the
+        // pipeline's busier half. APS5_NO_PRECOMPUTED_DRAWS=1 leaves it all to the record.
+        static const bool precompute = std::getenv("APS5_NO_PRECOMPUTED_DRAWS") == nullptr;
+        if (precompute) localDevice->PrecomputeDraw(graphics, drawParameters, stages, prepared.precomputed);
     }
     prepared.parameters = drawParameters;
     return std::nullopt;
@@ -664,6 +668,8 @@ void Driver::recordPrepared(PreparedDraw& prepared, std::unique_lock<GuestMemory
             static std::atomic<std::uint64_t> replaced{0};
             std::fprintf(stderr, "[draw] device replaced during unlocked preparation (%llu)\n", static_cast<unsigned long long>(++replaced));
             prepared.device = std::move(current);
+            // Made for the other device's context.
+            prepared.precomputed.Clear();
         }
 
         recordLabelsForPacket(prepared.device.get(), prepared.queue);
@@ -682,7 +688,7 @@ void Driver::recordPrepared(PreparedDraw& prepared, std::unique_lock<GuestMemory
         VulkanDevice::NoteRecipe(VulkanDevice::RecipeEvent::Restart, VulkanDevice::RecipeKind::Draw);
     }
     std::shared_ptr<const DrawRecipe> built;
-    prepared.device->Draw(graphics, prepared.parameters, prepared.stages, prepared.snapshots, prepared.recipeStages.empty() ? nullptr : &built);
+    prepared.device->Draw(graphics, prepared.parameters, prepared.stages, prepared.snapshots, prepared.recipeStages.empty() ? nullptr : &built, &prepared.precomputed);
     phaseTiming.Phase(DrawRowGraphics);
     if (built != nullptr) attachDrawRecipe(prepared.drawKey, prepared.recipeStages, std::move(built));
     timing.Mark("draw_and_resource_release");
