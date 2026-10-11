@@ -106,23 +106,25 @@ std::pair<IrF32, IrU1> TranslationContext::unaryFloatSpecials(IrOpcode opcode, I
         break;
     }
     case IrOpcode::FPFract32: {
-        const IrU32 unsignedValue(ir.BitwiseAnd(value.Value(), ir.Constant(0x7fffffffu)));
-        value = pick(IrU1(ir.UGreaterThan(unsignedValue.Value(), ir.Constant(0x3f7fffffu))), ir.Constant(0x3f7fffffu), unsignedValue);
+        // The magnitude below one: a value just under an integer rounds up to 1.0, where RDNA
+        // returns the largest float below it.
+        value = IrU32(ir.Emit(IrOpcode::UMin32, IrType::U32, {&ir.BitwiseAnd(value.Value(), ir.Constant(0x7fffffffu)), &ir.Constant(0x3f7fffffu)}));
         invalid = infinite;
         break;
     }
     case IrOpcode::FPSin:
     case IrOpcode::FPCos: {
-        const IrF32 whole(ir.Emit(IrOpcode::FPTrunc32, IrType::F32, {&argument.Value()}));
-        const IrF32 difference(ir.Emit(IrOpcode::FPSub32, IrType::F32, {&argument.Value(), &whole.Value()}));
-        const IrF32 fraction(ir.Emit(IrOpcode::FPAbs32, IrType::F32, {&difference.Value()}));
-        const auto fractionIs = [&](float cycle) { return IrU1(ir.Emit(IrOpcode::FPOrdEqual32, IrType::U1, {&fraction.Value(), &ir.ConstantF32(cycle)})); };
+        // RDNA's exact zeros: sin at every half cycle, cos at every odd quarter. The fraction of a
+        // cycle shows them, reduced as the emitter reduces the argument (EmitTrigCycleF32) so the
+        // GPU compiler computes it once; sin at a whole cycle is a zero already.
+        const IrU1 large(ir.Emit(IrOpcode::UGreaterThanEqual32, IrType::U1, {&magnitude.Value(), &ir.Constant(0x4b000000u)}));
+        const IrF32 cycle(ir.Select(large.Value(), ir.ConstantF32(0.0f), ir.Emit(IrOpcode::FPFract32, IrType::F32, {&argument.Value()})));
+        const auto cycleIs = [&](float at) { return IrU1(ir.Emit(IrOpcode::FPOrdEqual32, IrType::U1, {&cycle.Value(), &ir.ConstantF32(at)})); };
         if (opcode == IrOpcode::FPSin) {
-            const IrU1 cardinal(ir.LogicalOr(fractionIs(0.0f).Value(), fractionIs(0.5f).Value()));
-            value = pick(cardinal, ir.Constant(0u), value);
+            value = pick(cycleIs(0.5f), ir.Constant(0u), value);
             value = pick(zero, bits.Value(), value);
         } else {
-            value = pick(IrU1(ir.LogicalOr(fractionIs(0.25f).Value(), fractionIs(0.75f).Value())), ir.Constant(0u), value);
+            value = pick(IrU1(ir.LogicalOr(cycleIs(0.25f).Value(), cycleIs(0.75f).Value())), ir.Constant(0u), value);
         }
         invalid = infinite;
         break;

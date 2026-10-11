@@ -834,29 +834,21 @@ std::uint32_t EmitFlushF32DenormToSignedZero(SpirvEmitterState& state, std::uint
     return result;
 }
 
-std::uint32_t EmitTrigCycleF32(SpirvEmitterState& state, std::uint32_t src, bool preserveSignedZero) {
+// The fraction of a cycle sin and cos take: zero from 2^23 on, where every float is a whole number of
+// cycles. Zeros, infinities and NaNs never reach the result: the translator's unaryFloatSpecials
+// picks theirs, and its cardinal test reduces the same way, so the GPU compiler shares the two.
+std::uint32_t EmitTrigCycleF32(SpirvEmitterState& state, std::uint32_t src) {
     const auto fract = state.module.AllocateId();
     const auto bits = state.module.AllocateId();
     const auto absBits = state.module.AllocateId();
     const auto large = state.module.AllocateId();
-    const auto finite = state.module.AllocateId();
-    const auto largeFinite = state.module.AllocateId();
     const auto reduced = state.module.AllocateId();
     state.module.AddFunction(spv::OpExtInst, TypeF32(state), fract, GlslStd450(state), GLSLstd450Fract, src);
     state.module.AddFunction(spv::OpBitcast, TypeU32(state), bits, src);
     state.module.AddFunction(spv::OpBitwiseAnd, TypeU32(state), absBits, bits, ConstantU32(state, 0x7fffffffu));
     state.module.AddFunction(spv::OpUGreaterThanEqual, TypeBool(state), large, absBits, ConstantU32(state, 0x4b000000u));
-    state.module.AddFunction(spv::OpULessThan, TypeBool(state), finite, absBits, ConstantU32(state, 0x7f800000u));
-    state.module.AddFunction(spv::OpLogicalAnd, TypeBool(state), largeFinite, large, finite);
-    state.module.AddFunction(spv::OpSelect, TypeF32(state), reduced, largeFinite, ConstantF32Value(state, 0.0f), fract);
-    if (!preserveSignedZero) {
-        return reduced;
-    }
-    const auto zero = state.module.AllocateId();
-    const auto result = state.module.AllocateId();
-    state.module.AddFunction(spv::OpIEqual, TypeBool(state), zero, absBits, ConstantU32(state, 0u));
-    state.module.AddFunction(spv::OpSelect, TypeF32(state), result, zero, src, reduced);
-    return result;
+    state.module.AddFunction(spv::OpSelect, TypeF32(state), reduced, large, ConstantF32Value(state, 0.0f), fract);
+    return reduced;
 }
 
 std::uint32_t EmitF16BitsToF32(SpirvEmitterState& state, std::uint32_t bits) {

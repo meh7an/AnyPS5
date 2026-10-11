@@ -20,7 +20,7 @@
 
 namespace AgcDriver::Graphics {
 
-void LogPipelineStatistics_nid_no_patch(const Context& context, VkPipeline pipeline) {
+void LogPipelineStatistics_nid_no_patch(const Context& context, VkPipeline pipeline, const std::string& label) {
     if (!context.pipelineExecutableInfo) return;
     const auto getProperties = context.Function<PFN_vkGetPipelineExecutablePropertiesKHR>("vkGetPipelineExecutablePropertiesKHR");
     const auto getStatistics = context.Function<PFN_vkGetPipelineExecutableStatisticsKHR>("vkGetPipelineExecutableStatisticsKHR");
@@ -41,9 +41,9 @@ void LogPipelineStatistics_nid_no_patch(const Context& context, VkPipeline pipel
         Check(getStatistics(context.device, &executable, &count, statistics.data()), "vkGetPipelineExecutableStatisticsKHR");
         statistics.resize(count);
         const auto& property = properties[index];
-        std::fprintf(stderr, "[pipeline-stats] executable=%u stages=0x%x subgroup=%u name=%s\n", index, property.stages, property.subgroupSize, property.name);
+        std::fprintf(stderr, "[pipeline-stats] %s executable=%u stages=0x%x subgroup=%u name=%s\n", label.c_str(), index, property.stages, property.subgroupSize, property.name);
         for (const auto& statistic : statistics) {
-            std::fprintf(stderr, "[pipeline-stats] executable=%u %s=", index, statistic.name);
+            std::fprintf(stderr, "[pipeline-stats] %s executable=%u %s=", label.c_str(), index, statistic.name);
             switch (statistic.format) {
             case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_BOOL32_KHR:
                 std::fprintf(stderr, "%s", statistic.value.b32 ? "true" : "false");
@@ -247,7 +247,15 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
         pipelineInfo.layout = layout;
         pipelineInfo.renderPass = renderPass;
         Check(context.Function<PFN_vkCreateGraphicsPipelines>("vkCreateGraphicsPipelines")(context.device, context.pipelineCache, 1, &pipelineInfo, nullptr, &pipeline), "vkCreateGraphicsPipelines");
-        LogPipelineStatistics_nid_no_patch(context, pipeline);
+        if (context.pipelineExecutableInfo) {
+            std::string label;
+            for (const auto& shader : shaders) {
+                char program[48];
+                std::snprintf(program, sizeof(program), "%s%s 0x%llx", label.empty() ? "" : " ", shader.stage == ShaderRecompiler::ShaderStage::Fragment ? "ps" : "vs", static_cast<unsigned long long>(shader.codeAddress));
+                label += program;
+            }
+            LogPipelineStatistics_nid_no_patch(context, pipeline, label);
+        }
     } catch (...) {
         release();
         throw;

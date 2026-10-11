@@ -3,13 +3,16 @@
 
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include <set>
+#include <string>
 
 namespace AgcDriver::Graphics {
 
 struct VertexInputLayout;
 struct PassBinding;
 
-void LogPipelineStatistics_nid_no_patch(const Context& context, VkPipeline pipeline);
+// Prints the driver's statistics for each executable of `pipeline` (APS5_PIPELINE_STATS=1), each
+// line led by `label` (the guest programs it runs).
+void LogPipelineStatistics_nid_no_patch(const Context& context, VkPipeline pipeline, const std::string& label);
 
 // The attachments of one render pass instance. Work recorded with it references the handle until
 // the batch completes, so a recorded draw keeps the object (Recorder::Keep) like its pipeline.
