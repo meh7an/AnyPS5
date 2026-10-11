@@ -15,6 +15,7 @@
 #include <cstring>
 #include <map>
 #include <numeric>
+#include <optional>
 #include <span>
 #include <string>
 #include <unordered_map>
@@ -96,7 +97,7 @@ bool VariantResultCopies() {
 
 // APS5_PROFILE_DRAW: the memo's outcomes, every 10 s on a [stage-memo] line.
 struct StageMemoCounters {
-    std::atomic<std::uint64_t> lookups{0}, hits{0}, revalidated{0}, absent{0}, mappings{0}, changed{0}, pending{0}, skipped{0};
+    std::atomic<std::uint64_t> lookups{0}, hits{0}, revalidated{0}, copiedWords{0}, absent{0}, mappings{0}, changed{0}, pending{0}, skipped{0};
     std::atomic<std::uint64_t> inserts{0}, refusedPatches{0}, refusedMismatch{0}, refusedUnwatched{0}, refusedUnstable{0}, evictions{0};
     std::atomic<std::uint64_t> verified{0}, differed{0};
     // Hits that copied the entry's result: into an empty place of the slot, or because a draw held
@@ -133,7 +134,7 @@ void reportStageMemo(std::size_t entries) {
     const auto take = [](std::atomic<std::uint64_t>& counter) { return static_cast<unsigned long long>(counter.exchange(0, std::memory_order_relaxed)); };
     const auto lookups = take(counters.lookups);
     const auto hits = take(counters.hits);
-    std::fprintf(stderr, "[stage-memo] %llu lookups (10 s): %llu hits (%.1f%%, %llu after comparing stamped words; result copied by %llu into an empty place, %llu with every served copy held, those held by use count 2/3/more %llu/%llu/%llu); misses: no entry %llu, mappings changed %llu, words changed %llu, pending results %llu, not tried (changing key) %llu; inserts %llu, refused: no patches %llu, patch mismatch %llu, unwatched %llu, unstable %llu; evictions %llu, %zu entries; verify: %llu compared, %llu differed\n", lookups, hits, lookups != 0 ? 100.0 * static_cast<double>(hits) / static_cast<double>(lookups) : 0.0, take(counters.revalidated), take(counters.copiedEmpty), take(counters.copiedHeld), take(counters.heldTwo), take(counters.heldThree), take(counters.heldMore), take(counters.absent), take(counters.mappings), take(counters.changed), take(counters.pending), take(counters.skipped), take(counters.inserts), take(counters.refusedPatches), take(counters.refusedMismatch), take(counters.refusedUnwatched), take(counters.refusedUnstable), take(counters.evictions), entries, take(counters.verified), take(counters.differed));
+    std::fprintf(stderr, "[stage-memo] %llu lookups (10 s): %llu hits (%.1f%%, %llu after comparing stamped words, %llu with changed memory copies patched in; result copied by %llu into an empty place, %llu with every served copy held, those held by use count 2/3/more %llu/%llu/%llu); misses: no entry %llu, mappings changed %llu, words changed %llu, pending results %llu, not tried (changing key) %llu; inserts %llu, refused: no patches %llu, patch mismatch %llu, unwatched %llu, unstable %llu; evictions %llu, %zu entries; verify: %llu compared, %llu differed\n", lookups, hits, lookups != 0 ? 100.0 * static_cast<double>(hits) / static_cast<double>(lookups) : 0.0, take(counters.revalidated), take(counters.copiedWords), take(counters.copiedEmpty), take(counters.copiedHeld), take(counters.heldTwo), take(counters.heldThree), take(counters.heldMore), take(counters.absent), take(counters.mappings), take(counters.changed), take(counters.pending), take(counters.skipped), take(counters.inserts), take(counters.refusedPatches), take(counters.refusedMismatch), take(counters.refusedUnwatched), take(counters.refusedUnstable), take(counters.evictions), entries, take(counters.verified), take(counters.differed));
 }
 
 // A stage's memo key: the user data size, each user word's bits the source reads other than as a
@@ -214,6 +215,84 @@ StageMemoMiss stageMemoCurrent(const StageMemoEntry& entry, std::uint64_t genera
     if (!GuestMemory::UnchangedSinceAll(queries)) return StageMemoMiss::Changed;
     if (Graphics::StorageTexture::AnyPendingOverlaps(entry.runs) || Graphics::AnyShadowedOverlaps(entry.runs)) return StageMemoMiss::Pending;
     return StageMemoMiss::None;
+}
+
+// Locates a result's memory copies in a memo entry's words (StageMemoEntry::copies), by the address
+// the capture traced for each copied read and for its V#'s word 1. All or none: a read traced at
+// two addresses, a word outside the regions, a result word that does not hold the captured word
+// (the proof the user words' patches get at the insert), or a word 1 that is itself a copied word
+// leaves the entry without copies, its words compared whole.
+void resolveStageMemoCopies(StageMemoEntry& entry, std::span<const ShaderRecompiler::MemoryCopy> copies, std::span<const std::pair<std::uint32_t, std::uint64_t>> traced, const ShaderRecompiler::RecompileResult& result) {
+    const auto addressOf = [&](std::uint32_t slot) -> std::optional<std::uint64_t> {
+        std::optional<std::uint64_t> found;
+        for (const auto& [read, address] : traced) {
+            if (read != slot) continue;
+            if (found.has_value() && *found != address) return std::nullopt;
+            found = address;
+        }
+        return found;
+    };
+    // The position (over all regions, in order) and the word at a guest address.
+    const auto locate = [&](std::uint64_t address, std::uint32_t& position, std::uint32_t& word) {
+        std::uint32_t first = 0;
+        for (const auto& [begin, words] : entry.regions) {
+            if (address >= begin && (address - begin) % sizeof(std::uint32_t) == 0 && (address - begin) / sizeof(std::uint32_t) < words.size()) {
+                const auto index = static_cast<std::uint32_t>((address - begin) / sizeof(std::uint32_t));
+                position = first + index;
+                word = words[index];
+                return true;
+            }
+            first += static_cast<std::uint32_t>(words.size());
+        }
+        return false;
+    };
+    std::vector<StageMemoEntry::Copy> located;
+    std::vector<std::uint32_t> pairs;
+    for (const auto& copy : copies) {
+        const auto address = addressOf(copy.slot);
+        const auto pairAddress = addressOf(copy.pair);
+        StageMemoEntry::Copy place{copy.binding, copy.word};
+        std::uint32_t pairPosition = 0, top = 0;
+        if (!address.has_value() || !pairAddress.has_value() || !locate(*address, place.position, place.base) || !locate(*pairAddress, pairPosition, top)) return;
+        if (copy.binding >= result.bindings.size() || copy.word >= result.bindings[copy.binding].guestDescriptor.size() || result.bindings[copy.binding].guestDescriptor[copy.word] != place.base) return;
+        place.address = *address;
+        place.top = top & 0xffffu;
+        located.push_back(place);
+        pairs.push_back(pairPosition);
+    }
+    std::vector<std::uint32_t> positions;
+    for (const auto& place : located) positions.push_back(place.position);
+    std::sort(positions.begin(), positions.end());
+    positions.erase(std::unique(positions.begin(), positions.end()), positions.end());
+    for (const auto pair : pairs) {
+        if (std::binary_search(positions.begin(), positions.end(), pair)) return;
+    }
+    entry.copies = std::move(located);
+    entry.copyPositions = std::move(positions);
+}
+
+// Whether every copied base the live words changed keeps its zero-ness: the specialization tests the
+// base (word 0, and word 1's low half, compared whole) for zero and reads nothing else of it.
+bool stageMemoBasesKept(const StageMemoEntry& entry, std::span<const std::pair<std::uint32_t, std::uint32_t>> live) {
+    for (const auto& [position, value] : live) {
+        for (const auto& copy : entry.copies) {
+            if (copy.position == position && copy.top == 0 && (copy.base == 0) != (value == 0)) return false;
+        }
+    }
+    return true;
+}
+
+// The copied word at a copy's position: the live one where the lookup found it changed, else the
+// entry's.
+std::uint32_t stageMemoCopiedWord(const StageMemoEntry::Copy& copy, std::span<const std::pair<std::uint32_t, std::uint32_t>> live) {
+    const auto found = std::lower_bound(live.begin(), live.end(), copy.position, [](const std::pair<std::uint32_t, std::uint32_t>& entry, std::uint32_t position) { return entry.first < position; });
+    return found != live.end() && found->first == copy.position ? found->second : copy.base;
+}
+
+// A memo result's copied words (StageMemoEntry::copies), written at every hit: a served copy is
+// patched in place and may carry the words of an earlier hit.
+void applyStageMemoCopies(const StageMemoEntry& entry, std::span<const std::pair<std::uint32_t, std::uint32_t>> live, ShaderRecompiler::RecompileResult& result) {
+    for (const auto& copy : entry.copies) result.bindings[copy.binding].guestDescriptor[copy.word] = stageMemoCopiedWord(copy, live);
 }
 
 // APS5_TRACE_MEMO_CHURN=1: what the stage memo's misses change, every 10 s on a [stage-memo-churn]
@@ -495,6 +574,14 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::compileDrawStag
         std::size_t entries = 0;
         auto miss = StageMemoMiss::Absent;
         std::uint64_t collected = 0;
+        // An entry with memory copies (StageMemoEntry::copies) is compared with its copied words
+        // masked, every time (a key whose captured bases move every frame would otherwise go out of
+        // trial), and the copied words the guest changed are kept here (position, word; sorted) for
+        // the hit to patch into the result and the draw's shader memory.
+        struct CopiedLiveTag {};
+        auto& live = ThreadScratch<std::vector<std::pair<std::uint32_t, std::uint32_t>>, CopiedLiveTag>();
+        live.clear();
+        bool copyCheck = false;
         // The slot after the lookup's outcome, under the memo's lock.
         const auto settle = [&](StageMemoSlot& slot) {
             if (miss == StageMemoMiss::None) {
@@ -521,14 +608,15 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::compileDrawStag
                 auto& slot = *found;
                 entry = slot.entry;
                 stageMemoOrder.splice(stageMemoOrder.end(), stageMemoOrder, slot.order);
-                miss = stageMemoTried(slot.misses) ? stageMemoCurrent(*entry, slot.generation, collected) : StageMemoMiss::Skipped;
-                if (miss != StageMemoMiss::Changed || !StageMemoValues()) settle(slot);
+                copyCheck = !entry->copies.empty();
+                miss = copyCheck || stageMemoTried(slot.misses) ? stageMemoCurrent(*entry, slot.generation, collected) : StageMemoMiss::Skipped;
+                if (miss != StageMemoMiss::Changed || (!StageMemoValues() && !copyCheck)) settle(slot);
             }
         }
         // A store stamped the words' 64 KiB blocks (any store near them does): the words decide,
         // compared outside the lock after the collects above, as the insert proves a capture's. Equal,
         // they were the guest's at that collect, and a later store stamps newer.
-        if (miss == StageMemoMiss::Changed && StageMemoValues()) {
+        if (miss == StageMemoMiss::Changed && (StageMemoValues() || copyCheck)) {
             if (Graphics::StorageTexture::AnyPendingOverlaps(entry->runs) || Graphics::AnyShadowedOverlaps(entry->runs)) {
                 miss = StageMemoMiss::Pending;
             } else {
@@ -536,7 +624,18 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::compileDrawStag
                 ThreadScratchLease<std::vector<ShaderRecompiler::MemoryRegion>, MemoWordsTag> words;
                 for (const auto& [address, values] : entry->regions) words.value.push_back({address, std::as_bytes(std::span(values))});
                 const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::DrawCache);
-                if (captureStable(words.value)) {
+                if (copyCheck) {
+                    // The dispatch cache's validation, its data mask over the copied words.
+                    PendingView view;
+                    view.Load();
+                    const DataMask mask{entry->copyPositions, &live};
+                    if (validateCaptured(program.binary.codeAddress, submission.queue, words.value, *entry->result, true, view, nullptr, nullptr, &mask) && stageMemoBasesKept(*entry, live)) {
+                        miss = StageMemoMiss::None;
+                        countStageMemo(live.empty() ? counters.revalidated : counters.copiedWords);
+                    } else {
+                        live.clear();
+                    }
+                } else if (captureStable(words.value)) {
                     miss = StageMemoMiss::None;
                     countStageMemo(counters.revalidated);
                 }
@@ -544,7 +643,9 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::compileDrawStag
             std::lock_guard lock(stageMemoMutex);
             auto* found = stageMemo.find(memoHash);
             if (found != nullptr && found->entry == entry) {
-                if (miss == StageMemoMiss::None) found->generation = std::max(found->generation, collected);
+                // Equal words were the guest's at that collect; changed copied words leave the entry
+                // behind the guest, to be compared again.
+                if (miss == StageMemoMiss::None && live.empty()) found->generation = std::max(found->generation, collected);
                 settle(*found);
             }
         }
@@ -560,6 +661,7 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::compileDrawStag
             const bool fresh = served == nullptr;
             if (fresh) served = std::make_shared<ShaderRecompiler::RecompileResult>(*entry->result);
             ShaderRecompiler::PatchOverUserData(request, *served, *entry->patches);
+            applyStageMemoCopies(*entry, live, *served);
             if (fresh) {
                 std::lock_guard lock(stageMemoMutex);
                 auto* found = stageMemo.find(memoHash);
@@ -579,10 +681,30 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::compileDrawStag
             if (!VerifyStageMemo()) {
                 countStageMemo(counters.hits);
                 shaderMemory.Seed(entry->regions);
+                // The copied words the guest changed, over the entry's: later stages of the draw read
+                // the guest's.
+                for (const auto& copy : entry->copies) {
+                    const auto word = stageMemoCopiedWord(copy, live);
+                    if (word != copy.base) shaderMemory.SeedWord(copy.address, word);
+                }
                 if (wantRegions) {
                     stageCapture.regions.clear();
-                    for (const auto& [address, words] : entry->regions) stageCapture.regions.push_back({address, std::as_bytes(std::span(words))});
-                    stageCapture.memo = entry;
+                    if (live.empty()) {
+                        for (const auto& [address, words] : entry->regions) stageCapture.regions.push_back({address, std::as_bytes(std::span(words))});
+                        stageCapture.memo = entry;
+                    } else {
+                        // The draw cache keeps the words the result was made over: the entry's with
+                        // the guest's copied words, owned with the capture.
+                        auto patched = std::make_shared<std::vector<std::pair<std::uint64_t, std::vector<std::uint32_t>>>>(entry->regions);
+                        std::uint32_t first = 0;
+                        auto next = live.begin();
+                        for (auto& [address, words] : *patched) {
+                            for (; next != live.end() && next->first < first + words.size(); ++next) words[next->first - first] = next->second;
+                            first += static_cast<std::uint32_t>(words.size());
+                        }
+                        for (const auto& [address, words] : *patched) stageCapture.regions.push_back({address, std::as_bytes(std::span(words))});
+                        stageCapture.memo = std::move(patched);
+                    }
                 }
                 regionsDone();
                 phaseTiming.Phase(DrawRowRecompile);
@@ -649,14 +771,14 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::compileDrawStag
     }
     phaseTiming.Phase(DrawRowRecompile);
     if (memoKey != nullptr && MemoChurnTraced()) traceMemoChurn(memoHash, memoMiss, *handle, request, recent, compiled, program.binary.codeAddress);
-    if (memoKey != nullptr && (memoStore || memoResult != nullptr)) insertStageMemo(memoHash, handle, pushOffset, memoWords, mappings, compiled, memoResult, request.context.userData, recent, program.binary.codeAddress);
+    if (memoKey != nullptr && (memoStore || memoResult != nullptr)) insertStageMemo(memoHash, handle, pushOffset, memoWords, mappings, compiled, memoResult, request.context.userData, recent, program.binary.codeAddress, capture.get());
     // Shared, not copied: the result is immutable (a copy cost a few dozen allocations per stage).
     // The stage capture keeps it for its readers only (see the memo's hit above).
     if (wantRegions) stageCapture.compiled = compiled;
     return compiled;
 }
 
-void Driver::insertStageMemo(std::uint64_t hash, const std::shared_ptr<const ShaderRecompiler::SourceHandle>& handle, std::uint32_t pushOffset, const std::vector<std::uint32_t>& key, std::uint64_t mappings, const std::shared_ptr<const ShaderRecompiler::RecompileResult>& result, const std::shared_ptr<const ShaderRecompiler::RecompileResult>& memoResult, std::span<const std::uint32_t> userData, std::span<const ShaderRecompiler::MemoryRegion> recent, std::uint64_t codeAddress) {
+void Driver::insertStageMemo(std::uint64_t hash, const std::shared_ptr<const ShaderRecompiler::SourceHandle>& handle, std::uint32_t pushOffset, const std::vector<std::uint32_t>& key, std::uint64_t mappings, const std::shared_ptr<const ShaderRecompiler::RecompileResult>& result, const std::shared_ptr<const ShaderRecompiler::RecompileResult>& memoResult, std::span<const std::uint32_t> userData, std::span<const ShaderRecompiler::MemoryRegion> recent, std::uint64_t codeAddress, const ShaderRecompiler::ResourceCapture* capture) {
     auto& counters = stageMemoCounters();
     if (memoResult != nullptr) {
         // APS5_VERIFY_STAGE_MEMO: the memo's result against the capture's.
@@ -733,6 +855,10 @@ void Driver::insertStageMemo(std::uint64_t hash, const std::shared_ptr<const Sha
             countStageMemo(counters.refusedUnstable);
             return;
         }
+    }
+    // The result's memory copies, located in the entry's words: a lookup lets those words differ.
+    if (capture != nullptr && !entry->regions.empty()) {
+        if (const auto copies = ShaderRecompiler::MemoryCopiesFor(*handle, *result); copies != nullptr) resolveStageMemoCopies(*entry, *copies, capture->readTrace.copies, *result);
     }
     countStageMemo(counters.inserts);
     std::lock_guard lock(stageMemoMutex);

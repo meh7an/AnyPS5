@@ -99,6 +99,21 @@ struct StageMemoEntry {
     std::uint64_t generation = 0;
     // The guest registry's generation from before the capture.
     std::uint64_t mappings = 0;
+    // The result's memory copies (ShaderRecompiler::MemoryCopiesFor): words a buffer's base was
+    // copied into, from a captured word at `position` (counted over `regions` in order, at guest
+    // `address`), whose V# word 1 held `top` in its low half. A lookup lets the captured word differ
+    // while the base keeps its zero-ness, and patches the guest's word in (compileDrawStage);
+    // `positions` lists the copied words once, sorted. Empty without copies.
+    struct Copy {
+        std::uint32_t binding = 0;
+        std::uint32_t word = 0;
+        std::uint32_t position = 0;
+        std::uint64_t address = 0;
+        std::uint32_t base = 0;
+        std::uint32_t top = 0;
+    };
+    std::vector<Copy> copies;
+    std::vector<std::uint32_t> copyPositions;
 };
 
 }

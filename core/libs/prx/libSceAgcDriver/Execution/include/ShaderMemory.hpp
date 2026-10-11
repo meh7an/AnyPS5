@@ -74,6 +74,9 @@ public:
     // naming the reads of the stage that made them), and words inside an initial region are skipped
     // (a read there takes the initial bytes).
     void Seed(std::span<const std::pair<std::uint64_t, std::vector<std::uint32_t>>> regions);
+    // One seeded word at `address` replaced (Seed's rules): a memo word the guest changed where the
+    // stage memo let it (its memory copies).
+    void SeedWord(std::uint64_t address, std::uint32_t word);
     // The driver's source handle memo outcomes, for the [capture] line (APS5_PROFILE_DRAW).
     static void CountHandleMemo(bool hit);
 

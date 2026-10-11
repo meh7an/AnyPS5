@@ -330,6 +330,18 @@ void ShaderMemory::Seed(std::span<const std::pair<std::uint64_t, std::vector<std
     }
 }
 
+void ShaderMemory::SeedWord(std::uint64_t address, std::uint32_t word) {
+    if (!initial.empty()) {
+        const auto next = std::upper_bound(initial.begin(), initial.end(), address, [](std::uint64_t value, const auto& entry) { return value < entry.first; });
+        if (next != initial.begin() && address - std::prev(next)->first < std::prev(next)->second.size()) return;
+    }
+    auto& page = pages[address & ~static_cast<std::uint64_t>(PageBytes - 1)];
+    const auto index = static_cast<std::size_t>((address % PageBytes) / sizeof(std::uint32_t));
+    page.words[index] = word;
+    page.valid.set(index);
+    page.read.set(index);
+}
+
 std::vector<ShaderRecompiler::MemoryRegion> ShaderMemory::TakeRecentRegions() {
     std::vector<ShaderRecompiler::MemoryRegion> result;
     for (auto& [base, page] : pages) {
