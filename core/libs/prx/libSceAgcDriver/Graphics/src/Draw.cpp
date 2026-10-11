@@ -1010,6 +1010,15 @@ void KeepDrawInput(Recorder* recorder, std::uint64_t address, const DrawInputCop
     recorder->KeepDrawSnapshot(address, copy.bytes, copy.generation, copy.registryGeneration, copy.uploaded ? nullptr : copy.buffer, use, derived);
 }
 
+// Whether draws bind their index and vertex ranges in place (InPlaceDrawInput) rather than copy
+// them: opt-in, APS5_INPLACE_DRAW_INPUT=1. The read an in-place range notes on the batch holds the
+// guest's next store into it until the draw ran, which costs a title rewriting its vertex rings
+// every frame more than the copies (Sonic Origins Plus's menu: 37 FPS in place, 45 copied).
+bool InPlaceDrawInputs() {
+    static const bool enabled = std::getenv("APS5_INPLACE_DRAW_INPUT") != nullptr;
+    return enabled;
+}
+
 const HostImport* InPlaceDrawInput(const Context& context, std::uint64_t address, std::size_t bytes, std::size_t alignment) {
     auto* recorder = context.recorder;
     if (recorder == nullptr || bytes == 0) return nullptr;
@@ -1225,7 +1234,7 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         const bool fanGeometry = state.stages.mesh && state.stages.mesh->inputPrimitive == 5;
         const bool skipRestart = state.primitiveRestart && (!listTopology || context.primitiveListRestart) && !fanGeometry;
         const auto use = draw.indexSize == 2 ? (skipRestart ? Recorder::SnapshotUse::Index16Restart : Recorder::SnapshotUse::Index16) : (skipRestart ? Recorder::SnapshotUse::Index32Restart : Recorder::SnapshotUse::Index32);
-        const auto* import = InPlaceDrawInput(context, draw.indexAddress, static_cast<std::size_t>(indexBytes), draw.indexSize);
+        const auto* import = InPlaceDrawInputs() ? InPlaceDrawInput(context, draw.indexAddress, static_cast<std::size_t>(indexBytes), draw.indexSize) : nullptr;
         DrawInputCopy copy;
         Recorder::UploadSlice slice;
         // The indices as read here; a reused copy has its highest index kept with it instead.
@@ -1336,7 +1345,7 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         const auto [begin, end] = plan.copies[range];
         const auto bytes = static_cast<std::size_t>(end - begin);
         GuestMemory::CheckRange(reinterpret_cast<const void*>(begin), bytes, 1);
-        if (const auto* import = InPlaceDrawInput(context, begin, bytes, plan.alignments[range])) {
+        if (const auto* import = InPlaceDrawInputs() ? InPlaceDrawInput(context, begin, bytes, plan.alignments[range]) : nullptr) {
             rangeHandles.push_back(import->buffer);
             rangeOffsets.push_back(begin - import->base);
             inputs.inPlaceReads.emplace_back(begin, end);
