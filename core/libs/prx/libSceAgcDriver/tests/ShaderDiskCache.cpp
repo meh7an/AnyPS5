@@ -1,4 +1,5 @@
 #include "ShaderDiskCache.hpp"
+#include "BdaAbi.hpp"
 #include "CacheKey.hpp"
 #include "VertexInputSpecialization.hpp"
 #include "SpirvBackend/SpirvSpecialization.hpp"
@@ -739,6 +740,18 @@ void verifyBufferAlignmentSpecialization() {
     require(restored.spirv.data() == aligned.spirv.data(), "unaligned buffers replaced the aligned specialization");
 }
 
+void verifyBufferAtomicFaultOnly() {
+    // buffer_atomic_add v0, s[0:3], 0 through the user-data V#: the atomic reaches its buffer
+    // through the binding, so its unaligned-address fault takes the fault buffer and no page table.
+    ComputeRequest request(false);
+    request.code = {0xe0c80000u, 0x80000000u, 0xbf810000u};
+    request.request.shader.code = request.code;
+    const auto result = Recompile(request.request);
+    const auto bound = [&](DescriptorRole role) { return std::ranges::any_of(result.bindings, [&](const auto& binding) { return binding.role == role; }); };
+    require(!bound(DescriptorRole::BdaPagetable), "a buffer atomic through a known descriptor made the program address-based");
+    require(bound(DescriptorRole::FaultBuffer) && result.bdaAbiVersion == BdaAbi::Version, "a buffer atomic through a known descriptor has no fault buffer");
+}
+
 void verifyBindingPlanSelection() {
     ShaderInfo info{};
     info.buffers.resize(2);
@@ -1044,6 +1057,7 @@ int main(int argc, char** argv) {
         verifyFailureMemoSwitch(argv[0]);
         verifyInvocationIsolation();
         verifyBufferAlignmentSpecialization();
+        verifyBufferAtomicFaultOnly();
         verifyBindingPlanSelection();
         verifyVertexTypeSpecialization();
         verifyBuiltinSpecialization();

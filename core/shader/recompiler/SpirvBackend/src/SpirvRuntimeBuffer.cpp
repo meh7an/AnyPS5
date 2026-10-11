@@ -48,7 +48,16 @@ std::uint32_t nonzero(SpirvEmitterState& state, std::uint32_t value) {
 
 void faultIf(SpirvValueEmitContext& context, const IrValue& instruction, std::uint32_t condition, std::uint32_t address, std::uint32_t bytes, BdaAbi::FaultReason reason) {
     auto& state = context.state;
-    EmitIfCondition(state, condition, [&] { RecordBdaFault(state, address, ConstantU32(state, bytes), BdaInstructionPc(state, instruction), reason); });
+    EmitIfCondition(state, condition, [&] {
+        if (state.program.Info().usesDma) {
+            RecordBdaFault(state, address, ConstantU32(state, bytes), BdaInstructionPc(state, instruction), reason);
+            return;
+        }
+        // A fault-only program (an atomic through a known descriptor) records the address as words.
+        const auto low = Unary(state, spv::OpUConvert, TypeU32(state), address);
+        const auto high = Unary(state, spv::OpUConvert, TypeU32(state), Binary(state, spv::OpShiftRightLogical, TypeScalarU64(state), address, BdaConstant(state, 32u)));
+        RecordBdaFaultWords(state, low, high, ConstantU32(state, bytes), BdaInstructionPc(state, instruction), reason);
+    });
     StopBdaInvocationIf(state, condition);
 }
 
@@ -590,6 +599,10 @@ std::uint32_t EmitRuntimeBufferAtomic(SpirvValueEmitContext& context, const IrVa
     auto& state = context.state;
     if (bits != 32u && bits != 64u) context.Fail(instruction, "unsupported runtime buffer atomic width");
     if (context.Memory(instruction).gpuDescriptor && (state.bdaAtomicPointerFunction == 0u || state.bdaNoteWriteFunction == 0u)) context.Fail(instruction, "BDA atomic functions are missing");
+    // The guest address of an unaligned atomic is reported in 64 bits, which a fault-only program
+    // (no BDA capabilities) enables here.
+    if (std::ranges::find(state.supportedCapabilities, spv::CapabilityInt64) == state.supportedCapabilities.end()) context.Fail(instruction, "runtime buffer atomic faults require shaderInt64");
+    state.module.EmitCapability(spv::CapabilityInt64);
     const auto type = bits == 64u ? TypeU64(state) : TypeU32(state);
     const auto scalar = bits == 64u ? TypeScalarU64(state) : TypeU32(state);
     const auto zero = bits == 64u ? ConstantU64(state, 0u) : ConstantU32(state, 0u);
