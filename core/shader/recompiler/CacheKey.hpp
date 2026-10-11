@@ -4,7 +4,9 @@
 #include "Recompiler.hpp"
 #include "RdnaDecoder/RdnaDescriptorFormat.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
+#include <algorithm>
 #include <cstdlib>
+#include <cstring>
 #include <stdexcept>
 #include <type_traits>
 
@@ -244,14 +246,42 @@ private:
         append(key, value.maxEvaluationOutputComponents);
     }
 
+    static std::uint64_t mixDigest(std::uint64_t hash, std::uint64_t value) {
+        hash = (hash ^ value) * 0x9e3779b97f4a7c15ull;
+        return hash ^ (hash >> 29u);
+    }
+
+    static std::uint64_t digest(std::span<const std::uint32_t> values) {
+        std::uint64_t hash = mixDigest(0x9e3779b97f4a7c15ull, values.size());
+        for (const auto value : values) hash = mixDigest(hash, value);
+        return hash;
+    }
+
+    static std::uint64_t digest(std::span<const std::string_view> values) {
+        std::uint64_t hash = mixDigest(0x9e3779b97f4a7c15ull, values.size());
+        for (const auto value : values) {
+            hash = mixDigest(hash, value.size());
+            // Eight bytes a step, the last step zero-padded (the size above tells the paddings apart).
+            for (std::size_t at = 0; at < value.size(); at += sizeof(std::uint64_t)) {
+                std::uint64_t chunk = 0;
+                std::memcpy(&chunk, value.data() + at, std::min(sizeof(chunk), value.size() - at));
+                hash = mixDigest(hash, chunk);
+            }
+        }
+        return hash;
+    }
+
     template<typename TKey>
     static void append(TKey& key, const SpirvTarget& value) {
         append(key, value.vulkanVersion);
         append(key, value.spirvVersion);
         append(key, value.subgroupSize);
         append(key, value.bdaAbiVersion);
-        append(key, value.supportedCapabilities);
-        append(key, value.supportedExtensions);
+        // The capability and extension lists are the device's, the same in every key built on it:
+        // a digest each, as listing them (an extension name byte by byte) made them most of a key
+        // built for every stage of every draw.
+        append(key, digest(value.supportedCapabilities));
+        append(key, digest(value.supportedExtensions));
         append(key, value.fragmentShaderBarycentricEnabled);
         append(key, value.maxWorkgroupSize);
         append(key, value.maxWorkgroupInvocations);
