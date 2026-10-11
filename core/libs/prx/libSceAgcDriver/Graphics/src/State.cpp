@@ -7,6 +7,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libc/include/General.hpp"
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <bitset>
 #include <cmath>
@@ -659,13 +660,14 @@ State DecodeState(const QueueState& queue, bool vertexWorkgroup) {
     // matters where the shader exports.
     const auto targetMask = ColorWriteMask(cx);
     APS5_LOG_OUT_DEBUG("CB_TARGET_MASK=0x%x CB_SHADER_MASK=0x%x", targetMask, shaderMask);
-    std::vector<std::uint32_t> exportSlots;
+    std::array<std::uint32_t, 8> exportSlots{};
+    std::uint32_t exportSlotCount = 0;
     for (std::uint32_t slot = 0; slot < 8; ++slot) {
-        if (((shaderMask >> (4u * slot)) & 0xfu) != 0) exportSlots.push_back(slot);
+        if (((shaderMask >> (4u * slot)) & 0xfu) != 0) exportSlots[exportSlotCount++] = slot;
     }
     const auto written = [&](std::uint32_t slot) { return ((targetMask >> (4u * slot)) & 0xfu) != 0; };
     std::uint32_t exportCount = 0;
-    for (std::uint32_t index = 0; index < exportSlots.size(); ++index) {
+    for (std::uint32_t index = 0; index < exportSlotCount; ++index) {
         if (written(exportSlots[index])) exportCount = index + 1;
     }
     if (((read(cx, 0x202) >> 4u) & 7u) == 0u) exportCount = 0;
@@ -797,7 +799,7 @@ State DecodeState(const QueueState& queue, bool vertexWorkgroup) {
     }
     if (!result.colors.empty()) result.blend = result.blends[result.colors.front().exportIndex];
     if (result.dualSourceBlend) {
-        Require(exportSlots.size() == 2 && exportSlots[0] == 0 && exportSlots[1] == 1 && exportCount == 1, "dual-source blending needs pixel exports to MRT slots 0 and 1 and color writes to slot 0 alone");
+        Require(exportSlotCount == 2 && exportSlots[0] == 0 && exportSlots[1] == 1 && exportCount == 1, "dual-source blending needs pixel exports to MRT slots 0 and 1 and color writes to slot 0 alone");
         Require(result.colors.front().componentMapping == 0xe4u, "dual-source blending into a component-swapped color target is unsupported");
         Require(((exportFormat >> 4u) & 0xfu) == (exportFormat & 0xfu), "dual-source blending needs the MRT1 export in the MRT0 export format");
         Require(((shaderMask >> 4u) & 0xfu) == (shaderMask & 0xfu), "dual-source blending needs the MRT1 export with the MRT0 shader mask");

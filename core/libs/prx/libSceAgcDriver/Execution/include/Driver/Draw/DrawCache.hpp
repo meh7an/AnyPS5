@@ -12,6 +12,11 @@
 #include <memory>
 #include <vector>
 
+namespace ShaderRecompiler {
+struct SourceHandle;
+struct UserDataPatch;
+}
+
 namespace AgcDriver::DriverDetail {
 
 struct DrawProgram {
@@ -23,6 +28,10 @@ struct DrawProgram {
 
     std::shared_ptr<const ShaderSnapshot> snapshot;
     std::size_t codeOffset = 0;
+    // A merged stage's user pointer register, or 0: userData then starts with eight words, the
+    // pointer's two (zero when it is unset) and six zeros, before the user words.
+    std::uint32_t mergedPointer = 0;
+    bool mergedPointerRequired = false;
 };
 
 struct DrawDecode {
@@ -79,6 +88,30 @@ struct StageCapture {
     std::vector<ShaderRecompiler::MemoryRegion> regions;
     std::uint64_t forgetSerial = 0;
     std::uint32_t pushOffset = 0;
+    // The stage memo entry `regions` point into when the stage was served from it.
+    std::shared_ptr<const void> memo;
+};
+
+// The stage memo (Step 4, DrawCapture.cpp): a stage's compiled result and the words its capture
+// read, kept by its source, push offset and the user data bits the source's capture and results
+// depend on other than as copies (ShaderRecompiler::UserDataKeyFor). A later stage with an equal key
+// whose captured words are unchanged (no write stamp newer than the capture's over them, or else
+// equal to the guest's when compared, no storage image results pending and no unit shadow live
+// there, no mapping changed) takes the result with its user words copied in
+// (ShaderRecompiler::RecompileOverUserData) instead of capturing and recompiling.
+struct StageMemoEntry {
+    std::shared_ptr<const ShaderRecompiler::SourceHandle> handle;
+    std::uint32_t pushOffset = 0;
+    std::vector<std::uint32_t> key;
+    std::shared_ptr<const ShaderRecompiler::RecompileResult> result;
+    std::shared_ptr<const std::vector<ShaderRecompiler::UserDataPatch>> patches;
+    // The capture's reads (address and words) and the ranges validated, merged within 64 KiB (the
+    // write tracker's block).
+    std::vector<std::pair<std::uint64_t, std::vector<std::uint32_t>>> regions;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> runs;
+    std::uint64_t generation = 0;
+    // The guest registry's generation from before the capture.
+    std::uint64_t mappings = 0;
 };
 
 bool DecodeProgramsCurrent(const DrawDecode& decode, const ShaderRegistry& registry);

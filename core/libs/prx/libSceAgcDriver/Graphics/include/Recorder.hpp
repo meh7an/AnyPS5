@@ -19,12 +19,23 @@
 #include <span>
 #include <tuple>
 #include <unordered_set>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
 namespace AgcDriver::Graphics {
 
 class Buffer;
+
+// The graphics state the open render pass's last draw bound (Pipeline::Continue), so a continued
+// draw skips the binds it repeats. Kept with the recorder's pass and reset when the pass ends.
+struct PassBinding {
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    VkViewport viewport{};
+    VkRect2D scissor{};
+    std::array<float, 3> depthBias{};
+    std::array<float, 2> depthBounds{};
+};
 
 // Accumulates GPU work across guest commands so the CPU does not wait for each one. Dispatches and the
 // copies that feed them record into one open batch; Submit sends it to the queue without waiting and
@@ -68,6 +79,8 @@ public:
     };
     DrawPassStart StartDrawPass(std::uint64_t key, bool forced, bool fenced, const PassAccess& access);
     void LeaveRenderPassOpen(std::uint64_t key, std::uint32_t timing, bool fenced, const PassAccess& access, std::function<void(VkCommandBuffer)> afterPass = {});
+    // What the draws of the pass being recorded bound so far (empty until a draw begins a pass).
+    PassBinding& PassBound();
     // DCC "uncompressed" key stores (DccMetadata.cpp StoreUncompressedOnGpu): queued on the open
     // batch and recorded as one run (one barrier pair for every queued fill) at Submit, before a
     // label store (RecordStore), or before a command that writes or reads a queued range (the
@@ -98,8 +111,21 @@ public:
     static constexpr std::size_t DrawSnapshotEntries = 1024;
     static constexpr std::size_t DrawInputBudget = std::size_t{1024} << 20u;
     static constexpr std::size_t DrawInputEntries = 16384;
-    std::shared_ptr<Buffer> ReusableDrawSnapshot(std::uint64_t address, std::size_t bytes, SnapshotUse use = SnapshotUse::Storage, std::uint32_t* derived = nullptr, std::uint64_t generation = 0);
+    // The kept snapshot of the range while it is current. A stale storage snapshot nothing else
+    // holds is patched where its blocks changed when the caller collected `generation` for it
+    // (refreshDrawSnapshot), and is current at that generation. `rewritten` (when given) is set
+    // when a kept snapshot or sighting of the range was found stale: the range was written since
+    // its last copy.
+    // `sighted` (when given) is set when the range's sighting is current: unchanged since a copy the
+    // cache did not keep (see KeepDrawSnapshot).
+    std::shared_ptr<Buffer> ReusableDrawSnapshot(std::uint64_t address, std::size_t bytes, SnapshotUse use = SnapshotUse::Storage, std::uint32_t* derived = nullptr, std::uint64_t generation = 0, bool* rewritten = nullptr, bool* sighted = nullptr);
+    // Keeps `buffer` as the range's snapshot. A null `buffer` notes a sighting instead: the range was
+    // copied at `generation` into a buffer that dies with its batch. A sighting takes an entry but
+    // none of the pool's bytes.
     void KeepDrawSnapshot(std::uint64_t address, std::size_t bytes, std::uint64_t generation, std::uint64_t registryGeneration, std::shared_ptr<Buffer> buffer, SnapshotUse use = SnapshotUse::Storage, std::uint32_t derived = 0);
+    // The kept snapshots of `use`'s pool (storage, or vertex and index inputs): entries (sightings
+    // included) and bytes.
+    std::pair<std::size_t, std::size_t> DrawSnapshotPoolUse(SnapshotUse use) const;
     // Draw uploads: small per-draw copies (snapshots of small read-only guest buffers, the words of
     // moved data buffers, small index and vertex ranges) are bump-allocated at the storage buffer
     // offset alignment (at least 16, which covers index and vertex offsets) from one host
@@ -631,6 +657,7 @@ private:
             bool fenced = false;
             std::uint64_t key = 0;
             std::uint32_t timing = NoTiming;
+            PassBinding bound;
             std::function<void(VkCommandBuffer)> afterPass;
         } renderPass;
         PassHazards passHazards;
@@ -813,6 +840,12 @@ private:
     std::uint64_t newestSubmitted = 0;
     std::chrono::steady_clock::time_point newestSubmittedAt{};
     using DrawSnapshotKey = std::tuple<std::uint64_t, SnapshotUse, std::size_t>;
+    struct DrawSnapshotKeyHash {
+        std::size_t operator()(const DrawSnapshotKey& key) const {
+            const auto hash = (std::get<0>(key) ^ (static_cast<std::uint64_t>(std::get<2>(key)) << 20u) ^ (static_cast<std::uint64_t>(std::get<1>(key)) << 60u)) * 0x9e3779b97f4a7c15ull;
+            return static_cast<std::size_t>(hash ^ (hash >> 32u));
+        }
+    };
     struct DrawSnapshot {
         std::uint64_t generation;
         std::uint64_t registryGeneration;
@@ -824,12 +857,16 @@ private:
         std::list<DrawSnapshotKey> recency;
         std::size_t bytes = 0;
     };
-    std::map<DrawSnapshotKey, DrawSnapshot> drawSnapshots;
+    // Storage and index snapshots are found by their exact key (a hash lookup); a vertex snapshot by
+    // the smallest one at the address covering the draw's bytes (an ordered map of vertex keys only).
+    std::unordered_map<DrawSnapshotKey, DrawSnapshot, DrawSnapshotKeyHash> exactSnapshots;
+    std::map<DrawSnapshotKey, DrawSnapshot> vertexSnapshots;
     std::array<DrawSnapshotPool, 2> drawSnapshotPools;
     // The draw upload chunk being filled and its bytes in use (see DrawUpload).
     std::shared_ptr<Buffer> drawUpload;
     VkDeviceSize drawUploadUsed = 0;
-    void eraseDrawSnapshot(std::map<DrawSnapshotKey, DrawSnapshot>::iterator entry);
+    template <typename Entries>
+    void eraseDrawSnapshot(Entries& entries, typename Entries::iterator entry);
     bool refreshDrawSnapshot(DrawSnapshot& entry, std::uint64_t address, std::size_t bytes);
 };
 

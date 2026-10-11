@@ -88,6 +88,10 @@ struct ShaderSnapshot {
 
 std::shared_ptr<const ShaderSnapshot> ReadRawShader(std::uint64_t address);
 std::shared_ptr<const ShaderSnapshot> ProgramSnapshot(const ShaderRegistry& shaders, std::uint64_t address, std::initializer_list<std::uint8_t> types);
+// ProgramSnapshot over a published registry, its map lookup memoized per thread for the registry
+// last asked about, which the memo holds: PublishRegisteredShader copies a registry instead of
+// changing it in place, so a memoized lookup stays valid.
+std::shared_ptr<const ShaderSnapshot> RegisteredProgramAt(const std::shared_ptr<const ShaderRegistry>& registry, std::uint64_t address, std::initializer_list<std::uint8_t> types);
 void NoteRawGraphicsDraw();
 bool RawGraphicsDrawn();
 bool ProgramUsesWorkgroup(const ShaderSnapshot& snapshot, std::size_t codeOffset);

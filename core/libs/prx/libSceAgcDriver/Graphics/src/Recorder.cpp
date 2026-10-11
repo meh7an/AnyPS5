@@ -1429,6 +1429,11 @@ Recorder::DrawPassStart Recorder::StartDrawPass(std::uint64_t key, bool forced, 
     return {commands, false, !elide};
 }
 
+PassBinding& Recorder::PassBound() {
+    Require(open != nullptr, "no batch is open for the render pass");
+    return open->renderPass.bound;
+}
+
 void Recorder::LeaveRenderPassOpen(std::uint64_t key, std::uint32_t timing, bool fenced, const PassAccess& access, std::function<void(VkCommandBuffer)> afterPass) {
     Require(open != nullptr, "no batch is open for the render pass");
     auto& pass = open->renderPass;
@@ -2512,28 +2517,40 @@ std::size_t SnapshotPool(Recorder::SnapshotUse use) {
 }
 }
 
-void Recorder::eraseDrawSnapshot(std::map<DrawSnapshotKey, DrawSnapshot>::iterator entry) {
+template <typename Entries>
+void Recorder::eraseDrawSnapshot(Entries& entries, typename Entries::iterator entry) {
     auto& pool = drawSnapshotPools[SnapshotPool(std::get<1>(entry->first))];
-    pool.bytes -= std::get<2>(entry->first);
+    if (entry->second.buffer != nullptr) pool.bytes -= std::get<2>(entry->first);
     pool.recency.erase(entry->second.recent);
-    drawSnapshots.erase(entry);
+    entries.erase(entry);
 }
 
-std::shared_ptr<Buffer> Recorder::ReusableDrawSnapshot(std::uint64_t address, std::size_t bytes, SnapshotUse use, std::uint32_t* derived, std::uint64_t generation) {
-    auto found = use == SnapshotUse::Vertex ? drawSnapshots.lower_bound({address, use, bytes}) : drawSnapshots.find({address, use, bytes});
-    if (found == drawSnapshots.end() || std::get<0>(found->first) != address || std::get<1>(found->first) != use) return {};
-    const bool sameRegistry = found->second.registryGeneration == GuestAllocations::GuestAllocationsGeneration_nid_postfix();
-    if (!sameRegistry || !GuestMemory::UnchangedSince(address, bytes, found->second.generation)) {
-        if (!sameRegistry || generation == 0 || use != SnapshotUse::Storage || !refreshDrawSnapshot(found->second, address, bytes)) {
-            eraseDrawSnapshot(found);
+std::shared_ptr<Buffer> Recorder::ReusableDrawSnapshot(std::uint64_t address, std::size_t bytes, SnapshotUse use, std::uint32_t* derived, std::uint64_t generation, bool* rewritten, bool* sighted) {
+    const auto reuse = [&](auto& entries, auto found) -> std::shared_ptr<Buffer> {
+        const bool sameRegistry = found->second.registryGeneration == GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+        if (!sameRegistry || !GuestMemory::UnchangedSince(address, bytes, found->second.generation)) {
+            if (!sameRegistry || generation == 0 || use != SnapshotUse::Storage || found->second.buffer == nullptr || !refreshDrawSnapshot(found->second, address, bytes)) {
+                if (rewritten != nullptr) *rewritten = true;
+                eraseDrawSnapshot(entries, found);
+                return {};
+            }
+            found->second.generation = generation;
+        }
+        if (found->second.buffer == nullptr) {
+            if (sighted != nullptr) *sighted = true;
             return {};
         }
-        found->second.generation = generation;
+        auto& recency = drawSnapshotPools[SnapshotPool(use)].recency;
+        recency.splice(recency.end(), recency, found->second.recent);
+        if (derived != nullptr) *derived = found->second.derived;
+        return found->second.buffer;
+    };
+    if (use == SnapshotUse::Vertex) {
+        const auto found = vertexSnapshots.lower_bound({address, use, bytes});
+        return found != vertexSnapshots.end() && std::get<0>(found->first) == address ? reuse(vertexSnapshots, found) : nullptr;
     }
-    auto& recency = drawSnapshotPools[SnapshotPool(use)].recency;
-    recency.splice(recency.end(), recency, found->second.recent);
-    if (derived != nullptr) *derived = found->second.derived;
-    return found->second.buffer;
+    const auto found = exactSnapshots.find({address, use, bytes});
+    return found != exactSnapshots.end() ? reuse(exactSnapshots, found) : nullptr;
 }
 
 bool Recorder::refreshDrawSnapshot(DrawSnapshot& entry, std::uint64_t address, std::size_t bytes) {
@@ -2582,20 +2599,33 @@ void Recorder::KeepDrawSnapshot(std::uint64_t address, std::size_t bytes, std::u
     auto& pool = drawSnapshotPools[SnapshotPool(use)];
     if (generation == 0 || bytes > budget) return;
     if (use == SnapshotUse::Vertex) {
-        for (auto it = drawSnapshots.lower_bound({address, use, 0}); it != drawSnapshots.end() && std::get<0>(it->first) == address && std::get<1>(it->first) == use && std::get<2>(it->first) <= bytes;) eraseDrawSnapshot(it++);
-    } else if (const auto found = drawSnapshots.find({address, use, bytes}); found != drawSnapshots.end()) {
-        eraseDrawSnapshot(found);
+        for (auto it = vertexSnapshots.lower_bound({address, use, 0}); it != vertexSnapshots.end() && std::get<0>(it->first) == address && std::get<2>(it->first) <= bytes;) eraseDrawSnapshot(vertexSnapshots, it++);
+    } else if (const auto found = exactSnapshots.find({address, use, bytes}); found != exactSnapshots.end()) {
+        eraseDrawSnapshot(exactSnapshots, found);
     }
-    while (!pool.recency.empty() && (pool.bytes + bytes > budget || pool.recency.size() >= maxEntries)) eraseDrawSnapshot(drawSnapshots.find(pool.recency.front()));
+    // A sighting holds no buffer, so it takes none of the budget.
+    const auto keptBytes = buffer != nullptr ? bytes : 0;
+    while (!pool.recency.empty() && (pool.bytes + keptBytes > budget || pool.recency.size() >= maxEntries)) {
+        const auto oldest = pool.recency.front();
+        if (std::get<1>(oldest) == SnapshotUse::Vertex) eraseDrawSnapshot(vertexSnapshots, vertexSnapshots.find(oldest));
+        else eraseDrawSnapshot(exactSnapshots, exactSnapshots.find(oldest));
+    }
     const DrawSnapshotKey key{address, use, bytes};
     pool.recency.push_back(key);
     try {
-        drawSnapshots.emplace(key, DrawSnapshot{generation, registryGeneration, std::prev(pool.recency.end()), std::move(buffer), derived});
+        DrawSnapshot snapshot{generation, registryGeneration, std::prev(pool.recency.end()), std::move(buffer), derived};
+        if (use == SnapshotUse::Vertex) vertexSnapshots.emplace(key, std::move(snapshot));
+        else exactSnapshots.emplace(key, std::move(snapshot));
     } catch (...) {
         pool.recency.pop_back();
         throw;
     }
-    pool.bytes += bytes;
+    pool.bytes += keptBytes;
+}
+
+std::pair<std::size_t, std::size_t> Recorder::DrawSnapshotPoolUse(SnapshotUse use) const {
+    const auto& pool = drawSnapshotPools[SnapshotPool(use)];
+    return {pool.recency.size(), pool.bytes};
 }
 
 Recorder::UploadSlice Recorder::DrawUpload(std::size_t bytes) {

@@ -222,6 +222,7 @@ function(add_shader_recompiler target runtimeTarget)
             DebugProbeActive
             DepthBitsTextureWidth
             HashBytes
+            PatchOverUserData
             PixelInput
             PixelInputBit
             RayTracingStrict
@@ -249,6 +250,8 @@ function(add_shader_recompiler target runtimeTarget)
             FindUserDataCalls
             UserDataCalleeLength
             LinkUserDataCalls
+            UserDataKeyFor
+            UserDataPatchesFor
             WriteFileAtomically
     )
     set(shaderCacheManifest)

@@ -930,20 +930,37 @@ void reportDrawEnd(const State& state, const DrawTimer& timer, const ShaderResou
 
 }
 
-DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uint64_t address, std::size_t bytes, std::size_t alignment, Recorder::SnapshotUse use) {
+DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uint64_t address, std::size_t bytes, std::size_t alignment, Recorder::SnapshotUse use, bool sighting) {
     Require(use != Recorder::SnapshotUse::Storage, "a draw input is a vertex or index buffer");
+    // The largest unproven range copied into the upload chunk (a quarter of a chunk).
+    constexpr std::size_t sightingUploadMax = Recorder::DrawUploadChunk / 4;
     DrawInputCopy copy;
+    copy.bytes = bytes;
     if (recorder != nullptr && bytes != 0) {
         GuestMemory::FlushGpuWrites(address, bytes);
         copy.registryGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
         copy.generation = GuestMemory::CollectWrites(address, bytes);
-        if (copy.generation != 0) copy.buffer = recorder->ReusableDrawSnapshot(address, bytes, use, &copy.derived);
+        bool sighted = false;
+        if (copy.generation != 0) copy.buffer = recorder->ReusableDrawSnapshot(address, bytes, use, &copy.derived, 0, &copy.rewritten, &sighted);
         if (copy.buffer != nullptr) {
             copy.reused = true;
             return copy;
         }
+        // Not yet found unchanged since a copy: a buffer of its own would likely sit in the snapshot
+        // cache unused (a ring slot is rewritten before its next draw) while the pool allocates
+        // the next one.
+        if (sighting && !sighted && bytes <= sightingUploadMax && ShaderResources::DrawUploadLimit() != 0) {
+            auto slice = recorder->DrawUpload(bytes);
+            GuestMemory::Read(address, std::span<std::byte>(slice.bytes, bytes), alignment);
+            copy.buffer = std::move(slice.buffer);
+            copy.offset = slice.offset;
+            copy.data = slice.bytes;
+            copy.uploaded = true;
+            return copy;
+        }
     }
     copy.buffer = std::make_shared<Buffer>(context, bytes, use == Recorder::SnapshotUse::Vertex ? VK_BUFFER_USAGE_VERTEX_BUFFER_BIT : VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
+    copy.data = copy.buffer->Bytes().data();
     GuestMemory::Read(address, copy.buffer->Bytes(), alignment);
     return copy;
 }
@@ -961,7 +978,8 @@ DrawInputCopy CopyZeroPaddedDrawInput(const Context& context, std::uint64_t addr
 
 void KeepDrawInput(Recorder* recorder, std::uint64_t address, const DrawInputCopy& copy, Recorder::SnapshotUse use, std::uint32_t derived) {
     if (recorder == nullptr || copy.reused || copy.generation == 0 || copy.buffer == nullptr) return;
-    recorder->KeepDrawSnapshot(address, copy.buffer->Bytes().size(), copy.generation, copy.registryGeneration, copy.buffer, use, derived);
+    // An uploaded copy dies with its batch: the cache notes the sighting instead.
+    recorder->KeepDrawSnapshot(address, copy.bytes, copy.generation, copy.registryGeneration, copy.uploaded ? nullptr : copy.buffer, use, derived);
 }
 
 const HostImport* InPlaceDrawInput(const Context& context, std::uint64_t address, std::size_t bytes, std::size_t alignment) {
@@ -981,6 +999,9 @@ const HostImport* InPlaceDrawInput(const Context& context, std::uint64_t address
 
 namespace {
 
+// A draw's vertex buffer copies (one or two for most draws): four inline, more spill to the heap.
+using VertexBufferList = InlineList<std::shared_ptr<Buffer>, 4>;
+
 // The draw's inputs before its resources (prepareDrawInputs): the validated parameters, the index
 // buffer copy with its highest index, the vertex buffer copies and their layout, the fragment
 // outputs and the pipeline stages.
@@ -995,9 +1016,9 @@ struct DrawInputs {
     VkDeviceSize indexOffset = 0;
     std::uint32_t maxIndex = 0;
     VertexInputLayout vertexInput;
-    std::vector<std::shared_ptr<Buffer>> vertexBuffers;
-    std::vector<VkBuffer> vertexHandles;
-    std::vector<VkDeviceSize> vertexOffsets;
+    VertexBufferList vertexBuffers;
+    InlineList<VkBuffer, 16> vertexHandles;
+    InlineList<VkDeviceSize, 16> vertexOffsets;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> inPlaceReads;
     // A bit per color target the pixel shader exports to (CachedFragmentOutputs).
     std::uint32_t fragmentOutputs = 0;
@@ -1021,7 +1042,13 @@ struct VertexParts {
     enum Part { Index, Layout, Fetches, Copies, Handles, Count };
     static constexpr const char* Names[Count] = {"index", "layout", "fetches", "copies", "handles"};
     std::array<double, Count> us{};
-    std::uint64_t draws = 0, indexed = 0, indexUploaded = 0, copies = 0, uploaded = 0, reused = 0, made = 0;
+    // Vertex copies by path: uploaded (small, on every draw), reused (a kept copy), made (a kept
+    // buffer of its own) and unproven (copied into the upload chunk, see CopyDrawInput's `sighting`);
+    // `rewritten`: made or unproven after a kept copy or sighting went stale.
+    std::uint64_t draws = 0, indexed = 0, indexUploaded = 0, copies = 0, uploaded = 0, reused = 0, made = 0, madeBytes = 0, unproven = 0, unprovenBytes = 0, rewritten = 0;
+    // Index copies above the upload limit (CopyDrawInput): reused, and made fresh (after a kept copy
+    // went stale: rewritten).
+    std::uint64_t indexReused = 0, indexMade = 0, indexRewritten = 0;
     std::array<std::uint64_t, 6> sizeCount{};
     std::array<std::uint64_t, 6> sizeBytes{};
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
@@ -1038,19 +1065,32 @@ struct VertexParts {
         us[part] += std::chrono::duration<double, std::micro>(now - lap).count();
         lap = now;
     }
-    void noteCopy(std::size_t bytes, int path) {
+    void noteCopy(std::size_t bytes, int path, bool rewrite = false) {
         if (!enabled) return;
         ++copies;
-        ++(path == 0 ? uploaded : path == 1 ? reused : made);
+        ++(path == 0 ? uploaded : path == 1 ? reused : path == 2 ? made : unproven);
+        if (path == 2) madeBytes += bytes;
+        if (path == 3) unprovenBytes += bytes;
+        if (rewrite) ++rewritten;
         const std::size_t bucket = bytes <= 256 ? 0 : bytes <= 1024 ? 1 : bytes <= 4096 ? 2 : bytes <= 16384 ? 3 : bytes <= 65536 ? 4 : 5;
         ++sizeCount[bucket];
         sizeBytes[bucket] += bytes;
     }
-    void report() {
+    void noteIndexCopy(bool reuse, bool rewrite) {
+        if (!enabled) return;
+        ++(reuse ? indexReused : indexMade);
+        if (rewrite) ++indexRewritten;
+    }
+    void report(const Recorder* recorder) {
         if (!enabled) return;
         const auto now = std::chrono::steady_clock::now();
         if (now - lastReport < std::chrono::seconds(10) || draws == 0) return;
         lastReport = now;
+        if (recorder != nullptr) {
+            const auto [inputs, inputBytes] = recorder->DrawSnapshotPoolUse(Recorder::SnapshotUse::Vertex);
+            const auto [storage, storageBytes] = recorder->DrawSnapshotPoolUse(Recorder::SnapshotUse::Storage);
+            std::fprintf(stderr, "[vertex-parts] kept snapshots: inputs %zu (%.1f MiB), storage %zu (%.1f MiB)\n", inputs, static_cast<double>(inputBytes) / 1048576.0, storage, static_cast<double>(storageBytes) / 1048576.0);
+        }
         std::string line;
         for (std::size_t i = 0; i < Count; ++i) {
             char text[64];
@@ -1064,9 +1104,10 @@ struct VertexParts {
             std::snprintf(text, sizeof(text), " %s %llu (%.1f MiB)", SizeNames[i], static_cast<unsigned long long>(sizeCount[i]), static_cast<double>(sizeBytes[i]) / 1048576.0);
             sizes += text;
         }
-        std::fprintf(stderr, "[vertex-parts] %llu draws (%llu indexed, %llu index copies uploaded; %llu vertex copies: %llu uploaded, %llu reused, %llu made), us per draw:%s; vertex copy sizes:%s\n", static_cast<unsigned long long>(draws), static_cast<unsigned long long>(indexed), static_cast<unsigned long long>(indexUploaded), static_cast<unsigned long long>(copies), static_cast<unsigned long long>(uploaded), static_cast<unsigned long long>(reused), static_cast<unsigned long long>(made), line.c_str(), sizes.c_str());
+        std::fprintf(stderr, "[vertex-parts] %llu draws (%llu indexed, %llu index copies uploaded, %llu kept copies reused, %llu made (%llu rewritten); %llu vertex copies: %llu uploaded, %llu reused, %llu made (%.1f MiB), %llu unproven (%.1f MiB), %llu rewritten), us per draw:%s; vertex copy sizes:%s\n", static_cast<unsigned long long>(draws), static_cast<unsigned long long>(indexed), static_cast<unsigned long long>(indexUploaded), static_cast<unsigned long long>(indexReused), static_cast<unsigned long long>(indexMade), static_cast<unsigned long long>(indexRewritten), static_cast<unsigned long long>(copies), static_cast<unsigned long long>(uploaded), static_cast<unsigned long long>(reused), static_cast<unsigned long long>(made), static_cast<double>(madeBytes) / 1048576.0, static_cast<unsigned long long>(unproven), static_cast<double>(unprovenBytes) / 1048576.0, static_cast<unsigned long long>(rewritten), line.c_str(), sizes.c_str());
         us = {};
-        draws = indexed = indexUploaded = copies = uploaded = reused = made = 0;
+        draws = indexed = indexUploaded = copies = uploaded = reused = made = madeBytes = unproven = unprovenBytes = rewritten = 0;
+        indexReused = indexMade = indexRewritten = 0;
         sizeCount = {};
         sizeBytes = {};
     }
@@ -1145,8 +1186,9 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
     inputs.maxIndex = draw.indexed ? 0u : draw.firstVertex + draw.indexCount - 1u;
     // Small index and vertex ranges are copied into the recorder's upload chunk on every draw
     // (Recorder::DrawUpload): cheaper than proving a kept copy unchanged. Larger ones keep their
-    // own copy, reused while the range is unchanged (CopyDrawInput). A range a host import covers
-    // is read in place instead.
+    // own copy, reused while the range is unchanged (CopyDrawInput); a larger vertex range goes into
+    // the chunk too until it is found unchanged since a copy (CopyDrawInput's `sighting`). A range a
+    // host import covers is read in place instead.
     auto* const uploads = ShaderResources::DrawUploadLimit() != 0 ? context.recorder : nullptr;
     const auto uploaded = [&](std::size_t bytes) { return uploads != nullptr && bytes != 0 && bytes <= ShaderResources::DrawUploadLimit(); };
     if (draw.indexed) {
@@ -1171,6 +1213,7 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
             read = std::span<const std::byte>(slice.bytes, static_cast<std::size_t>(indexBytes));
         } else {
             copy = CopyDrawInput(context, context.recorder, draw.indexAddress, static_cast<std::size_t>(indexBytes), draw.indexSize, use);
+            parts.noteIndexCopy(copy.reused, copy.rewritten);
             scan = !copy.reused;
             if (scan) read = copy.buffer->Bytes().first(static_cast<std::size_t>(indexBytes));
         }
@@ -1261,8 +1304,6 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
     std::vector<VkDeviceSize> rangeOffsets;
     rangeHandles.reserve(plan.copies.size());
     rangeOffsets.reserve(plan.copies.size());
-    inputs.vertexBuffers.reserve(plan.copies.size());
-    inputs.vertexHandles.reserve(attributes.size());
     for (std::size_t range = 0; range < plan.copies.size(); ++range) {
         const auto [begin, end] = plan.copies[range];
         const auto bytes = static_cast<std::size_t>(end - begin);
@@ -1282,11 +1323,11 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
             parts.noteCopy(bytes, 0);
             continue;
         }
-        auto copy = CopyDrawInput(context, context.recorder, begin, bytes, 1, Recorder::SnapshotUse::Vertex);
+        auto copy = CopyDrawInput(context, context.recorder, begin, bytes, 1, Recorder::SnapshotUse::Vertex, true);
         KeepDrawInput(context.recorder, begin, copy, Recorder::SnapshotUse::Vertex, 0);
-        parts.noteCopy(bytes, copy.reused ? 1 : 2);
+        parts.noteCopy(bytes, copy.reused ? 1 : copy.uploaded ? 3 : 2, copy.rewritten);
         rangeHandles.push_back(copy.buffer->Handle());
-        rangeOffsets.push_back(0);
+        rangeOffsets.push_back(copy.offset);
         inputs.vertexBuffers.push_back(std::move(copy.buffer));
     }
     std::vector<VkBuffer> soloHandles(fetches.size(), VK_NULL_HANDLE);
@@ -1316,7 +1357,7 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         inputs.vertexOffsets[i] = rangeOffsets[plan.copyOf[j]] + plan.offsets[j];
     }
     parts.mark(VertexParts::Handles);
-    parts.report();
+    parts.report(context.recorder);
     timer.phase(PhaseVertex);
     return inputs;
 }
@@ -1643,21 +1684,26 @@ std::function<void()> indirectRecordCheck(const IndirectRecord* indirect) {
     };
 }
 
-// Everything a recorded draw uses lives until its batch completes.
+// A draw's resident targets, one per color attachment (one for most draws): four inline, more spill
+// to the heap. Handed from the draw to its record and kept objects without an allocation.
+using TargetList = InlineList<std::shared_ptr<StorageTexture>, 4>;
+
+// Everything a recorded draw uses lives until its batch completes. One is built and torn down for
+// every draw, so its lists stay small.
 struct Kept {
     std::shared_ptr<ShaderResources> resources;
     std::shared_ptr<Pipeline> pipeline;
     std::shared_ptr<Framebuffer> framebuffer;
     std::shared_ptr<Buffer> indices;
-    std::vector<std::shared_ptr<Buffer>> vertexBuffers;
-    std::vector<std::shared_ptr<StorageTexture>> targets;
+    VertexBufferList vertexBuffers;
+    TargetList targets;
     std::unique_ptr<DeviceBuffer> scratch;
 };
 
 // The completion side of a recorded draw: the kept objects, the record check, the lease outcome,
 // the GPU write notes, the copied-buffer write-back (listed in DrawCopiedWriters or run as a
 // completion action) and the targets marked dirty.
-void keepRecordedDraw(Recorder& recorder, const std::shared_ptr<ShaderResources>& resources, std::shared_ptr<Pipeline> pipeline, std::shared_ptr<Framebuffer> framebuffer, DrawInputs& inputs, std::vector<std::shared_ptr<StorageTexture>> targets, std::unique_ptr<DeviceBuffer> scratch, std::function<void()> checkRecords, bool listed, bool completion, const DrawOutcome& outcome) {
+void keepRecordedDraw(Recorder& recorder, const std::shared_ptr<ShaderResources>& resources, std::shared_ptr<Pipeline> pipeline, std::shared_ptr<Framebuffer> framebuffer, DrawInputs& inputs, TargetList targets, std::unique_ptr<DeviceBuffer> scratch, std::function<void()> checkRecords, bool listed, bool completion, const DrawOutcome& outcome) {
     auto kept = std::make_shared<Kept>();
     kept->resources = resources;
     kept->pipeline = std::move(pipeline);
@@ -1707,7 +1753,7 @@ struct RecordedDraw {
     std::shared_ptr<Pipeline> pipeline;
     std::shared_ptr<Framebuffer> framebuffer;
     std::span<const VkImageView> targetViews;
-    std::vector<std::shared_ptr<StorageTexture>> targets;
+    TargetList targets;
     std::vector<std::shared_ptr<StorageTexture>> proxies;
     const IndirectRecord* indirect = nullptr;
     std::span<const ShaderResources::MovedBuffer> moved;
@@ -1824,18 +1870,33 @@ void captureInputs(const Context& context, Recorder& recorder, VkCommandBuffer c
 struct RecordParts {
     enum Part { Stores, Bindings, Pass, Bind, Push, Command, Leave, Count };
     static constexpr const char* Names[Count] = {"store flushes", "draw bindings", "pass continue/begin", "descriptor bind", "push constants", "draw command", "leave pass"};
+    // A part taking this long in one draw is counted apart (with its total and the longest): the
+    // Vulkan driver waiting inside a command rather than recording it shows there, not in the mean.
+    static constexpr double SlowUs = 20.0;
     std::array<double, Count> us{};
+    std::array<double, Count> slowUs{};
+    std::array<double, Count> maxUs{};
+    std::array<std::uint64_t, Count> slow{};
     std::uint64_t draws = 0, continued = 0;
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
     std::chrono::steady_clock::time_point lap{};
-    bool enabled = std::getenv("APS5_PROFILE_DRAW_PHASES") != nullptr;
+    // APS5_PROFILE_RECORD_PARTS=1 times these parts alone (a few clock reads per draw, about 2% of
+    // the frame rate): the other phase timers cost about a quarter of it, which hides what the
+    // driver does at full speed.
+    bool enabled = std::getenv("APS5_PROFILE_DRAW_PHASES") != nullptr || std::getenv("APS5_PROFILE_RECORD_PARTS") != nullptr;
     void start() {
         if (enabled) lap = std::chrono::steady_clock::now();
     }
     void mark(Part part) {
         if (!enabled) return;
         const auto now = std::chrono::steady_clock::now();
-        us[part] += std::chrono::duration<double, std::micro>(now - lap).count();
+        const auto spent = std::chrono::duration<double, std::micro>(now - lap).count();
+        us[part] += spent;
+        maxUs[part] = std::max(maxUs[part], spent);
+        if (spent >= SlowUs) {
+            ++slow[part];
+            slowUs[part] += spent;
+        }
         lap = now;
     }
     void finish(bool passContinued) {
@@ -1845,14 +1906,19 @@ struct RecordParts {
         const auto now = std::chrono::steady_clock::now();
         if (now - lastReport < std::chrono::seconds(10)) return;
         lastReport = now;
-        std::string line;
+        std::string line, slowLine;
         for (std::size_t i = 0; i < Count; ++i) {
             char text[64];
             std::snprintf(text, sizeof(text), " %s %.2f", Names[i], us[i] / static_cast<double>(draws));
             line += text;
+            std::snprintf(text, sizeof(text), " %s %llu (%.1f ms, max %.0f us)", Names[i], static_cast<unsigned long long>(slow[i]), slowUs[i] / 1000.0, maxUs[i]);
+            slowLine += text;
         }
-        std::fprintf(stderr, "[record-parts] %llu draws (%llu continued a pass), us per draw:%s\n", static_cast<unsigned long long>(draws), static_cast<unsigned long long>(continued), line.c_str());
+        std::fprintf(stderr, "[record-parts] %llu draws (%llu continued a pass), us per draw:%s; parts of %.0f us or more:%s\n", static_cast<unsigned long long>(draws), static_cast<unsigned long long>(continued), line.c_str(), SlowUs, slowLine.c_str());
         us = {};
+        slowUs = {};
+        maxUs = {};
+        slow = {};
         draws = continued = 0;
     }
 };
@@ -1937,7 +2003,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     bool rewritten = false;
     if (!meshIndirect && !inputs.restartTable.empty()) meshArguments = directMeshArguments(context, draw, inputs.restartTable);
     if (continued) {
-        record.pipeline->Continue(commands, state);
+        record.pipeline->Continue(commands, state, &recorder->PassBound());
     } else {
         for (const auto& proxy : record.proxies) {
             proxy->RecordAttachmentProxyLoad(commands, VK_IMAGE_LAYOUT_GENERAL);
@@ -1958,7 +2024,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         // Earlier recorded work (dispatches, the previous draw) wrote the images in the general
         // layout, which a lean draw renders in: no transitions.
         APS5_LOG_OUT_DEBUG("Beginning pipeline renderExtent=%ux%u", state.renderExtent.width, state.renderExtent.height);
-        record.pipeline->Begin(commands, *record.framebuffer, state.renderExtent, state);
+        record.pipeline->Begin(commands, *record.framebuffer, state.renderExtent, state, &recorder->PassBound());
     }
     parts.mark(RecordParts::Pass);
     APS5_LOG_CHARS_OUT_DEBUG("Pipeline Begin OK");
@@ -1982,6 +2048,8 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         record.pipeline->ContinueSecondChannel(commands);
         recordDrawCommands(context, commands, state, draw, inputs, record.indirect, argumentBuffer, argumentOffset);
     }
+    // The split draws bound pipelines of their own: the pass's next draw binds its pipeline again.
+    if (record.pipeline->SplitsFaces() || record.pipeline->SplitsSecondChannel()) recorder->PassBound() = {};
     parts.mark(RecordParts::Command);
     if (meshArguments != nullptr) recorder->Keep(meshArguments);
     if (args != nullptr) CountIndirectDraw(record.indirect->path, record.indirect->readMs, rewritten);
@@ -2106,7 +2174,8 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     static AgcDriver::Mutex dumpMutex;
     static std::map<std::uint64_t, int> dumped;
     std::vector<TargetBinding> targets(state.colors.size());
-    std::vector<VkImageView> targetViews;
+    // A view per color target and one for the depth surface.
+    InlineList<VkImageView, 9> targetViews;
     for (std::size_t index = 0; index < state.colors.size(); ++index) {
         auto& binding = targets[index];
         binding.color = state.colors[index];
@@ -2309,8 +2378,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     auto pipeline = CachedPipeline(context, pipelineState, inputs.vertexInput, *resources, shaders, lean ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
     // Resident targets' views are stable while their storage image lives, so the framebuffer is
     // reused with the pipeline; a per-draw RenderTarget gets a framebuffer of its own.
-    std::vector<std::shared_ptr<StorageTexture>> owners;
-    owners.reserve(targets.size());
+    TargetList owners;
     for (const auto& binding : targets) owners.push_back(binding.resident);
     auto framebuffer = pipeline->AcquireFramebuffer(targetViews, owners, state.renderExtent);
     timer.phase(PhasePipeline);
@@ -2323,7 +2391,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         record.pipeline = pipeline;
         record.framebuffer = framebuffer;
         record.targetViews = targetViews;
-        record.targets = owners;
+        record.targets = std::move(owners);
         for (const auto& binding : targets) {
             if (binding.proxied) record.proxies.push_back(binding.resident);
         }
@@ -2343,9 +2411,9 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
             recipe->key = contentKey;
             recipe->pipeline = pipeline;
             recipe->framebuffer = framebuffer;
-            for (const auto& owner : owners) recipe->targets.emplace_back(owner);
-            recipe->targetViews = targetViews;
-            recipe->passKey = DrawRenderPassKey(context, state, targetViews);
+            for (const auto& binding : targets) recipe->targets.emplace_back(binding.resident);
+            recipe->targetViews.assign(targetViews.begin(), targetViews.end());
+            recipe->passKey = DrawRenderPassKey(context, state, recipe->targetViews);
             recipe->vertexInput = inputs.vertexInput;
             recipe->pushStages = PushConstantStages(shaders);
             if (recipe->pushStages != 0) {
@@ -2364,6 +2432,12 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     APS5_LOG_CHARS_OUT_DEBUG("Creating CommandBatch");
     std::optional<CommandBatch> batch;
     if (!recorded) {
+        // A buffer shadow the draw reads was seeded, or written, by recorded work this batch would
+        // otherwise run ahead of.
+        if (recorder != nullptr && resources->UsesBufferShadows()) {
+            Recorder::CountSync(4);
+            recorder->Sync();
+        }
         // The color-target detiles below take their descriptor sets from a fresh batch.
         if (context.detiler != nullptr) context.detiler->BeginBatch();
         batch.emplace(context);
@@ -2523,7 +2597,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     APS5_LOG_CHARS_OUT_DEBUG("SubmitAndWait");
     timer.phase(PhaseRecord);
     if (recorded) {
-        keepRecordedDraw(*recorder, resources, pipeline, framebuffer, inputs, owners, std::move(scratch), std::move(checkRecords), listed, completion, outcome);
+        keepRecordedDraw(*recorder, resources, pipeline, framebuffer, inputs, std::move(owners), std::move(scratch), std::move(checkRecords), listed, completion, outcome);
         timer.phase(PhaseKeep);
         if (outcome.waited) {
             // The wait the dispatch path makes for such work (source 3, "address-based"): the
@@ -2644,8 +2718,7 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
     // what the lookup would return, and Refresh brings it up to date exactly as the lookup's does
     // (FlushPending, the whole-surface collect and UnchangedSince, the key scan). An image gone
     // from the cache is a miss: the ordinary path looks up anew.
-    std::vector<std::shared_ptr<StorageTexture>> targets;
-    targets.reserve(recipe.targets.size());
+    TargetList targets;
     for (std::size_t index = 0; index < recipe.targets.size(); ++index) {
         timer.phase(PhaseSetup);
         auto stored = recipe.targets[index].lock();

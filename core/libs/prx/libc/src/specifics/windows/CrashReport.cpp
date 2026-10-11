@@ -250,6 +250,9 @@ bool HandleSse4a(EXCEPTION_POINTERS* info) {
 LONG WINAPI ReportCrash(EXCEPTION_POINTERS* info) {
     static std::atomic<bool> reported{false};
     const auto* fault = info->ExceptionRecord;
+    // A read or write of a guarded guest page (GuestArenaGuard): the guard's owner makes the bytes
+    // current, the page opens and the access runs again.
+    if (fault->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && fault->NumberParameters >= 2 && fault->ExceptionInformation[0] <= 1 && GuestArena::GuestArenaHandleGuard_nid_postfix(fault->ExceptionInformation[1], fault->ExceptionInformation[0] == 1, info->ContextRecord->Rip)) return EXCEPTION_CONTINUE_EXECUTION;
     if (fault->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && fault->NumberParameters >= 2 && fault->ExceptionInformation[0] == 1 && GuestArena::GuestArenaHandleWrite_nid_postfix(fault->ExceptionInformation[1])) return EXCEPTION_CONTINUE_EXECUTION;
     if (HandleWatch(info)) return EXCEPTION_CONTINUE_EXECUTION;
     if (HandleSse4a(info)) return EXCEPTION_CONTINUE_EXECUTION;

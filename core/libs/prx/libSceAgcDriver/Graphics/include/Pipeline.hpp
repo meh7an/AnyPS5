@@ -8,6 +8,7 @@
 namespace AgcDriver::Graphics {
 
 struct VertexInputLayout;
+struct PassBinding;
 
 void LogPipelineStatistics_nid_no_patch(const Context& context, VkPipeline pipeline);
 
@@ -47,10 +48,13 @@ public:
     VkPipelineLayout Layout() const;
     std::shared_ptr<Framebuffer> AcquireFramebuffer(std::span<const VkImageView> targets, std::span<const std::shared_ptr<StorageTexture>> owners, VkExtent2D extent);
     // Begins the render pass on the framebuffer, binds the pipeline and sets its dynamic state.
-    void Begin(VkCommandBuffer commands, const Framebuffer& framebuffer, VkExtent2D extent, const State& state) const;
+    // `bound` (the recorder's PassBound) starts over and records what was bound.
+    void Begin(VkCommandBuffer commands, const Framebuffer& framebuffer, VkExtent2D extent, const State& state, PassBinding* bound = nullptr) const;
     // The same inside a render pass another pipeline of the same attachments began (compatible by
-    // construction: the attachment formats alone decide).
-    void Continue(VkCommandBuffer commands, const State& state) const;
+    // construction: the attachment formats alone decide). With `bound`, what the pass's previous
+    // draw bound is not bound again: the same pipeline skips its bind and sets only the dynamic
+    // state that changed; another pipeline sets all of it.
+    void Continue(VkCommandBuffer commands, const State& state, PassBinding* bound = nullptr) const;
     bool SplitsFaces() const { return backFaces != VK_NULL_HANDLE; }
     bool Optimized() const { return optimized != nullptr && optimized->handle.load() != VK_NULL_HANDLE; }
     void ContinueBackFaces(VkCommandBuffer commands, const State& state) const;

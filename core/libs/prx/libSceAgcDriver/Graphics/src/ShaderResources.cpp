@@ -2,11 +2,13 @@
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ThreadScratch.hpp"
 #include "ThreadOwned.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PlaceholderImages.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/InlineList.hpp"
 #include <algorithm>
 #include <atomic>
 #include <memory>
@@ -1071,6 +1073,9 @@ ShaderResources::ShaderResources(const Context& context, const ShaderRecompiler:
 
 ShaderResources::ShaderResources(const Context& context, std::span<const CompiledShader> shaders, const ColorTarget& target, std::uint32_t colorAttachments, std::uint64_t indexAddress, std::size_t indexBytes, std::span<const GuestMemorySnapshot> snapshots) : context(context), guestMemory(context) {
     drawBuild = true;
+    // A draw reads large ranges through an existing buffer shadow; a synchronous one syncs the
+    // recorder first (Draw), since the shadow's seeds and writers sit in its batches.
+    guestMemory.AllowShadowReads();
     prepareAddressBindings(shaders, snapshots);
     build(shaders, &target, colorAttachments, indexAddress, indexBytes);
 }
@@ -1911,17 +1916,17 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
     if (validatedTextures.size() != textures.size()) return fail(FastFail::NoRecord);
     const bool unchanged = pendingSerialSeen != 0 && pendingSerialSeen == serialBefore;
     const bool keyProofs = KeyFastPath();
-    thread_local std::vector<GuestMemory::UnchangedQuery>* queriesSlot = nullptr;
-    auto& queries = ShaderRecompiler::ThreadOwned(queriesSlot);
-    thread_local std::vector<StorageTexture::PendingQuery>* pendingSlot = nullptr;
-    auto& pending = ShaderRecompiler::ThreadOwned(pendingSlot);
+    struct QueriesTag {};
+    auto& queries = ThreadScratch<std::vector<GuestMemory::UnchangedQuery>, QueriesTag>();
+    struct PendingTag {};
+    auto& pending = ThreadScratch<std::vector<StorageTexture::PendingQuery>, PendingTag>();
     // The element each pending query stands for, in query order.
-    thread_local std::vector<PendingOverlap>* ownersSlot = nullptr;
-    auto& owners = ShaderRecompiler::ThreadOwned(ownersSlot);
-    thread_local std::vector<const StorageTexture*>* imagesSlot = nullptr;
-    auto& images = ShaderRecompiler::ThreadOwned(imagesSlot);
-    thread_local std::vector<DccKeys>* scannedKeysSlot = nullptr;
-    auto& scannedKeys = ShaderRecompiler::ThreadOwned(scannedKeysSlot);
+    struct OwnersTag {};
+    auto& owners = ThreadScratch<std::vector<PendingOverlap>, OwnersTag>();
+    struct ImagesTag {};
+    auto& images = ThreadScratch<std::vector<const StorageTexture*>, ImagesTag>();
+    struct ScannedKeysTag {};
+    auto& scannedKeys = ThreadScratch<std::vector<DccKeys>, ScannedKeysTag>();
     queries.clear();
     pending.clear();
     owners.clear();
@@ -2246,10 +2251,10 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
         captureValidation();
         return true;
     };
-    thread_local std::vector<PendingOverlap>* overlappingSlot = nullptr;
-    auto& overlapping = ShaderRecompiler::ThreadOwned(overlappingSlot);
-    thread_local std::vector<PendingOverlap>* refreshedSlot = nullptr;
-    auto& refreshed = ShaderRecompiler::ThreadOwned(refreshedSlot);
+    struct OverlappingTag {};
+    auto& overlapping = ThreadScratch<std::vector<PendingOverlap>, OverlappingTag>();
+    struct RefreshedTag {};
+    auto& refreshed = ThreadScratch<std::vector<PendingOverlap>, RefreshedTag>();
     refreshed.clear();
     FastFail reason = FastFail::Count;
     bool accepted = false;
@@ -2295,8 +2300,8 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
             // The walk after the refresh, or beside a proof that accepted a foreign overlap, must
             // find every object in place and current: another object, or an upload (a moved
             // content version), is a decision the proof got wrong.
-            thread_local std::vector<std::pair<const StorageTexture*, std::uint64_t>>* versionsSlot = nullptr;
-            auto& versions = ShaderRecompiler::ThreadOwned(versionsSlot);
+            struct VersionsTag {};
+            auto& versions = ThreadScratch<std::vector<std::pair<const StorageTexture*, std::uint64_t>>, VersionsTag>();
             versions.clear();
             for (const auto& surface : validatedTextures) {
                 if (surface.source != nullptr) versions.emplace_back(surface.source, surface.source->Version());
@@ -2327,17 +2332,24 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
         }
         return true;
     };
+    // A range this build reads in place that a buffer shadow serves now (its writer made it since):
+    // rebuilt, so the work binds the device copy instead of publishing it every use.
+    if (Recorder::Active() != nullptr && guestMemory.InPlaceShadowable()) return finish(fast, false, ProofFailure::Imports);
+    // A region the build's own buffer shadow serves gets the pending storage results stored without
+    // its shadow published (the rebind below seeds whatever changed).
+    const auto flushScope = [&](const DirectRegion& region) { return guestMemory.ShadowServed(region.begin, static_cast<std::size_t>(region.end - region.begin)) ? PublishScope::None : PublishScope::Whole; };
     if (EpochRevalidate()) {
         if (!directRegions.empty() && !(pendingSerialSeen != 0 && pendingSerialSeen == StorageTexture::PendingSerial())) {
-            thread_local std::vector<StorageTexture::PendingQuery>* regionsSlot = nullptr;
-            auto& regions = ShaderRecompiler::ThreadOwned(regionsSlot);
+            struct RegionsTag {};
+            auto& regions = ThreadScratch<std::vector<StorageTexture::PendingQuery>, RegionsTag>();
             regions.clear();
             for (const auto& region : directRegions) regions.push_back({region.begin, region.end, nullptr, nullptr, false});
             StorageTexture::ScanPending(regions);
             // A region over a unit shadow's fresh results (a retile bumped the serial) is
             // published by the flush, as one over a pending image is stored.
-            for (const auto& region : regions) {
-                if (region.overlaps || AnyShadowedOverlaps(region.begin, static_cast<std::size_t>(region.end - region.begin))) StorageTexture::FlushPending(region.begin, static_cast<std::size_t>(region.end - region.begin), nullptr, "imported buffer region");
+            for (std::size_t index = 0; index < regions.size(); ++index) {
+                const auto& region = regions[index];
+                if (region.overlaps || AnyShadowedOverlaps(region.begin, static_cast<std::size_t>(region.end - region.begin))) StorageTexture::FlushPending(region.begin, static_cast<std::size_t>(region.end - region.begin), nullptr, "imported buffer region", flushScope(directRegions[index]));
             }
         }
         if (HostImportsUnchanged(context, importsProof)) {
@@ -2347,7 +2359,7 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
             importsProof = HostImportsIdentity(context);
         }
     } else {
-        for (const auto& region : directRegions) StorageTexture::FlushPending(region.begin, static_cast<std::size_t>(region.end - region.begin), nullptr, "imported buffer region");
+        for (const auto& region : directRegions) StorageTexture::FlushPending(region.begin, static_cast<std::size_t>(region.end - region.begin), nullptr, "imported buffer region", flushScope(region));
         if (!serialLoop()) return finish(fast, false, ProofFailure::Imports);
     }
     // (3) Buffers staged in device memory (GuestBufferMemory::AllowDeviceStaging) are copied in
@@ -2361,6 +2373,9 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
             return finish(fast, false);
         }
     }
+    // (4) Buffer shadows serving regions (GuestBufferMemory::AllowShadowReads) are bound again, their
+    // stale units seeded; a shadow gone since leaves the set naming a stale buffer: rebuilt.
+    if (guestMemory.UsesBufferShadows() && !guestMemory.RebindBufferShadows()) return finish(fast, false, ProofFailure::Imports);
     pendingSerialSeen = EpochRevalidate() && StorageTexture::PendingSerial() == serialBefore ? serialBefore : 0;
     for (const auto& texture : textures) {
         if (texture != nullptr && texture->IsDepthCopy()) texture->RefreshDepthCopy();
@@ -3535,33 +3550,6 @@ BindingParts& bindingParts() {
     static BindingParts parts;
     return parts;
 }
-
-// A list whose first N elements live on the stack: the per-draw scratch lists of
-// PrepareDrawBindings hold a handful of entries, and a heap allocation each cost more than filling them.
-template <typename T, std::size_t N>
-class InlineList {
-public:
-    void push_back(const T& value) {
-        if (count < N) {
-            local[count] = value;
-        } else {
-            if (heap.empty()) heap.assign(local.begin(), local.end());
-            heap.push_back(value);
-        }
-        ++count;
-    }
-    T* data() { return count <= N ? local.data() : heap.data(); }
-    std::size_t size() const { return count; }
-    bool empty() const { return count == 0; }
-    T& operator[](std::size_t index) { return data()[index]; }
-    T* begin() { return data(); }
-    T* end() { return data() + count; }
-
-private:
-    std::array<T, N> local{};
-    std::vector<T> heap;
-    std::size_t count = 0;
-};
 
 }
 

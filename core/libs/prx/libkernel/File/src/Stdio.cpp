@@ -607,6 +607,7 @@ int64_t APS5_VABI pwrite_nid_disambig1_nid_postfix(int d, const void* buf, size_
         APS5_INVALID_ARG_EX;
     }
     if (FailPosixPositionedGuestSocket(d)) return -1;
+    GuestArena::OpenForHostRead(buf, nbytes);
     auto n = NativePwrite(d, buf, nbytes, offset);
     if (n < 0) {
         throw std::runtime_error(std::string(__func__) + ": pwrite failed, fd=" + std::to_string(d) + ", errno=" + std::to_string(errno));
@@ -844,6 +845,9 @@ static std::int64_t TransferIovecs(int d, const KernelIovec* iov, int iovcnt, co
     }
     std::deque<GuestArena::HostWrite> destinations;
     if (!write && !OpenIovecs(iov, iovcnt, destinations)) return SceErrorFromErrno(GUEST_EFAULT);
+    if (write) {
+        for (int i = 0; i < iovcnt; ++i) GuestArena::OpenForHostRead(iov[i].base, iov[i].length);
+    }
     if (offset == nullptr && d >= GuestSockets::FirstDescriptor) {
         const auto result = write ? GuestSockets::Writev(d, reinterpret_cast<const GuestSockets::Iovec*>(iov), iovcnt)
                                   : GuestSockets::Readv(d, reinterpret_cast<const GuestSockets::Iovec*>(iov), iovcnt);

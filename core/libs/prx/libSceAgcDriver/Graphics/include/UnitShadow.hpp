@@ -48,7 +48,7 @@ bool UnitShadowEnabled();
 // byte of the range; PartialUnits: a writer of the range (only units it covers partly are published,
 // so the neighbours' results in the rest of the unit reach the import before the write stamps it).
 enum class PublishScope : std::uint8_t { None, Whole, PartialUnits };
-enum class PublishReason : std::uint8_t { Hook, Region, Indirect, CopySource, CopyDestination, Fill, FillClear, Label, Keys, Scanout, Validate, Upload, TailMip, Evict, Retire, Teardown, Count };
+enum class PublishReason : std::uint8_t { Hook, Region, Indirect, CopySource, CopyDestination, Fill, FillClear, Label, Keys, Scanout, Validate, Upload, TailMip, Evict, Retire, Teardown, Guard, Unguarded, Count };
 // The reason for a FlushPending reason string ("memory access" -> Hook, ...).
 PublishReason PublishReasonFor(const char* flushReason);
 
@@ -66,6 +66,13 @@ struct ShadowSlab {
     std::uint64_t lastUse = 0;
     // Destinations handed out for a write-back in progress: such a slab is never evicted.
     std::atomic<std::uint32_t> pins{0};
+    // A buffer slab whose import pages are guarded (BufferShadowGuarded): set when a write's units
+    // are marked, cleared when a host touch made them current and opened them. Under the GpuMutex.
+    mutable std::atomic<bool> guarded{false};
+    // Its host touches: the present of the last one, and how many in a row came close enough to
+    // the one before to count towards dropping the slab. Under the GpuMutex.
+    std::uint64_t lastTouch = 0;
+    std::uint32_t touchStreak = 0;
 };
 
 // Holds one pin of a slab (ShadowDestination::pin).
@@ -150,6 +157,62 @@ std::string ShadowReport();
 // APS5_SHADOW_VERIFY=1: after a shadow-sourced upload, the units read must carry no stamp newer
 // than their generation (counted as mismatches otherwise).
 bool ShadowVerify();
+
+// Buffer shadows (on by default on Windows, APS5_BUFFER_SHADOW=0 turns them off; elsewhere, where
+// nothing guards them, APS5_BUFFER_SHADOW=1 turns them on): a device-local copy of a large guest
+// buffer range inside a host import, bound in the import's place by the dispatches that write it and
+// the dispatches and draws that read it, so passes that produce and consume a buffer on the GPU stop
+// crossing PCIe for it. One slab of the import's shadow spans the range whole, and its units follow
+// every rule above: a unit stamped since its generation is seeded from the import before a use, a
+// writer's units hold the newest bytes unpublished, and every host-facing consumer publishes them as
+// it publishes retiled units (image retiles never land in a buffer slab's units). The title's own
+// CPU code reads guest memory without the flush hook, so on Windows a written slab's import pages
+// are guarded (GuestArenaGuard): a host touch publishes the slab whole, waits for it and opens it,
+// and a slab that cannot be guarded has its written units published at once. A slab touched again
+// and again (APS5_BUFFER_SHADOW_DROP times in a row, default 8, each within 30 presents of the last;
+// 0 never drops) costs more than it saves: it is dropped, and its range is served in place from
+// then on. Unguarded (off Windows), a native read of a range after the GPU's label would see the
+// import's older bytes.
+bool BufferShadowEnabled();
+// Whether buffer shadows guard their import pages (Windows, buffer shadows on).
+bool BufferShadowGuarded();
+// The smallest range bound through a buffer shadow (APS5_BUFFER_SHADOW_MIN_MIB, default 8).
+std::uint64_t BufferShadowMinBytes();
+struct BufferShadowBinding {
+    VkBuffer buffer;
+    // The guest address of the buffer's first byte.
+    std::uint64_t base;
+    std::shared_ptr<ShadowSlab> slab;
+    // A writer's: keeps the slab from eviction until MarkBufferShadowWritten (an evicted slab would
+    // take the work's results with it).
+    std::shared_ptr<ShadowSlabPin> pin;
+};
+// Under GuestMemory::GpuMutex with an active recorder: the buffer shadow serving [begin, end) of
+// `import`, its stale units seeded from the import into the open batch first. A writer (`make`)
+// creates it when none spans the range; a reader only takes an existing one. Nothing when refused
+// (disabled, the budget, a shadow over part of the range): the caller binds the import instead.
+std::optional<BufferShadowBinding> BufferShadowFor(const Context& context, const HostImport& import, std::uint64_t begin, std::uint64_t end, bool make);
+// After the work writing [begin, end) through `slab` was recorded and the range stamped at
+// `generation` (GuestMemory::MarkWritten): its units hold the newest bytes, unpublished.
+void MarkBufferShadowWritten(const HostImport& import, const ShadowSlab& slab, std::uint64_t begin, std::uint64_t end, std::uint64_t generation);
+// Whether a buffer shadow spans [begin, end) (a build reading the range in place is rebuilt to bind
+// it, see ShaderResources::Revalidate).
+bool BufferShadowServes(std::uint64_t begin, std::uint64_t end);
+
+// Guarded buffer shadows, phase 0 (APS5_BUFFER_SHADOW_OBSERVE=1 with buffer shadows off,
+// APS5_BUFFER_SHADOW=0): the whole 64 KiB units of a range a buffer shadow would serve are guarded
+// (GuestArenaGuard) once a write of it is recorded, and a host CPU touch of one (the title's code,
+// the driver's, the Vulkan driver's) is counted and opens its unit until the next write. A
+// [shadow-guard] line every 10 s says what was guarded and which code touched it. The GPU writes the
+// import in place meanwhile, so no byte anyone reads changes. A host access GuestArena announces
+// (HostWrite, OpenForHostRead) is counted and opens its units first.
+bool BufferShadowObserved();
+void ObserveBufferShadowWrite(std::uint64_t begin, std::uint64_t end);
+// Before an import of [begin, end), which pins accessible pages only: whether the range is open.
+// Observed guards are opened; a guarded buffer shadow's are not (making the bytes current takes the
+// flush hook, which must not run under the import table's lock), so the import waits until a host
+// touch has made the range current and opened it.
+bool OpenShadowGuards(std::uint64_t begin, std::uint64_t end);
 
 }
 

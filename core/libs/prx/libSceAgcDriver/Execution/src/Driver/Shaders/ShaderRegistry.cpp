@@ -5,6 +5,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ThreadScratch.hpp"
 #include "CacheKey.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ShaderPreparation.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ShaderPreparationScope.hpp"
@@ -16,6 +17,7 @@
 #include <cstdio>
 #include <cstddef>
 #include <span>
+#include <array>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
@@ -254,13 +256,13 @@ std::shared_ptr<const ShaderSnapshot> RegisteredHeader(const ShaderRegistry& reg
     return {};
 }
 
-std::shared_ptr<const ShaderSnapshot> RegisteredProgram(const ShaderRegistry& registry, std::uint64_t address, std::initializer_list<std::uint8_t> types) {
-    auto found = registry.upper_bound(address);
-    if (found == registry.begin()) return {};
-    --found;
+namespace {
+
+// The program among the registrations starting last at or below `address` (RegisteredProgram).
+std::shared_ptr<const ShaderSnapshot> selectRegistered(const std::vector<std::shared_ptr<const ShaderSnapshot>>& candidates, std::uint64_t address, std::initializer_list<std::uint8_t> types) {
     std::shared_ptr<const ShaderSnapshot> result;
     bool registered = false;
-    for (const auto& snapshot : found->second) {
+    for (const auto& snapshot : candidates) {
         if (address - snapshot->codeAddress >= snapshot->code.size() * sizeof(std::uint32_t)) continue;
         registered = true;
         if (std::ranges::find(types, snapshot->type) == types.end()) continue;
@@ -269,6 +271,43 @@ std::shared_ptr<const ShaderSnapshot> RegisteredProgram(const ShaderRegistry& re
     }
     require(!registered || result != nullptr, "registered program refers to an incompatible shader binary type");
     return result;
+}
+
+// RegisteredProgramAt's memo: a direct-mapped table of map lookups in one registry. decodeDraw and
+// dispatch looked up each program in the registry's tree, a walk of cold nodes.
+struct RegisteredShaderMemo {
+    static constexpr std::size_t Entries = 16;
+    struct Entry {
+        std::uint64_t address = 0;
+        const std::vector<std::shared_ptr<const ShaderSnapshot>>* candidates = nullptr;
+    };
+    std::shared_ptr<const ShaderRegistry> registry;
+    std::array<Entry, Entries> entries{};
+};
+
+struct RegisteredShaderMemoTag;
+
+}
+
+std::shared_ptr<const ShaderSnapshot> RegisteredProgram(const ShaderRegistry& registry, std::uint64_t address, std::initializer_list<std::uint8_t> types) {
+    auto found = registry.upper_bound(address);
+    if (found == registry.begin()) return {};
+    return selectRegistered(std::prev(found)->second, address, types);
+}
+
+std::shared_ptr<const ShaderSnapshot> RegisteredProgramAt(const std::shared_ptr<const ShaderRegistry>& registry, std::uint64_t address, std::initializer_list<std::uint8_t> types) {
+    auto& memo = ThreadScratch<RegisteredShaderMemo, RegisteredShaderMemoTag>();
+    if (memo.registry != registry) {
+        memo.registry = registry;
+        memo.entries = {};
+    }
+    auto& entry = memo.entries[(address >> 8u) % RegisteredShaderMemo::Entries];
+    if (entry.candidates == nullptr || entry.address != address) {
+        auto found = registry->upper_bound(address);
+        if (found == registry->begin()) return {};
+        entry = {address, &std::prev(found)->second};
+    }
+    return selectRegistered(*entry.candidates, address, types);
 }
 
 void PublishRegisteredShader(std::shared_ptr<ShaderRegistry>& registry, const std::shared_ptr<const ShaderSnapshot>& snapshot) {

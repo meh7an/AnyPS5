@@ -72,6 +72,9 @@ std::uint64_t RegisteredReadableEnd(std::uint64_t address);
 // imported); see GuestBufferMemory.cpp.
 struct ImageMirror;
 class Recorder;
+// A buffer shadow's device buffer and a writer's pin on it (UnitShadow.hpp).
+struct ShadowSlab;
+struct ShadowSlabPin;
 
 // Identity of the import serving [address, address + bytes): a serial unique for the life of one
 // import, 0 when no import serves the range. An equal serial later means the same VkBuffer still
@@ -196,6 +199,25 @@ public:
     // that copy alone. Call before Upload.
     void AllowDeviceStaging() { stagingAllowed = true; }
     void AllowAdjustedRegions() { adjustedRegions = true; }
+    // Buffer shadows (UnitShadow.hpp, BufferShadowEnabled): a region of at least
+    // BufferShadowMinBytes inside a host import binds the shadow's device buffer in the import's
+    // place. A dispatch build (AllowDeviceStaging) writes through one, made on its first write; a
+    // draw build (AllowShadowReads) only reads through an existing one, and binds a region it
+    // writes in place. Call before Upload.
+    void AllowShadowReads() { shadowReads = true; }
+    // Binds every shadow-served region again for another use of this upload (a resource cache hit,
+    // from ShaderResources::Revalidate, under GuestMemory::GpuMutex with the device's recorder
+    // active): its stale units are seeded into the open batch. False when a shadow no longer serves
+    // its region (the build is then rebuilt).
+    bool RebindBufferShadows();
+    // Whether a region this upload binds in place is now served by a buffer shadow it could bind
+    // (Revalidate rebuilds such a build so the work reads device memory).
+    bool InPlaceShadowable() const;
+    // Whether a buffer shadow serves a region (a synchronous draw syncs the recorder first: the
+    // shadow's seeds and writers sit in its batches).
+    bool UsesBufferShadows() const;
+    // Whether the region holding [address, address + bytes) is served by a buffer shadow.
+    bool ShadowServed(std::uint64_t address, std::size_t bytes) const;
     // Records the copy-in of every staged region anew for another use of this upload (a resource
     // cache hit, from ShaderResources::Revalidate, under GuestMemory::GpuMutex, once the imports
     // were confirmed unchanged): the previous use's copy-back left the shadow behind, and the next
@@ -319,6 +341,18 @@ private:
         // The device refused the shadow (memory or allocations exhausted): the region takes the
         // path it would take without staging, in both upload stages.
         bool unstaged = false;
+        // A buffer shadow serves the region in the import's place (see AllowShadowReads): the
+        // device buffer of `shadow`, whose first byte is guest address `shadowBase`. Written by the
+        // work when `shadowWritten` (MarkDirectWrites marks its units); `shadowImport` names the
+        // shadow, and `shadowPin` keeps a writer's slab from eviction until the mark.
+        std::shared_ptr<ShadowSlab> shadow;
+        std::uint64_t shadowBase = 0;
+        bool shadowWritten = false;
+        HostImport shadowImport{};
+        mutable std::shared_ptr<ShadowSlabPin> shadowPin;
+        // APS5_BUFFER_SHADOW_OBSERVE: the work writes a range a buffer shadow would serve, in place;
+        // MarkDirectWrites guards it (ObserveBufferShadowWrite).
+        bool shadowObserved = false;
     };
 
     // How [begin, end) lies against the space's base regions.
@@ -363,6 +397,9 @@ private:
     // so UploadPrepare and UploadFinish decide alike.
     bool stagingEligible(const Region& region, bool addressable) const;
     bool bindableInPlace(std::uint64_t offset, bool addressable) const;
+    // Whether a region inside a host import may be served by a buffer shadow: shadows enabled for
+    // this build, not address-based, a whole committed range of at least BufferShadowMinBytes.
+    bool shadowEligible(const Region& region, bool addressable) const;
     // Records the import-to-buffer copies of the given gpuCopy regions into the open batch, with
     // the barriers that order them after earlier recorded writes and before the shaders reading them.
     void recordGpuCopies(std::span<Region* const> copies, bool addressable);
@@ -370,6 +407,7 @@ private:
     Context context;
     bool stagingAllowed = false;
     bool adjustedRegions = false;
+    bool shadowReads = false;
     GuestAllocations::Lease lease;
     // The cached address space this build maps through (its lease pins the ranges); `regions` then
     // holds only the regions outside it (V#s, snapshots, ranges copied per build).

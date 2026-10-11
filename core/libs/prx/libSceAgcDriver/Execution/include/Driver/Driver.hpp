@@ -137,11 +137,21 @@ private:
     // APS5_TRACE_DRAW_RELOC: for a draw repeating an earlier draw's structural key, how its stages'
     // captured memory compares with the earlier draw's (moved, same words, differing words).
     static void traceDrawRelocation(std::uint64_t structuralKey, const std::vector<DrawProgram>& programs, const std::vector<StageCapture>& captures);
+    // APS5_TRACE_STAGE_MEMO: for a draw repeating an earlier draw's structural key, whether a draw
+    // cache keyed on the user data with the changed words masked would serve it (the same captured
+    // words in place, the same variant, every changed result word a copy of a changed user word),
+    // and where each changed user word went.
+    static void traceStageMemo(std::uint64_t structuralKey, const std::vector<DrawProgram>& programs, const std::vector<StageCapture>& captures, const std::vector<const ShaderRecompiler::RecompileResult*>& results, const std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>>& vertexInfos);
     static bool sameVertexInfo(const ShaderRecompiler::ShaderVertexStageInfo& a, const ShaderRecompiler::ShaderVertexStageInfo& b);
     static bool sameDecode(const DrawDecode& a, const DrawDecode& b);
     std::shared_ptr<DrawDecode> decodeDraw(const QueueState& queue, const Submission& submission);
     void resolveDrawDecode(const QueueState& queue, const Submission& submission, std::shared_ptr<const DrawDecode>& decode, bool registerKey, std::uint64_t drawKey, bool profile);
     void lookupDraw(const Submission& submission, const std::shared_ptr<VulkanDevice>& localDevice, const Graphics::State& graphics, const ShaderRecompiler::ShaderPixelStageInfo& pixel, const std::vector<DrawProgram>& programs, const std::vector<ShaderRecompiler::ProgramRole>& roles, const std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>>& vertexInfos, bool useDrawEntries, bool registerKey, bool profile, std::uint64_t& drawKey, std::shared_ptr<DrawEntry>& entry, std::vector<std::shared_ptr<DispatchVariant>>& matched, std::vector<std::vector<ShaderRecompiler::MemoryRegion>>& matchedRegions, bool& drawHit, bool& verifyHit, DrawPhaseTiming& phaseTiming, std::array<double, DrawDriverPhaseCount>& phaseMs);
+    // Remembers a captured stage in the stage memo (DrawCapture.cpp, StageMemoEntry): refused when its
+    // result's user data copies cannot be named or do not hold, when its reads are not write-watched,
+    // or when they changed under the capture. Under APS5_VERIFY_STAGE_MEMO `memoResult` (what the memo
+    // would have served) is compared with the capture's result first.
+    void insertStageMemo(std::uint64_t hash, const std::shared_ptr<const ShaderRecompiler::SourceHandle>& handle, std::uint32_t pushOffset, const std::vector<std::uint32_t>& key, std::uint64_t mappings, const std::shared_ptr<const ShaderRecompiler::RecompileResult>& result, const std::shared_ptr<const ShaderRecompiler::RecompileResult>& memoResult, std::span<const std::uint32_t> userData, std::span<const ShaderRecompiler::MemoryRegion> recent, std::uint64_t codeAddress);
     std::shared_ptr<const ShaderRecompiler::RecompileResult> materializeDrawStage(std::size_t i, std::uint32_t pushOffset, const QueueState& queue, const Submission& submission, const std::vector<DrawProgram>& programs, const Graphics::State& graphics, const ShaderRecompiler::ShaderPixelStageInfo& pixel, const std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>>& vertexInfos, std::vector<ShaderRecompiler::MemoryRegion>& memory, const std::vector<ShaderRecompiler::LinkedProgram>& linked, const Pm4::DrawParameters& drawParameters, const std::shared_ptr<VulkanDevice>& localDevice, ShaderMemory& shaderMemory, std::vector<StageCapture>& stageCaptures, std::vector<bool>& recompiled, bool drawHit, bool wantRegions, const std::vector<std::shared_ptr<DispatchVariant>>& matched, const std::vector<std::vector<ShaderRecompiler::MemoryRegion>>& matchedRegions, bool profile, std::uint64_t dumpTarget, std::uint64_t dumpSlot1, std::uint64_t& captures, DrawPhaseTiming& phaseTiming, std::array<double, DrawDriverPhaseCount>& phaseMs, std::string& rejected);
     void cacheDrawStages(bool useDrawEntries, bool drawHit, const Pm4::DrawParameters& drawParameters, const std::optional<Graphics::IndirectDrawPath>& indirectCpu, const std::vector<DrawProgram>& programs, const std::vector<StageCapture>& stageCaptures, const std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>>& vertexInfos, const std::vector<std::vector<Graphics::DecodeRead>>& decodeReads, bool verifyHit, const std::vector<std::shared_ptr<DispatchVariant>>& matched, std::vector<std::shared_ptr<DispatchVariant>>& fresh, std::uint64_t drawKey, bool registerKey, const std::shared_ptr<const DrawDecode>& decode, DrawPhaseTiming& phaseTiming);
     static bool drawPrecheck();
@@ -177,7 +187,8 @@ private:
     void traceCopyPending(const char* what, std::uint64_t address, std::size_t bytes, std::uint64_t source, std::uint64_t destination, std::size_t copyBytes, const std::shared_ptr<VulkanDevice>& localDevice);
     static void countIndirect(int path, double readMs);
     void dispatchIndirect(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission);
-    static bool& sampledRead();
+    static bool sampledRead();
+    static void setSampledRead(bool sampled);
     static bool writeEvidenceEnabled();
     static bool writerKeyedEvidence();
     static bool foreignWriters();
@@ -336,6 +347,29 @@ private:
     std::atomic<std::uint64_t> drawCacheParks{0};
 
     DrawEntryCounters drawEntryCounters;
+
+    // The stage memo (DrawCapture.cpp): entries by key hash, the least recently used first in
+    // stageMemoOrder.
+    struct StageMemoSlot {
+        std::shared_ptr<const StageMemoEntry> entry;
+        // The entry's source and push offset, checked on every lookup without reaching the entry.
+        const void* source = nullptr;
+        std::uint32_t pushOffset = 0;
+        std::list<std::uint64_t>::iterator order;
+        // The result the slot last served, patched in place by the next hit while no draw holds it
+        // (a copy of the entry's result per hit cost a few dozen allocations). A hit that finds it
+        // held (the draw cache's variants keep theirs until evicted) copies, and the copy replaces it.
+        std::shared_ptr<ShaderRecompiler::RecompileResult> served;
+        // The entry's misses in a row (its words changed): a key whose words keep changing is
+        // validated and stored again only at powers of two of them, then every 64th.
+        std::uint32_t misses = 0;
+        // The generation the entry's words were last proven the guest's at: the capture's, then the
+        // collect before a compare that found them equal after a store stamped their blocks.
+        std::uint64_t generation = 0;
+    };
+    AgcDriver::Mutex stageMemoMutex;
+    std::unordered_map<std::uint64_t, StageMemoSlot> stageMemo;
+    std::list<std::uint64_t> stageMemoOrder;
 
     AgcDriver::Mutex driverPhasesMutex;
     std::array<DriverPhaseTotals, DispatchClassCount> driverPhaseTotals{};
