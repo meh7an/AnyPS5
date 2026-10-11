@@ -89,10 +89,13 @@ bool Driver::reapEachPacket() {
     return each;
 }
 
+// The recorded draws and dispatches a batch takes before it is submitted (APS5_BATCH_CAP). A submit
+// is mostly the device driver's own work and breaks the open render pass: on the S2 menu page
+// (about 2,700 draws a frame) 512 ran about 1 FPS ahead of 64.
 std::uint64_t Driver::batchCap() {
     static const std::uint64_t value = [] {
         const char* text = std::getenv("APS5_BATCH_CAP");
-        return text ? std::strtoull(text, nullptr, 10) : 64ull;
+        return text ? std::strtoull(text, nullptr, 10) : 512ull;
     }();
     return value;
 }
