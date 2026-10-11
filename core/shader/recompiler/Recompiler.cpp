@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstdio>
+#include <functional>
 #include "CacheKey.hpp"
 #include "CompiledVariant.hpp"
 #include "ShaderDiskCache.hpp"
@@ -217,6 +218,11 @@ struct UserDataAnalysis {
     std::shared_ptr<const UserDataKey> key;
     std::vector<std::array<std::int32_t, 4>> bufferCopies;
     std::vector<std::array<std::int32_t, 8>> imageCopies;
+    // Per buffer, the SRT read slots of its V#'s words 0 and 1 when word 0 is a memory copy
+    // (analyzeMemoryCopies), else {-1, -1}; and the raw read nodes of those slots, which a capture
+    // traces (null without copies).
+    std::vector<std::array<std::int32_t, 2>> bufferBaseReads;
+    std::shared_ptr<const SrtReadTrace::CopyNodes> copyNodes;
 };
 
 struct EmissionFailure {
@@ -232,6 +238,8 @@ struct SourceEntry {
     // results by variant id (UserDataPatchesFor), made on first use (under mutex).
     std::shared_ptr<const UserDataAnalysis> userData;
     std::vector<std::pair<std::uint64_t, std::shared_ptr<const std::vector<UserDataPatch>>>> patches;
+    // The memory copies of each variant's results by variant id (MemoryCopiesFor), likewise.
+    std::vector<std::pair<std::uint64_t, std::shared_ptr<const std::vector<MemoryCopy>>>> memoryCopies;
     // The code the entry was built for: the key carries only a hash of it, so a candidate entry is
     // accepted only when its code matches word for word. Owned here because the request's span
     // points into a registration the driver may replace while the entry lives on.
@@ -379,6 +387,111 @@ void markUserWords(const IrResourcePlan& plan, IrValue* root, std::vector<std::u
     }
 }
 
+bool MemoryCopiesEnabled() {
+    static const bool enabled = std::getenv("APS5_NO_MEMORY_COPIES") == nullptr;
+    return enabled;
+}
+
+// The SRT read slot `value` is (through bit casts and the lane read of a uniform value): a ReadConst
+// of the slot or the slot's raw read itself, by `rawReads`; -1 for anything else.
+std::int32_t srtReadSlot(const IrResourcePlan& plan, const std::unordered_map<const IrValue*, std::uint32_t>& rawReads, IrValue* value) {
+    auto* resolved = value != nullptr ? value->Resolve() : nullptr;
+    while (resolved != nullptr && resolved->ArgumentCount() >= 1 && (resolved->Opcode() == IrOpcode::BitCastU32F32 || resolved->Opcode() == IrOpcode::BitCastF32U32 || resolved->Opcode() == IrOpcode::ReadFirstLane)) resolved = resolved->Argument(0)->Resolve();
+    if (resolved == nullptr) return -1;
+    if (resolved->Opcode() == IrOpcode::ReadConst) {
+        if (resolved->ArgumentCount() < 2 || resolved->Argument(1) == nullptr) return -1;
+        const auto* slot = resolved->Argument(1)->Resolve();
+        return slot != nullptr && slot->HasImmediate() && slot->Type() == IrType::U32 && slot->ImmediateU32() < plan.srtReads.size() ? static_cast<std::int32_t>(slot->ImmediateU32()) : -1;
+    }
+    const auto found = rawReads.find(resolved);
+    return found != rawReads.end() ? static_cast<std::int32_t>(found->second) : -1;
+}
+
+// A plan's memory copies (UserDataAnalysis::bufferBaseReads): a buffer whose V# word 0 is an SRT read
+// that nothing else in the plan uses (no other descriptor dword, control flow condition, uniform fill
+// value or read address reaches it, as Detail::ComputePureFlatSlots asks of a pure slot) and whose
+// word 1 is a read as well. That word 0 is the buffer's base, which the walk never follows and the
+// specialization only tests for zero together with word 1's low half: a capture whose words differ
+// only there has the same result but for the copied word, in the buffer's binding and in the
+// flattened SRT. None where the walk reads memory the trace does not see (ComputePureFlatSlots'
+// conditions). APS5_NO_MEMORY_COPIES=1 finds none.
+void analyzeMemoryCopies(const IrResourcePlan& plan, UserDataAnalysis& analysis) {
+    analysis.bufferBaseReads.assign(plan.info.buffers.size(), {-1, -1});
+    const auto& sources = plan.descriptorSources;
+    if (!MemoryCopiesEnabled() || plan.srtReads.empty() || !plan.srtPlanComplete || plan.requiresSpecializationMemory) return;
+    if (std::any_of(sources.begin(), sources.end(), [](const DescriptorSource& source) { return source.indirectImage.has_value(); })) return;
+    if (plan.uniformFill.fill.kind != UniformFillKind::None && plan.uniformFill.fill.words > plan.uniformFill.values.size()) return;
+    std::unordered_map<const IrValue*, std::uint32_t> rawReads;
+    for (std::uint32_t slot = 0; slot < plan.srtReads.size(); ++slot) {
+        if (plan.srtReads[slot].value != nullptr) rawReads.emplace(plan.srtReads[slot].value->Resolve(), slot);
+    }
+    // The candidates: per buffer, the reads its words 0 and 1 are; their sources' word 0 is left out
+    // of the marking below (a copy is its only use).
+    std::vector<std::array<std::int32_t, 2>> candidates(plan.info.buffers.size(), {-1, -1});
+    std::vector<std::uint8_t> candidateSource(sources.size(), 0);
+    for (std::size_t i = 0; i < plan.info.buffers.size(); ++i) {
+        const auto sourceIndex = plan.info.buffers[i].source;
+        if (sourceIndex >= sources.size() || sources[sourceIndex].dwordCount < 2) continue;
+        const auto& source = sources[sourceIndex];
+        const auto base = srtReadSlot(plan, rawReads, source.dwords[0]);
+        const auto pair = srtReadSlot(plan, rawReads, source.dwords[1]);
+        if (base < 0 || pair < 0) continue;
+        candidates[i] = {base, pair};
+        candidateSource[sourceIndex] = 1;
+    }
+    if (std::none_of(candidateSource.begin(), candidateSource.end(), [](std::uint8_t candidate) { return candidate != 0; })) return;
+    // Every read reached from anything but a candidate's word 0.
+    std::vector<std::uint8_t> used(plan.srtReads.size(), 0);
+    std::unordered_set<const IrValue*> visited;
+    std::vector<IrValue*> pending;
+    const auto mark = [&](IrValue* root) {
+        if (root == nullptr) return;
+        pending.push_back(root);
+        while (!pending.empty()) {
+            IrValue* value = pending.back()->Resolve();
+            pending.pop_back();
+            if (value == nullptr || !visited.insert(value).second) continue;
+            if (value->Opcode() == IrOpcode::ReadConst && value->ArgumentCount() >= 2 && value->Argument(1) != nullptr) {
+                const IrValue* slot = value->Argument(1)->Resolve();
+                if (slot->HasImmediate() && slot->Type() == IrType::U32 && slot->ImmediateU32() < used.size()) {
+                    used[slot->ImmediateU32()] = 1;
+                    pending.push_back(plan.srtReads[slot->ImmediateU32()].value);
+                }
+            }
+            if (const auto found = rawReads.find(value); found != rawReads.end()) used[found->second] = 1;
+            for (std::size_t i = 0; i < value->ArgumentCount(); ++i) {
+                if (value->Argument(i) != nullptr) pending.push_back(value->Argument(i));
+            }
+        }
+    };
+    for (std::size_t s = 0; s < sources.size(); ++s) {
+        for (std::uint32_t d = 0; d < sources[s].dwordCount && d < sources[s].dwords.size(); ++d) {
+            if (d != 0 || candidateSource[s] == 0) mark(sources[s].dwords[d]);
+        }
+    }
+    for (const auto& block : plan.controlFlow) mark(block.condition);
+    if (plan.uniformFill.fill.kind != UniformFillKind::None) {
+        for (std::uint32_t i = 0; i < plan.uniformFill.fill.words; ++i) mark(plan.uniformFill.values[i]);
+    }
+    // The address cones: the arguments of every read, never the read itself.
+    for (const auto& read : plan.srtReads) {
+        if (read.value == nullptr) continue;
+        IrValue* raw = read.value->Resolve();
+        for (std::size_t i = 0; i < raw->ArgumentCount(); ++i) mark(raw->Argument(i));
+    }
+    SrtReadTrace::CopyNodes nodes;
+    for (std::size_t i = 0; i < candidates.size(); ++i) {
+        const auto [base, pair] = candidates[i];
+        if (base < 0 || used[static_cast<std::size_t>(base)] != 0) continue;
+        analysis.bufferBaseReads[i] = {base, pair};
+        for (const auto slot : {base, pair}) nodes.emplace_back(plan.srtReads[static_cast<std::size_t>(slot)].value->Resolve(), static_cast<std::uint32_t>(slot));
+    }
+    if (nodes.empty()) return;
+    std::sort(nodes.begin(), nodes.end(), [](const auto& left, const auto& right) { return std::less<const IrValue*>{}(left.first, right.first) || (left.first == right.first && left.second < right.second); });
+    nodes.erase(std::unique(nodes.begin(), nodes.end()), nodes.end());
+    analysis.copyNodes = std::make_shared<const SrtReadTrace::CopyNodes>(std::move(nodes));
+}
+
 // The user data analysis of a plan. A buffer's or direct image's descriptor dword that is a copy of
 // a user word is a copy; every other user word read anywhere in the plan (the other descriptor
 // dwords, samplers, bindless tables and the buffers they index, the SRT reads and their addresses,
@@ -464,6 +577,7 @@ std::shared_ptr<const UserDataAnalysis> analyzeUserData(const IrResourcePlan& pl
     std::sort(key->bufferBases.begin(), key->bufferBases.end());
     key->bufferBases.erase(std::unique(key->bufferBases.begin(), key->bufferBases.end()), key->bufferBases.end());
     analysis->key = std::move(key);
+    analyzeMemoryCopies(plan, *analysis);
     return analysis;
 }
 
@@ -507,6 +621,35 @@ std::shared_ptr<const std::vector<UserDataPatch>> makeUserDataPatches(const User
         }
     }
     return patches;
+}
+
+// The memory copies of a variant's results (MemoryCopiesFor): each buffer binding element whose V#
+// the analysis found a base read for, at its word 0, and each such read in the flattened SRT, at
+// its flat offset. Empty without any.
+std::vector<MemoryCopy> makeMemoryCopies(const UserDataAnalysis& analysis, const CompiledVariant& variant, const IrResourcePlan& plan) {
+    std::vector<MemoryCopy> copies;
+    const auto& layout = variant.bindings.layout;
+    for (std::size_t b = 0; b < layout.descriptors.size(); ++b) {
+        const auto& logical = layout.descriptors[b];
+        if (logical.kind != DescriptorBindingKind::Buffers) continue;
+        for (std::size_t e = 0; e < logical.resources.size(); ++e) {
+            const auto resource = logical.resources[e];
+            if (resource >= analysis.bufferBaseReads.size()) continue;
+            const auto [base, pair] = analysis.bufferBaseReads[resource];
+            if (base >= 0) copies.push_back({static_cast<std::uint32_t>(b), static_cast<std::uint32_t>(e * 4u), static_cast<std::uint32_t>(base), static_cast<std::uint32_t>(pair)});
+        }
+    }
+    const auto buffers = copies.size();
+    for (std::size_t b = 0; b < layout.descriptors.size(); ++b) {
+        if (layout.descriptors[b].kind != DescriptorBindingKind::FlattenedSrt) continue;
+        for (std::size_t c = 0; c < buffers; ++c) {
+            const auto copy = copies[c];
+            const auto flat = plan.srtReads[copy.slot].flatOffset;
+            const bool listed = std::any_of(copies.begin() + static_cast<std::ptrdiff_t>(buffers), copies.end(), [&](const MemoryCopy& other) { return other.binding == b && other.word == flat; });
+            if (!listed) copies.push_back({static_cast<std::uint32_t>(b), flat, copy.slot, copy.pair});
+        }
+    }
+    return copies;
 }
 
 std::uint64_t nextVariantId() {
@@ -871,15 +1014,25 @@ std::shared_ptr<const IrResourcePlan> GetResourcePlan(const RecompileRequest& re
 
 namespace {
 
-// The capture's materialization; with pure flat slots in the plan the walk's read addresses are
-// traced into the capture (ResourceCapture::readTrace).
+// The raw reads of a source's memory copies (UserDataAnalysis::copyNodes), analyzing the plan first.
+std::shared_ptr<const SrtReadTrace::CopyNodes> memoryCopyNodes(SourceEntry& source) {
+    std::lock_guard lock(source.mutex);
+    if (source.plan == nullptr) return nullptr;
+    if (source.userData == nullptr) source.userData = analyzeUserData(*source.plan);
+    return source.userData->copyNodes;
+}
+
+// The capture's materialization; with pure flat slots in the plan, or memory copies (MemoryCopiesFor),
+// the walk's read addresses are traced into the capture (ResourceCapture::readTrace).
 void materializeCapture(ResourceCapture& capture, const SrtRuntime& runtime) {
     const auto& plan = *capture.plan;
-    if (std::none_of(plan.pureFlatSlots.begin(), plan.pureFlatSlots.end(), [](std::uint8_t pure) { return pure != 0u; })) {
+    auto copyNodes = capture.source != nullptr ? memoryCopyNodes(*capture.source) : nullptr;
+    if (copyNodes == nullptr && std::none_of(plan.pureFlatSlots.begin(), plan.pureFlatSlots.end(), [](std::uint8_t pure) { return pure != 0u; })) {
         ResourceMaterializer{}.Materialize(plan, runtime, capture.snapshot, capture.specialization);
         return;
     }
     SrtRuntime traced = runtime;
+    capture.readTrace.copyNodes = std::move(copyNodes);
     traced.readTrace = &capture.readTrace;
     ResourceMaterializer{}.Materialize(plan, traced, capture.snapshot, capture.specialization);
     auto& other = capture.readTrace.otherReads;
@@ -957,6 +1110,26 @@ std::shared_ptr<const std::vector<UserDataPatch>> UserDataPatchesFor(const Sourc
         auto patches = makeUserDataPatches(*source.userData, *variant, source.plan->userDataCount);
         source.patches.emplace_back(result.variantId, patches);
         return patches;
+    }
+    return nullptr;
+}
+
+std::shared_ptr<const std::vector<MemoryCopy>> MemoryCopiesFor(const SourceHandle& handle, const RecompileResult& result) {
+    if (handle.source == nullptr || result.variantId == 0) return nullptr;
+    auto& source = *handle.source;
+    std::lock_guard lock(source.mutex);
+    if (source.plan == nullptr) return nullptr;
+    if (source.userData == nullptr) source.userData = analyzeUserData(*source.plan);
+    if (source.userData->copyNodes == nullptr) return nullptr;
+    for (const auto& [variantId, copies] : source.memoryCopies) {
+        if (variantId == result.variantId) return copies;
+    }
+    for (const auto& variant : source.variants) {
+        if (variant->result.variantId != result.variantId) continue;
+        auto copies = makeMemoryCopies(*source.userData, *variant, *source.plan);
+        auto shared = copies.empty() ? nullptr : std::make_shared<const std::vector<MemoryCopy>>(std::move(copies));
+        source.memoryCopies.emplace_back(result.variantId, shared);
+        return shared;
     }
     return nullptr;
 }

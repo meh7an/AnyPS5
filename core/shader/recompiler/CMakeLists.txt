@@ -210,6 +210,8 @@ function(add_shader_recompiler target runtimeTarget)
             DebugProbeActive
             DepthBitsTextureWidth
             HashBytes
+            MemoryCopiesFor
+            MemoryCopy
             PatchOverUserData
             PixelInput
             PixelInputBit

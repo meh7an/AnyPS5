@@ -53,8 +53,9 @@ bool interpretRuntimeSources(const IrResourcePlan& program, std::span<const std:
 // APS5_VERIFY_SRT_TAPE: the Evaluator's walk beside the tape's, over a trace of its own; any
 // difference in the descriptors, the flat slots, the active sources or the reads traced is reported
 // (a few times) and the Evaluator's answer replaces the tape's.
-void verifyTape(const IrResourcePlan& program, const SrtRuntime& runtime, std::vector<DescriptorValue>& results, std::vector<std::uint32_t>& flat, std::vector<std::uint8_t>& activeSources, std::size_t leavesBefore, std::size_t readsBefore) {
+void verifyTape(const IrResourcePlan& program, const SrtRuntime& runtime, std::vector<DescriptorValue>& results, std::vector<std::uint32_t>& flat, std::vector<std::uint8_t>& activeSources, std::size_t leavesBefore, std::size_t readsBefore, std::size_t copiesBefore) {
     SrtReadTrace expectedTrace;
+    if (runtime.readTrace != nullptr) expectedTrace.copyNodes = runtime.readTrace->copyNodes;
     SrtRuntime interpreted = runtime;
     interpreted.readTrace = runtime.readTrace != nullptr ? &expectedTrace : nullptr;
     std::vector<DescriptorValue> expectedResults;
@@ -77,13 +78,22 @@ void verifyTape(const IrResourcePlan& program, const SrtRuntime& runtime, std::v
         reads.erase(std::unique(reads.begin(), reads.end()), reads.end());
         std::sort(expectedReads.begin(), expectedReads.end());
         expectedReads.erase(std::unique(expectedReads.begin(), expectedReads.end()), expectedReads.end());
+        auto copies = std::vector(trace->copies.begin() + static_cast<std::ptrdiff_t>(copiesBefore), trace->copies.end());
+        auto expectedCopies = expectedTrace.copies;
+        std::sort(copies.begin(), copies.end());
+        copies.erase(std::unique(copies.begin(), copies.end()), copies.end());
+        std::sort(expectedCopies.begin(), expectedCopies.end());
+        expectedCopies.erase(std::unique(expectedCopies.begin(), expectedCopies.end()), expectedCopies.end());
         if (leaves != expectedLeaves) difference = "traced leaf reads";
         else if (reads != expectedReads) difference = "traced reads";
+        else if (copies != expectedCopies) difference = "traced copy reads";
         if (!difference.empty()) {
             trace->leaves.resize(leavesBefore);
             trace->otherReads.resize(readsBefore);
+            trace->copies.resize(copiesBefore);
             trace->leaves.insert(trace->leaves.end(), expectedTrace.leaves.begin(), expectedTrace.leaves.end());
             trace->otherReads.insert(trace->otherReads.end(), expectedTrace.otherReads.begin(), expectedTrace.otherReads.end());
+            trace->copies.insert(trace->copies.end(), expectedTrace.copies.begin(), expectedTrace.copies.end());
         }
     }
     static std::atomic<std::uint64_t> walks {0};
@@ -113,8 +123,9 @@ bool EvaluateRuntimeSourcesImpl(const IrResourcePlan& program, std::span<const s
         if (const auto* tape = SrtTape::For(program); tape != nullptr) {
             const auto leavesBefore = runtime.readTrace != nullptr ? runtime.readTrace->leaves.size() : 0;
             const auto readsBefore = runtime.readTrace != nullptr ? runtime.readTrace->otherReads.size() : 0;
+            const auto copiesBefore = runtime.readTrace != nullptr ? runtime.readTrace->copies.size() : 0;
             if (tape->Run(program, runtime, results, flat, activeSources)) {
-                if (SrtTape::Verified()) verifyTape(program, runtime, results, flat, activeSources, leavesBefore, readsBefore);
+                if (SrtTape::Verified()) verifyTape(program, runtime, results, flat, activeSources, leavesBefore, readsBefore, copiesBefore);
                 return true;
             }
         }

@@ -73,6 +73,22 @@ struct UserDataPatch {
 // and its vertex attributes resolved from the request's V#s, as Recompile(request, capture) would
 // materialize them. The vertex family's stage inputs are validated as a capture validates them.
 void PatchOverUserData(const RecompileRequest& request, RecompileResult& result, const std::vector<UserDataPatch>& patches);
+// A result word that is a copy of a word the capture read from memory and nothing in the plan
+// uses otherwise: a buffer's base, word 0 of a V# read from a table, as dword `word` of binding
+// `binding`'s guest descriptor (the buffer's binding, and the flattened SRT, which holds every read).
+// `slot` is the SRT read, whose address a capture traces into readTrace.copies; `pair` the read of
+// the same V#'s word 1, whose low half (the base's top) a driver compares to keep the base's
+// zero-ness, the one thing the specialization reads of it, when it lets word 0 differ.
+struct MemoryCopy {
+    std::uint32_t binding = 0;
+    std::uint32_t word = 0;
+    std::uint32_t slot = 0;
+    std::uint32_t pair = 0;
+};
+// The memory copies in a result materialized over `handle`'s source, made once per variant as the
+// user data patches are. Null when the source has none, or the result's variant is not its own.
+// APS5_NO_MEMORY_COPIES=1 finds none.
+[[nodiscard]] std::shared_ptr<const std::vector<MemoryCopy>> MemoryCopiesFor(const SourceHandle& handle, const RecompileResult& result);
 
 }
 
