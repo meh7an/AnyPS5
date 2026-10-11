@@ -232,19 +232,29 @@ std::string stageMemoDifference(const ShaderRecompiler::RecompileResult& memo, c
 
 }
 
-std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDrawStage(std::size_t i, std::uint32_t pushOffset, const QueueState& queue, const Submission& submission, const std::vector<DrawProgram>& programs, const Graphics::State& graphics, const ShaderRecompiler::ShaderPixelStageInfo& pixel, const std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>>& vertexInfos, std::vector<ShaderRecompiler::MemoryRegion>& memory, const std::vector<ShaderRecompiler::LinkedProgram>& linked, const Pm4::DrawParameters& drawParameters, const std::shared_ptr<VulkanDevice>& localDevice, ShaderMemory& shaderMemory, std::vector<StageCapture>& stageCaptures, std::vector<bool>& recompiled, bool drawHit, bool wantRegions, const std::vector<std::shared_ptr<DispatchVariant>>& matched, const std::vector<std::vector<ShaderRecompiler::MemoryRegion>>& matchedRegions, bool profile, std::uint64_t dumpTarget, std::uint64_t dumpSlot1, std::uint64_t& captures, DrawPhaseTiming& phaseTiming, std::array<double, DrawDriverPhaseCount>& phaseMs, std::string& rejected) {
+std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDrawStage(std::size_t i, std::uint32_t pushOffset, const QueueState& queue, const Submission& submission, const std::vector<DrawProgram>& programs, const Graphics::State& graphics, const ShaderRecompiler::ShaderPixelStageInfo& pixel, const std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>>& vertexInfos, std::vector<ShaderRecompiler::RecompileRequest>& requests, std::vector<ShaderRecompiler::MemoryRegion>& memory, const std::vector<ShaderRecompiler::LinkedProgram>& linked, const Pm4::DrawParameters& drawParameters, const std::shared_ptr<VulkanDevice>& localDevice, ShaderMemory& shaderMemory, std::vector<StageCapture>& stageCaptures, std::vector<bool>& recompiled, bool drawHit, bool wantRegions, const std::vector<std::shared_ptr<DispatchVariant>>& matched, const std::vector<std::vector<ShaderRecompiler::MemoryRegion>>& matchedRegions, bool profile, std::uint64_t dumpTarget, std::uint64_t dumpSlot1, std::uint64_t& captures, DrawPhaseTiming& phaseTiming, std::array<double, DrawDriverPhaseCount>& phaseMs, std::string& rejected) {
     PerformanceTimer timing("Shader.DrawStage");
     using Stage = ShaderRecompiler::ShaderStage;
     phaseTiming.Phase(DrawRowVectors);
     const auto& program = programs[i];
     const auto waveSize = program.binary.stage == Stage::Fragment ? graphics.stages.fragmentWaveSize : graphics.stages.vertexWaveSize;
-    ShaderRecompiler::RecompileRequest request{
-        program.binary,
-        {waveSize, program.firstUserSgpr, program.userData, std::nullopt, program.binary.stage == Stage::Fragment ? std::optional(pixel) : std::nullopt, vertexInfos[i], memory, RegisteredFloatMode(*program.snapshot)},
-        localDevice->Target(),
-        {0, 0, pushOffset, (graphics.stages.mesh ? ShaderRecompiler::MeshDrawPushOffsetBytes : Graphics::PipelinePushSlotBytes) - pushOffset % Graphics::PipelinePushSlotBytes},
-        ShaderRecompiler::GraphicsCompileContext{program.firstUserSgpr, linked, graphics.stages.mesh, graphics.stages.tessellation, {drawParameters.indexAddress, drawParameters.indexCount, drawParameters.indexSize, drawParameters.instanceCount}}
-    };
+    // The stage's request, filled in place (see PreparedDraw::requests), the draw's decoded vertex
+    // inputs borrowed rather than copied: vertexInfos outlives every use of it below.
+    auto& request = requests[i];
+    request.shader = program.binary;
+    request.context.waveSize = waveSize;
+    request.context.userDataBaseRegister = program.firstUserSgpr;
+    request.context.userData = program.userData;
+    request.context.compute = std::nullopt;
+    if (program.binary.stage == Stage::Fragment) request.context.pixel = pixel;
+    else request.context.pixel = std::nullopt;
+    request.context.vertex.Borrow(vertexInfos[i] ? &*vertexInfos[i] : nullptr);
+    request.context.memory = memory;
+    request.context.floatMode = RegisteredFloatMode(*program.snapshot);
+    request.target = localDevice->Target();
+    request.layout = {0, 0, pushOffset, (graphics.stages.mesh ? ShaderRecompiler::MeshDrawPushOffsetBytes : Graphics::PipelinePushSlotBytes) - pushOffset % Graphics::PipelinePushSlotBytes};
+    request.graphics = ShaderRecompiler::GraphicsCompileContext{program.firstUserSgpr, linked, graphics.stages.mesh, graphics.stages.tessellation, {drawParameters.indexAddress, drawParameters.indexCount, drawParameters.indexSize, drawParameters.instanceCount}};
+    request.useCache = true;
     const auto waitedBefore = traceCapSync() || profile ? Graphics::Recorder::ThreadWaitedMs() : 0.0;
     static const bool subPhases = std::getenv("APS5_PROFILE_DRAW_PHASES") != nullptr;
     auto lap = subPhases ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -306,7 +316,12 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
             if (miss == StageMemoMiss::None) {
                 slot.misses = 0;
                 // Held by nothing but the slot: no draw is using it any more.
-                if (slot.served != nullptr && slot.served.use_count() == 1) served = slot.served;
+                // use_count reads relaxed: the fence orders the patch after the last holder's
+                // release (a draw thread's record drops its reference there).
+                if (slot.served != nullptr && slot.served.use_count() == 1) {
+                    std::atomic_thread_fence(std::memory_order_acquire);
+                    served = slot.served;
+                }
             } else {
                 ++slot.misses;
                 memoStore = stageMemoTried(slot.misses);
@@ -315,9 +330,9 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
         {
             std::lock_guard lock(stageMemoMutex);
             entries = stageMemo.size();
-            const auto found = stageMemo.find(memoHash);
-            if (found != stageMemo.end() && found->second.source == handle->source.get() && found->second.pushOffset == pushOffset && found->second.entry->key == memoWords) {
-                auto& slot = found->second;
+            auto* found = stageMemo.find(memoHash);
+            if (found != nullptr && found->source == handle->source.get() && found->pushOffset == pushOffset && found->entry->key == memoWords) {
+                auto& slot = *found;
                 entry = slot.entry;
                 stageMemoOrder.splice(stageMemoOrder.end(), stageMemoOrder, slot.order);
                 miss = stageMemoTried(slot.misses) ? stageMemoCurrent(*entry, slot.generation, collected) : StageMemoMiss::Skipped;
@@ -341,10 +356,10 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
                 }
             }
             std::lock_guard lock(stageMemoMutex);
-            const auto found = stageMemo.find(memoHash);
-            if (found != stageMemo.end() && found->second.entry == entry) {
-                if (miss == StageMemoMiss::None) found->second.generation = std::max(found->second.generation, collected);
-                settle(found->second);
+            auto* found = stageMemo.find(memoHash);
+            if (found != nullptr && found->entry == entry) {
+                if (miss == StageMemoMiss::None) found->generation = std::max(found->generation, collected);
+                settle(*found);
             }
         }
         switch (miss) {
@@ -361,8 +376,8 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
             ShaderRecompiler::PatchOverUserData(request, *served, *entry->patches);
             if (fresh) {
                 std::lock_guard lock(stageMemoMutex);
-                const auto found = stageMemo.find(memoHash);
-                if (found != stageMemo.end() && found->second.entry == entry && (found->second.served == nullptr || found->second.served.use_count() > 1)) found->second.served = served;
+                auto* found = stageMemo.find(memoHash);
+                if (found != nullptr && found->entry == entry && (found->served == nullptr || found->served.use_count() > 1)) found->served = served;
             }
             memoResult = served;
             if (!VerifyStageMemo()) {
@@ -521,16 +536,17 @@ void Driver::insertStageMemo(std::uint64_t hash, const std::shared_ptr<const Sha
     auto [slot, inserted] = stageMemo.try_emplace(hash);
     if (inserted) {
         stageMemoOrder.push_back(hash);
-        slot->second.order = std::prev(stageMemoOrder.end());
+        slot->order = std::prev(stageMemoOrder.end());
     } else {
-        stageMemoOrder.splice(stageMemoOrder.end(), stageMemoOrder, slot->second.order);
+        stageMemoOrder.splice(stageMemoOrder.end(), stageMemoOrder, slot->order);
     }
     // The served result belongs to the entry replaced; the misses in a row go on counting.
-    slot->second.entry = std::move(entry);
-    slot->second.source = handle->source.get();
-    slot->second.pushOffset = pushOffset;
-    slot->second.served.reset();
-    slot->second.generation = generation;
+    slot->entry = std::move(entry);
+    slot->source = handle->source.get();
+    slot->pushOffset = pushOffset;
+    slot->served.reset();
+    slot->generation = generation;
+    // Eviction moves entries in the map: `slot` is not used past this point.
     while (stageMemo.size() > StageMemoCapacity() && !stageMemoOrder.empty()) {
         stageMemo.erase(stageMemoOrder.front());
         stageMemoOrder.pop_front();

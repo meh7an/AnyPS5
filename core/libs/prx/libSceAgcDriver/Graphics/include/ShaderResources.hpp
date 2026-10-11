@@ -3,7 +3,9 @@
 
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
+#include "prx/libSceAgcDriver/Execution/include/HashSlotMap.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BdaResources.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/InlineList.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Sampler.hpp"
 #include "Recompiler.hpp"
@@ -82,8 +84,9 @@ public:
     // ShaderResources::PrepareDrawBindings): taken from pools made without FREE_DESCRIPTOR_SET (a
     // bump allocation in the driver, where a freeable pool searches its free list on every
     // allocation) and never freed one by one: a pool counts its live sets, and once it is full and
-    // its last set was released it is reset whole and filled again. APS5_NO_TRANSIENT_SETS=1 takes
-    // these sets from the freeable chain as before.
+    // its last set was released it is reset whole and filled again. The driver's allocate call is
+    // most of a set's cost, so one call takes several sets of the layout and the rest wait for the
+    // next draws of it. APS5_NO_TRANSIENT_SETS=1 takes these sets from the freeable chain as before.
     SetAllocation AllocateTransient(VkDescriptorSetLayout layout, std::span<const VkDescriptorPoolSize> sizes);
     void Free(const SetAllocation& allocation) noexcept;
     // APS5_PROFILE_DRAW counters: layouts served from the map / created, sets allocated, pools opened.
@@ -94,6 +97,8 @@ public:
         std::uint64_t pools = 0;
         std::uint64_t dedicatedPools = 0;
         std::uint64_t transientSets = 0;
+        // Driver allocate calls that took transient sets (several sets each).
+        std::uint64_t transientCalls = 0;
         std::uint64_t transientPools = 0;
         std::uint64_t transientResets = 0;
     };
@@ -129,6 +134,14 @@ private:
     std::vector<TransientPool> transientPools;
     std::size_t fillingTransient = ~std::size_t{0};
     std::vector<std::size_t> resetTransient;
+    // Transient sets taken ahead of their draws, by layout, with the pool (index) each came from.
+    // Each counts as live in its pool until a draw took it and released it; a pool marked full drops
+    // the ones still waiting (no draw holds them), so it can be reset.
+    struct WaitingSet {
+        VkDescriptorSet set;
+        std::size_t pool;
+    };
+    std::unordered_map<VkDescriptorSetLayout, std::vector<WaitingSet>> waitingSets;
     Stats stats;
 };
 
@@ -165,7 +178,9 @@ public:
         };
         DescriptorCache* cache = nullptr;
         DescriptorCache::SetAllocation allocation;
-        std::vector<Snapshot> snapshots;
+        // A handful per draw (about five on S3K, more than eight often enough that spilling to the
+        // heap was 0.6% of the worker): inline, no allocation of their own.
+        InlineList<Snapshot, 16> snapshots;
         ~DrawBindings();
     };
     // A data buffer's new words point into the draw's compiled stage (its binding's guest
@@ -176,7 +191,11 @@ public:
         std::size_t size;
         std::span<const std::uint32_t> words;
     };
-    std::shared_ptr<DrawBindings> PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved = {}) const;
+    // A draw that reads copies (snapshots, moved buffers) gets a set of its own: `bindings` (empty,
+    // owned by an object the caller already kept in the recorder's open batch, so that the set and
+    // the copies live until the batch completed) receives it. False when the object's set serves the
+    // draw as it is.
+    bool PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved, DrawBindings& bindings) const;
     // The largest draw snapshot (and moved data buffer) PrepareDrawBindings copies into the
     // recorder's upload chunk on every draw instead of keeping a buffer of its own (see
     // Recorder::DrawUpload); APS5_DRAW_UPLOAD_MAX, default 4096, 0 keeps every copy in its own buffer.
@@ -476,6 +495,10 @@ private:
     VkDescriptorPool pool = VK_NULL_HANDLE;
     // The cache pool the set was allocated from, freed back to it on release.
     VkDescriptorPool cachePool = VK_NULL_HANDLE;
+    // The layout's descriptor counts by type, which a draw's own set is allocated with
+    // (PrepareDrawBindings): taken once with the layout.
+    std::array<VkDescriptorPoolSize, 16> drawSetSizes{};
+    std::size_t drawSetSizeCount = 0;
     std::vector<Allocation> allocations;
     std::vector<VkDescriptorBufferInfo> descriptorBuffers;
     std::vector<VkDescriptorImageInfo> descriptorImages;
@@ -589,23 +612,25 @@ public:
     std::size_t Size() const;
 
 private:
-    void erase(const Key& key);
-    void noteMiss(const Key& key);
-    // FNV-1a over two words at a time (a draw key is about a hundred words, hashed on every lookup).
-    // Not noexcept on purpose: libstdc++ then keeps each node's hash, so a bucket walk compares
-    // stored hashes instead of hashing every key it passes.
-    struct KeyHash {
-        std::size_t operator()(const Key& key) const {
-            std::uint64_t hash = 14695981039346656037ull;
-            std::size_t at = 0;
-            for (; at + 2 <= key.size(); at += 2) hash = (hash ^ (key[at] | static_cast<std::uint64_t>(key[at + 1]) << 32u)) * 1099511628211ull;
-            if (at < key.size()) hash = (hash ^ key[at]) * 1099511628211ull;
-            return static_cast<std::size_t>(hash ^ (hash >> 32u));
-        }
+    struct Entry {
+        Key key;
+        std::uint64_t hash;
+        std::shared_ptr<ShaderResources> resources;
     };
+    using Entries = std::list<Entry>;
+    void noteMiss(const Key& key);
+    // A key's hash, in four lanes over pairs of words (a draw key is about a hundred words, hashed
+    // on every lookup: one FNV chain over it was a multiply waiting on the one before), computed
+    // before the mutex is taken.
+    static std::uint64_t hashKey(const Key& key);
+    // The entry under `hash` when it holds `key`, else null (the mutex held).
+    Entries::iterator* lookup(std::uint64_t hash, const Key& key);
     mutable AgcDriver::Mutex mutex;
-    std::list<std::pair<Key, std::shared_ptr<ShaderResources>>> entries;
-    std::unordered_map<Key, decltype(entries)::iterator, KeyHash> index;
+    // Most recently used first.
+    Entries entries;
+    // The entries by key hash, without a division or a bucket list to walk; a lookup compares the
+    // key it finds, so two keys sharing a hash only make the newer one replace the older.
+    HashSlotMap<Entries::iterator> index;
 };
 
 // The process-wide cache the device and the draw path share (keys name the device; a device clears

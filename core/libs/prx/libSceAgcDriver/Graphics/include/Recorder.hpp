@@ -3,6 +3,7 @@
 
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PassHazards.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/KeptArena.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include <atomic>
 #include <chrono>
@@ -17,6 +18,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <string_view>
 #include <tuple>
 #include <unordered_set>
 #include <unordered_map>
@@ -51,7 +53,8 @@ struct PassBinding {
 // signals a timeline semaphore with its serial: a thread can then wait for "everything submitted
 // up to serial S" WITHOUT the mutex (WaitSerial), because the monotonic value cannot be reset or
 // recycled the way the pooled batch fences are, and afterwards run the completions under the mutex
-// (FinishUpTo). Without timeline semaphores callers use the locked Sync as before.
+// (FinishUpTo). Without timeline semaphores callers use the locked Sync as before. With them the
+// batches carry no fence: a batch has completed when the timeline reached its serial.
 class Recorder {
 public:
     // `timelineSemaphores`: the device enabled VK_KHR_timeline_semaphore (WaitSerial is usable).
@@ -117,8 +120,13 @@ public:
     // when a kept snapshot or sighting of the range was found stale: the range was written since
     // its last copy.
     // `sighted` (when given) is set when the range's sighting is current: unchanged since a copy the
-    // cache did not keep (see KeepDrawSnapshot).
+    // cache did not keep (see KeepDrawSnapshot). A vertex or index snapshot comes back as its
+    // device-local mirror, made by a copy recorded at its first reuse: kept snapshots live in host
+    // memory, which vertex fetch reads over the bus on every draw (16 us for a 5,000-vertex shadow
+    // caster on an RTX 2080 Ti). Past DrawInputMirrorBudget, and with APS5_NO_INPUT_MIRRORS=1, the
+    // host snapshot itself comes back.
     std::shared_ptr<Buffer> ReusableDrawSnapshot(std::uint64_t address, std::size_t bytes, SnapshotUse use = SnapshotUse::Storage, std::uint32_t* derived = nullptr, std::uint64_t generation = 0, bool* rewritten = nullptr, bool* sighted = nullptr);
+    static constexpr std::size_t DrawInputMirrorBudget = std::size_t{512} << 20u;
     // Keeps `buffer` as the range's snapshot. A null `buffer` notes a sighting instead: the range was
     // copied at `generation` into a buffer that dies with its batch. A sighting takes an entry but
     // none of the pool's bytes.
@@ -141,6 +149,9 @@ public:
         std::byte* bytes = nullptr;
     };
     UploadSlice DrawUpload(std::size_t bytes);
+    // Storage for the objects a recorded draw keeps until its batch completed (see KeptArena);
+    // under the GPU mutex, as recording is.
+    KeptArena& DrawArena() { return drawArena; }
     void OnComplete(std::function<void()> action);
     void NotePendingWrite(std::uint64_t address, std::size_t bytes);
     void NotePendingFill(std::uint64_t address, std::size_t bytes, std::uint8_t value);
@@ -489,9 +500,30 @@ public:
     // or APS5_PROFILE_GPU). A class range covers the command with its own barriers (a dispatch's
     // barriers are classes of their own, its program range stays keyed by the program), so the
     // union of every range of a batch and the batch span differ by what no class times ('untimed').
-    enum class CommandClass : std::uint8_t { DispatchLeading = 0, DispatchTrailing, IndirectArguments, LabelRun, Fill, FillClear, Copy, StagingIn, StagingOut, Draw, StorageUpload, StorageWriteBack, DccClear, DccKeyStore, PresentBlit, ShadowPublish, TemplateDataRefresh, Count };
+    enum class CommandClass : std::uint8_t { DispatchLeading = 0, DispatchTrailing, IndirectArguments, LabelRun, Fill, FillClear, Copy, StagingIn, StagingOut, Draw, StorageUpload, StorageWriteBack, DccClear, DccKeyStore, PresentBlit, ShadowPublish, TemplateDataRefresh, DrawSetup, DispatchSetup, MetadataPass, DepthClearPass, TextureUpload, DispatchResources, DispatchPipeline, DepthTransfer, InputMirror, Count };
     static constexpr std::uint64_t ClassKey(CommandClass which) { return 0x10 + static_cast<std::uint64_t>(which); }
     std::uint32_t BeginGpuTiming(CommandClass which) { return BeginGpuTiming(ClassKey(which)); }
+    // A range tagged with a guest address for the [gputime] breakdowns: a draw pass's first color
+    // target (passes by target, the draws in them), a sampled texture's upload; `name` describes it.
+    std::uint32_t BeginGpuTiming(CommandClass which, std::uint64_t tag, std::string_view name);
+    // APS5_PROFILE_GPU_DRAWS=1 (with APS5_PROFILE_GPU): a range around each draw command, keyed by
+    // the draw's vertex and pixel programs, for the [gputime] draws-by-programs line (`pass` names
+    // the pass). It begins inside the open render pass, which it does not end; EndGpuTiming ends it.
+    static bool DrawProgramTiming();
+    std::uint32_t BeginDrawTiming(std::uint64_t vertex, std::uint64_t pixel, std::string_view pass);
+    // What a draw or a dispatch records ahead of its own ranges (target refreshes, resource builds,
+    // uploads) as one setup range of class DrawSetup or DispatchSetup. A draw's opens only while no
+    // render pass is open (opening it then ends none); a dispatch's ends the open pass, as the
+    // dispatch would. Closed by EndSetupTiming, by the next setup range, or before the batch is
+    // submitted.
+    void BeginSetupTiming(CommandClass which);
+    void EndSetupTiming();
+    // APS5_PROFILE_GPU_SITES=1 (with APS5_PROFILE_GPU): a probe range from every Commands() call to
+    // the next, keyed SiteKeyBase | the caller's address, so the [gputime] program list ranks the
+    // code that records commands by GPU time (the line gives SiteProbes' own address to map the
+    // addresses to the module, for nm).
+    static constexpr std::uint64_t SiteKeyBase = 0xc000000000000000ull;
+    static bool SiteProbes();
     static void CountBarriers(CommandClass which, std::uint32_t count = 1);
     // A leading barrier a command left out because the previous trailing barrier covered its
     // accesses (see Commands), on the [barriers] line as 'merged'. Debug aid: APS5_FULL_BARRIERS=1
@@ -547,13 +579,15 @@ public:
     std::vector<Completed> CompletedBatches(std::uint64_t afterSerial, std::uint64_t throughSerial, std::size_t& missing) const;
     // The newest submitted serial and its vkQueueSubmit time (ring mutex only).
     std::uint64_t NewestSubmitted(std::chrono::steady_clock::time_point* submittedAt = nullptr) const;
-    // In-flight batches whose fence has not signaled (one status query each); under the mutex.
+    // In-flight batches the GPU has not completed (a fence status query each, or one timeline read);
+    // under the mutex.
     std::size_t UnsignaledBatches() const;
     static bool FlipReadCheck();
 
 private:
     struct Batch {
         VkCommandBuffer commands = VK_NULL_HANDLE;
+        // None when the recorder is fenceless (the timeline tells the batch's completion).
         VkFence fence = VK_NULL_HANDLE;
         std::vector<std::shared_ptr<void>> kept;
         std::size_t keptBytes = 0;
@@ -589,6 +623,14 @@ private:
         std::uint32_t queuedDumps = 0;
         std::vector<std::uint64_t> timedKeys;
         std::vector<std::uint64_t> timedBytes;
+        // Per range: its tag (a draw pass's first color target) and the draws it holds, for the
+        // [gputime] pass breakdown.
+        std::vector<std::uint64_t> timedTags;
+        std::vector<std::uint32_t> timedDraws;
+        // The open setup range (BeginSetupTiming), if any.
+        std::uint32_t setupTiming = NoTiming;
+        // The open site probe (APS5_PROFILE_GPU_SITES), if any.
+        std::uint32_t siteTiming = NoTiming;
         // The whole-batch timed range (BatchTimingKey) and its stamps once read (see Completed).
         std::uint32_t batchTiming = NoTiming;
         double gpuStartNs = 0;
@@ -728,9 +770,11 @@ private:
     std::uint32_t beginTiming(std::uint64_t key);
     // Vulkan entry points resolved once (constructor): the loader's vkGetDeviceProcAddr is a name
     // lookup per call, paid by every reap, store and submit otherwise. APS5_NO_PROC_TABLE=1 leaves
-    // them null and resolves per call as before; vkWaitSemaphoresKHR stays a lazy lookup (timeline
-    // semaphores are optional).
+    // them null and resolves per call as before; the timeline's two are resolved once it exists
+    // (timeline semaphores are optional).
     PFN_vkGetFenceStatus getFenceStatus = nullptr;
+    PFN_vkGetSemaphoreCounterValueKHR getSemaphoreCounterValue = nullptr;
+    PFN_vkWaitSemaphoresKHR waitSemaphores = nullptr;
     PFN_vkResetFences resetFences = nullptr;
     PFN_vkWaitForFences waitForFences = nullptr;
     PFN_vkCmdUpdateBuffer cmdUpdateBuffer = nullptr;
@@ -750,6 +794,11 @@ private:
         return resolved != nullptr ? resolved : context.Function<TFunction>(name);
     }
     VkResult fenceStatus(VkFence fence) const { return function(getFenceStatus, "vkGetFenceStatus")(context.device, fence); }
+    // Whether the GPU completed a submitted batch: the timeline reached its serial (read again only
+    // when the value last read falls short of it), or its fence signaled.
+    bool gpuDone(const Batch& batch) const;
+    // Reads the timeline's value into `reachedSerial` and returns it.
+    std::uint64_t readTimeline() const;
     void recordBarrier(VkCommandBuffer commands, VkPipelineStageFlags sourceStage, VkPipelineStageFlags destinationStage, VkAccessFlags sourceAccess, VkAccessFlags destinationAccess) const;
     // Opens a batch when none is open, without closing a store run (Commands() does both).
     void ensureOpen();
@@ -803,6 +852,12 @@ private:
 
     Context context;
     VkSemaphore timeline = VK_NULL_HANDLE;
+    // The batches signal the timeline alone (APS5_BATCH_FENCES=1 gives each a fence as well, as
+    // without a timeline): one kernel signal less per submit, and one timeline read per Reap in
+    // place of a fence query per batch.
+    bool fenceless = false;
+    // The timeline value last read (under the mutex): the batches up to it completed.
+    mutable std::uint64_t reachedSerial = 0;
     // Identity for a thread that released the mutex around a wait (syncThroughUnlocked): the
     // recorder may have been torn down meanwhile, so it is looked up by this id, not by pointer.
     std::uint64_t id = 0;
@@ -831,8 +886,8 @@ private:
     std::uint64_t submissions = 0;
     std::size_t inFlightKeptBytes = 0;
     std::uint64_t writeNoteCount = 0;
-    // Command buffers and fences of completed batches, reused by later ones (hundreds of batches per
-    // frame would otherwise allocate and free their objects each time).
+    // Command buffers and fences (none when fenceless) of completed batches, reused by later ones
+    // (hundreds of batches per frame would otherwise allocate and free their objects each time).
     std::vector<std::pair<VkCommandBuffer, VkFence>> spare;
     std::vector<VkQueryPool> sparePools;
     mutable AgcDriver::Mutex completedMutex;
@@ -852,6 +907,8 @@ private:
         std::list<DrawSnapshotKey>::iterator recent;
         std::shared_ptr<Buffer> buffer;
         std::uint32_t derived;
+        // A vertex or index snapshot's device-local mirror (see ReusableDrawSnapshot).
+        std::shared_ptr<Buffer> device;
     };
     struct DrawSnapshotPool {
         std::list<DrawSnapshotKey> recency;
@@ -862,9 +919,13 @@ private:
     std::unordered_map<DrawSnapshotKey, DrawSnapshot, DrawSnapshotKeyHash> exactSnapshots;
     std::map<DrawSnapshotKey, DrawSnapshot> vertexSnapshots;
     std::array<DrawSnapshotPool, 2> drawSnapshotPools;
+    // The bytes of the kept snapshots' device-local mirrors.
+    std::size_t drawInputMirrorBytes = 0;
+    std::shared_ptr<Buffer> mirrorDrawInput(const std::shared_ptr<Buffer>& host, std::size_t bytes);
     // The draw upload chunk being filled and its bytes in use (see DrawUpload).
     std::shared_ptr<Buffer> drawUpload;
     VkDeviceSize drawUploadUsed = 0;
+    KeptArena drawArena;
     template <typename Entries>
     void eraseDrawSnapshot(Entries& entries, typename Entries::iterator entry);
     bool refreshDrawSnapshot(DrawSnapshot& entry, std::uint64_t address, std::size_t bytes);

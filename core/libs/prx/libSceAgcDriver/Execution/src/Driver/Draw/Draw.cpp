@@ -1,9 +1,15 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawThread.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/PreparedDraw.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Queues/WorkerAffinity.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
+#include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ThreadScratch.hpp"
+#include "prx/libc/include/HostThreadSlot.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include <cstdlib>
 
@@ -11,80 +17,190 @@ namespace AgcDriver::DriverDetail {
 
 namespace {
 
-// Driver::draw's per-draw lists, kept per thread so a draw reuses the capacity of the one before.
-struct DrawScratch {
-    std::vector<ShaderRecompiler::MemoryRegion> memory;
-    std::vector<ShaderRecompiler::LinkedProgram> linked;
-    std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>> vertexInfos;
-    std::vector<std::vector<Graphics::DecodeRead>> decodeReads;
-    std::vector<std::shared_ptr<const ShaderRecompiler::RecompileResult>> results;
-    std::vector<Graphics::CompiledShader> stages;
-    std::vector<const ShaderRecompiler::RecompileResult*> programResults;
-    std::vector<StageCapture> stageCaptures;
-    std::vector<std::shared_ptr<DispatchVariant>> matched;
-    std::vector<std::vector<ShaderRecompiler::MemoryRegion>> matchedRegions;
-    std::vector<std::shared_ptr<DispatchVariant>> fresh;
-    std::vector<bool> recompiled;
-    std::vector<std::uint32_t> pushOffsets;
-    std::vector<std::size_t> resultIndex;
-    std::vector<Graphics::GuestMemorySnapshot> snapshots;
-    std::vector<std::shared_ptr<DispatchVariant>> recipeStages;
-    bool busy = false;
+struct FrontDrawThreadTag;
 
-    // Empties the lists, the inner ones of decodeReads and matchedRegions too, keeping every capacity.
-    void Clear() {
-        memory.clear();
-        linked.clear();
-        vertexInfos.clear();
-        for (auto& reads : decodeReads) reads.clear();
-        results.clear();
-        stages.clear();
-        programResults.clear();
-        stageCaptures.clear();
-        matched.clear();
-        for (auto& regions : matchedRegions) regions.clear();
-        fresh.clear();
-        recompiled.clear();
-        pushOffsets.clear();
-        resultIndex.clear();
-        snapshots.clear();
-        recipeStages.clear();
+// Waits until `ready()`: spins about 50 us first, as the other thread usually answers within a few,
+// then sleeps on `word` with `sleeping` set, which has the other thread wake it after its next
+// change of `word` (set before `word` is read, so one of the two always sees the other).
+template<typename TReady>
+void awaitWord(const std::atomic<std::uint32_t>& word, std::atomic<bool>& sleeping, TReady&& ready) {
+    if (ready()) return;
+    const auto start = std::chrono::steady_clock::now();
+    for (std::uint32_t spin = 1;; ++spin) {
+#if defined(__x86_64__) || defined(__i386__)
+        __builtin_ia32_pause();
+#endif
+        if (ready()) return;
+        if ((spin & 63u) == 0 && std::chrono::steady_clock::now() - start > std::chrono::microseconds(50)) break;
     }
-};
+    for (;;) {
+        sleeping.store(true, std::memory_order_seq_cst);
+        const auto seen = word.load(std::memory_order_seq_cst);
+        if (ready()) break;
+        WaitWhile(word, seen);
+    }
+    sleeping.store(false, std::memory_order_relaxed);
+}
 
-struct DrawScratchTag;
-
-// The thread's DrawScratch for one draw, emptied when the draw returns: the compiled stages and
-// variants in it must not outlive the draw. A draw entered again on the thread while one runs (a
-// capture retry) gets a scratch of its own.
-class DrawScratchLease {
-public:
-    DrawScratchLease() {
-        auto& shared = ThreadScratch<DrawScratch, DrawScratchTag>();
-        if (shared.busy) {
-            owned = std::make_unique<DrawScratch>();
-            scratch = owned.get();
-        } else {
-            scratch = &shared;
+// Whether a draw's stages may write guest memory besides its render targets: a buffer element not
+// proved read-only, a written or atomic storage image, GDS, or an address-based (BDA) binding. A
+// worker waits for such a draw on its draw thread before it prepares the next one, whose captures
+// and validation read what recording it registers (pending writes, write stamps, pending images).
+bool writesGuestMemory(std::span<const Graphics::CompiledShader> stages) {
+    using Role = ShaderRecompiler::DescriptorRole;
+    const auto any = [](const ShaderRecompiler::ElementFlags& flags) {
+        for (const bool flag : flags) {
+            if (flag) return true;
         }
-        scratch->busy = true;
+        return false;
+    };
+    for (const auto& stage : stages) {
+        for (const auto& binding : stage.program->bindings) {
+            switch (binding.role) {
+                case Role::GuestBuffers:
+                    if (binding.bufferWritten.size() < binding.count || any(binding.bufferWritten)) return true;
+                    break;
+                case Role::GuestImages:
+                    if (binding.kind == ShaderRecompiler::DescriptorKind::StorageImage && (binding.imageWritten.size() < binding.count || any(binding.imageWritten) || any(binding.imageAtomic))) return true;
+                    break;
+                case Role::Gds:
+                case Role::BdaPagetable:
+                    return true;
+                default:
+                    break;
+            }
+        }
+    }
+    return false;
+}
+
+struct PreparedDrawTag;
+
+// The thread's PreparedDraw for one draw, emptied when the draw returns: the compiled stages and
+// variants in it must not outlive the draw. A draw entered again on the thread while one runs (a
+// capture retry) gets a record of its own.
+class PreparedDrawLease {
+public:
+    PreparedDrawLease() {
+        auto& shared = ThreadScratch<PreparedDraw, PreparedDrawTag>();
+        if (shared.busy) {
+            owned = std::make_unique<PreparedDraw>();
+            prepared = owned.get();
+        } else {
+            prepared = &shared;
+        }
+        prepared->busy = true;
     }
 
-    ~DrawScratchLease() {
-        scratch->Clear();
-        scratch->busy = false;
+    ~PreparedDrawLease() {
+        prepared->Clear();
+        prepared->busy = false;
     }
 
-    DrawScratchLease(const DrawScratchLease&) = delete;
-    DrawScratchLease& operator=(const DrawScratchLease&) = delete;
+    PreparedDrawLease(const PreparedDrawLease&) = delete;
+    PreparedDrawLease& operator=(const PreparedDrawLease&) = delete;
 
-    DrawScratch* operator->() const { return scratch; }
+    PreparedDraw& operator*() const { return *prepared; }
 
 private:
-    std::unique_ptr<DrawScratch> owned;
-    DrawScratch* scratch = nullptr;
+    std::unique_ptr<PreparedDraw> owned;
+    PreparedDraw* prepared = nullptr;
 };
 
+}
+
+DrawThread::DrawThread(std::uint32_t queue) : queue(queue) {
+    for (auto& slot : slots) slot = std::make_unique<PreparedDraw>();
+}
+
+DrawThread::~DrawThread() = default;
+
+bool DrawThread::Enabled() {
+    static const bool enabled = std::getenv("APS5_NO_DRAW_THREAD") == nullptr && std::getenv("APS5_LOCKED_DRAW_PREPARE") == nullptr;
+    return enabled;
+}
+
+bool DrawThread::Push() {
+    const auto count = pushed.load(std::memory_order_relaxed);
+    if (recorded.load(std::memory_order_acquire) != count) Drain(Wait::Push);
+    if (abandoned.load(std::memory_order_acquire)) return false;
+    pushed.store(count + 1, std::memory_order_seq_cst);
+    doorbell.fetch_add(1, std::memory_order_seq_cst);
+    if (backSleeping.load(std::memory_order_seq_cst)) WakeAll(doorbell);
+    ++pushes;
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    if (profile) report();
+    return true;
+}
+
+void DrawThread::Drain(Wait why) {
+    const auto count = pushed.load(std::memory_order_relaxed);
+    if (recorded.load(std::memory_order_acquire) == count) return;
+    // The draw thread needs the mutex to record what it waits for.
+    require(!GuestMemory::GpuMutex().HeldByThisThread(), "a queue worker waited for its draw thread holding the GPU mutex");
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    // A draw thread that left early records nothing more.
+    awaitWord(recorded, frontSleeping, [&] { return recorded.load(std::memory_order_acquire) == count || abandoned.load(std::memory_order_acquire); });
+    const auto index = static_cast<std::size_t>(why);
+    ++waits[index];
+    if (profile) waitedMs[index] += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+}
+
+void DrawThread::AttachFront() {
+    GuestMemory::SetGpuLockFront(CurrentThreadToken(), [](void* back) { return static_cast<DrawThread*>(back)->Busy(); }, [](void* back) { static_cast<DrawThread*>(back)->Drain(Wait::Lock); }, this);
+    HostThreadSlot<DrawThread*, FrontDrawThreadTag>::Set(this);
+}
+
+void DrawThread::Stop() {
+    stopping.store(true, std::memory_order_seq_cst);
+    doorbell.fetch_add(1, std::memory_order_seq_cst);
+    WakeAll(doorbell);
+    if (thread.joinable()) thread.join();
+    GuestMemory::SetGpuLockFront(nullptr, nullptr, nullptr, nullptr);
+    HostThreadSlot<DrawThread*, FrontDrawThreadTag>::Set(nullptr);
+}
+
+bool DrawThread::AwaitRecord(std::uint32_t taken) {
+    awaitWord(doorbell, backSleeping, [&] { return pushed.load(std::memory_order_acquire) != taken || stopping.load(std::memory_order_acquire); });
+    return pushed.load(std::memory_order_acquire) != taken;
+}
+
+void DrawThread::Recorded(std::uint32_t count) {
+    recorded.store(count, std::memory_order_seq_cst);
+    if (frontSleeping.load(std::memory_order_seq_cst)) WakeAll(recorded);
+}
+
+void DrawThread::Abandon() {
+    abandoned.store(true, std::memory_order_seq_cst);
+    Recorded(pushed.load(std::memory_order_acquire));
+}
+
+void DrawThread::report() {
+    const auto now = std::chrono::steady_clock::now();
+    if (now - lastReport < std::chrono::seconds(10)) return;
+    const auto seconds = std::chrono::duration<double>(now - lastReport).count();
+    lastReport = now;
+    const auto at = [&](Wait why) { return static_cast<std::size_t>(why); };
+    std::fprintf(stderr, "[draw-thread] queue 0x%x (%.0f s): %llu draws handed over; the worker waited for the draw thread before a hand-off %llu times (%.0f ms), at its GPU mutex %llu (%.0f ms), before a packet %llu (%.0f ms), after a memory-writing draw %llu (%.0f ms), at the end of a submission %llu (%.0f ms)\n", queue, seconds, static_cast<unsigned long long>(pushes), static_cast<unsigned long long>(waits[at(Wait::Push)]), waitedMs[at(Wait::Push)], static_cast<unsigned long long>(waits[at(Wait::Lock)]), waitedMs[at(Wait::Lock)], static_cast<unsigned long long>(waits[at(Wait::Packet)]), waitedMs[at(Wait::Packet)], static_cast<unsigned long long>(waits[at(Wait::Writer)]), waitedMs[at(Wait::Writer)], static_cast<unsigned long long>(waits[at(Wait::End)]), waitedMs[at(Wait::End)]);
+    pushes = 0;
+    waits.fill(0);
+    waitedMs.fill(0);
+}
+
+DrawThread* FrontDrawThread() {
+    return HostThreadSlot<DrawThread*, FrontDrawThreadTag>::Get();
+}
+
+DrawVerdict Driver::drawnVerdict(DrawPhaseTiming& phaseTiming, std::uint64_t captures) {
+    phaseTiming.Phase(DrawRowVectors);
+    if (!phaseTiming.profile) return DrawVerdict::Drawn;
+    auto& pending = pendingDrawPhases();
+    pending.phases = true;
+    pending.captures = captures;
+    pending.ms = phaseTiming.phaseMs;
+    pending.tailAt = phaseTiming.phaseLap;
+    return DrawVerdict::Drawn;
 }
 
 DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::string& rejected) {
@@ -95,17 +211,45 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     auto phaseLap = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     DrawPhaseTiming phaseTiming{profile, phaseMs, phaseLap};
     if (profile && packetStartedAt() != std::chrono::steady_clock::time_point{}) phaseMs[DrawRowPrologue] = std::chrono::duration<double, std::milli>(phaseLap - packetStartedAt()).count();
+    // Once taken, held until the draw returns: the record is emptied under it.
+    std::unique_lock gpuLock(GuestMemory::GpuMutex(), std::defer_lock);
+    if (auto* back = FrontDrawThread(); back != nullptr && back->FrontReady()) {
+        auto& slot = back->Slot();
+        // Emptied here unless handed over: the draw thread empties what it records.
+        struct Preparing {
+            DrawThread& back;
+            PreparedDraw& slot;
+            bool handed = false;
+            ~Preparing() {
+                if (!handed) slot.Clear();
+                back.preparing = false;
+            }
+        } preparing{*back, slot};
+        back->preparing = true;
+        if (const auto verdict = prepareDraw(slot, queue, packet, submission, rejected, gpuLock, timing, phaseTiming, captures)) return *verdict;
+        // The worker's deferred labels come before this draw in the stream: recorded now, as the
+        // serial draw's own lock records them (the draw thread's sees only its own, empty list).
+        if (!deferredLabels().labels.empty()) {
+            GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
+            std::lock_guard labelLock(GuestMemory::GpuMutex());
+            recordLabelsForPacket(slot.device.get(), submission.queue);
+        }
+        const bool writes = writesGuestMemory(slot.stages);
+        slot.collectEpoch = GuestMemory::ThreadCollectEpoch();
+        preparing.handed = back->Push();
+        if (!preparing.handed) recordPrepared(slot, gpuLock, timing, phaseTiming);
+        else if (writes) back->Drain(DrawThread::Wait::Writer);
+        return drawnVerdict(phaseTiming, captures);
+    }
+    const PreparedDrawLease prepared;
+    if (const auto verdict = prepareDraw(*prepared, queue, packet, submission, rejected, gpuLock, timing, phaseTiming, captures)) return *verdict;
+    recordPrepared(*prepared, gpuLock, timing, phaseTiming);
+    return drawnVerdict(phaseTiming, captures);
+}
 
-    const auto drawn = [&] {
-        phaseTiming.Phase(DrawRowVectors);
-        if (!profile) return DrawVerdict::Drawn;
-        auto& pending = pendingDrawPhases();
-        pending.phases = true;
-        pending.captures = captures;
-        pending.ms = phaseMs;
-        pending.tailAt = phaseLap;
-        return DrawVerdict::Drawn;
-    };
+std::optional<DrawVerdict> Driver::prepareDraw(PreparedDraw& prepared, QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::string& rejected, std::unique_lock<GuestMemory::GpuMutexType>& gpuLock, PerformanceTimer& timing, DrawPhaseTiming& phaseTiming, std::uint64_t& captures) {
+    const bool profile = phaseTiming.profile;
+    auto& phaseMs = phaseTiming.phaseMs;
     auto drawParameters = Pm4::ResolveDraw(packet, queue);
     bool traceIndirect = false;
     if (const auto verdict = precheckDraw(queue, submission, packet, drawParameters, rejected, traceIndirect)) return *verdict;
@@ -118,8 +262,8 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     static const std::uint64_t dumpSlot1 = [] { const char* text = std::getenv("APS5_DUMP_DRAW_SLOT1"); return text ? std::strtoull(text, nullptr, 16) : 0ull; }();
 
     static const bool lockedPrepare = std::getenv("APS5_LOCKED_DRAW_PREPARE") != nullptr;
-    std::unique_lock gpuLock(GuestMemory::GpuMutex(), std::defer_lock);
-    std::shared_ptr<VulkanDevice> localDevice;
+    prepared.queue = submission.queue;
+    auto& localDevice = prepared.device;
     if (lockedPrepare) {
 
         GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
@@ -145,9 +289,9 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     static const bool probeStageMemo = std::getenv("APS5_TRACE_STAGE_MEMO") != nullptr;
     const bool wantRegions = useDrawEntries || traceRelocation || probeStageMemo;
     const bool registerKey = useDrawEntries && registerKeyEnabled();
-    std::uint64_t drawKey = 0;
+    auto& drawKey = prepared.drawKey;
     std::shared_ptr<DrawEntry> entry;
-    std::shared_ptr<const DrawDecode> decode;
+    auto& decode = prepared.decode;
     if (registerKey) {
         const auto keyStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         drawKey = drawRegisterKey(queue, *submission.shaders, localDevice->Serial());
@@ -218,10 +362,9 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     }
     // The regions the stages read: two per program here, then the captures' and the decode reads.
     // Reserved once: grown a push at a time, the list was reallocated several times per draw.
-    const DrawScratchLease scratch;
-    auto& memory = scratch->memory;
+    auto& memory = prepared.memory;
     memory.reserve(2 * programs.size() + 32);
-    auto& linked = scratch->linked;
+    auto& linked = prepared.linked;
     linked.reserve(programs.size());
     for (std::size_t i = 0; i < programs.size(); ++i) {
         const auto& program = programs[i];
@@ -233,9 +376,11 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     timing.Mark("prepare");
     phaseTiming.Phase(DrawRowProgramPrepare);
 
-    auto& vertexInfos = scratch->vertexInfos;
+    auto& vertexInfos = prepared.vertexInfos;
     vertexInfos.resize(programs.size());
-    auto& decodeReads = scratch->decodeReads;
+    auto& requests = prepared.requests;
+    if (requests.size() < programs.size()) requests.resize(programs.size());
+    auto& decodeReads = prepared.decodeReads;
     decodeReads.resize(programs.size());
     const auto decodeVertexInfo = [&](std::size_t i) {
         const auto& program = programs[i];
@@ -247,30 +392,30 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         for (std::size_t i = 0; i < programs.size(); ++i) decodeVertexInfo(i);
         phaseTiming.Phase(DrawRowDecode);
     }
-    ShaderMemory shaderMemory(memory, &queryPendingWrite, &observePendingWrite, hookWaitCounter());
+    auto& shaderMemory = prepared.shaderMemory.emplace(memory, &queryPendingWrite, &observePendingWrite, hookWaitCounter());
     // The compiled stages of a miss (shared with the capture, never copied) and a barycentric
     // geometry stage, and the rect-list's generated stages; `stages` points into both.
-    auto& results = scratch->results;
-    std::array<ShaderRecompiler::RecompileResult, 2> rectStages;
-    auto& stages = scratch->stages;
+    auto& results = prepared.results;
+    auto& rectStages = prepared.rectStages;
+    auto& stages = prepared.stages;
     results.reserve(programs.size() + 1u);
     stages.reserve(programs.size() + 2u);
     std::uint32_t pushCursorBytes = 0;
 
-    auto& programResults = scratch->programResults;
+    auto& programResults = prepared.programResults;
     programResults.assign(programs.size(), nullptr);
 
-    auto& stageCaptures = scratch->stageCaptures;
+    auto& stageCaptures = prepared.stageCaptures;
     stageCaptures.resize(programs.size());
-    auto& matched = scratch->matched;
+    auto& matched = prepared.matched;
     matched.resize(programs.size());
-    auto& matchedRegions = scratch->matchedRegions;
+    auto& matchedRegions = prepared.matchedRegions;
     matchedRegions.resize(programs.size());
 
-    auto& fresh = scratch->fresh;
+    auto& fresh = prepared.fresh;
     fresh.resize(programs.size());
 
-    auto& recompiled = scratch->recompiled;
+    auto& recompiled = prepared.recompiled;
     recompiled.assign(programs.size(), false);
     bool drawHit = false;
     bool verifyHit = false;
@@ -298,9 +443,9 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     const auto fold = [&](const ShaderRecompiler::RecompileResult& main, Pm4::DrawParameters& parameters) { FoldDrawOffsets(main, programs.front(), parameters); };
 
     std::optional<Graphics::IndirectDrawPath> indirectCpu;
-    auto& pushOffsets = scratch->pushOffsets;
+    auto& pushOffsets = prepared.pushOffsets;
     pushOffsets.assign(programs.size(), 0);
-    auto& resultIndex = scratch->resultIndex;
+    auto& resultIndex = prepared.resultIndex;
     resultIndex.assign(programs.size(), 0);
     for (std::size_t i = 0; i < programs.size(); ++i) {
         if (roles[i] == Role::GeometryBack) continue;
@@ -313,7 +458,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             memory.insert(memory.end(), matchedRegions[i].begin(), matchedRegions[i].end());
         } else {
             resultIndex[i] = results.size();
-            results.push_back(materializeDrawStage(i, pushCursorBytes, queue, submission, programs, graphics, pixel, vertexInfos, memory, linked, drawParameters, localDevice, shaderMemory, stageCaptures, recompiled, drawHit, wantRegions, matched, matchedRegions, profile, dumpTarget, dumpSlot1, captures, phaseTiming, phaseMs, rejected));
+            results.push_back(materializeDrawStage(i, pushCursorBytes, queue, submission, programs, graphics, pixel, vertexInfos, requests, memory, linked, drawParameters, localDevice, shaderMemory, stageCaptures, recompiled, drawHit, wantRegions, matched, matchedRegions, profile, dumpTarget, dumpSlot1, captures, phaseTiming, phaseMs, rejected));
             if (!rejected.empty()) return DrawVerdict::Rejected;
             programResults[i] = results.back().get();
         }
@@ -325,7 +470,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         }
         const auto slotEnd = (pushCursorBytes / Graphics::PipelinePushSlotBytes + 1u) * Graphics::PipelinePushSlotBytes;
         require(result.pushConstants.size() <= slotEnd - pushCursorBytes, "stage push constants exceed the pipeline push constant block");
-        stages.push_back({program.binary.stage, &result, result.pushConstants.empty() ? 0u : pushCursorBytes});
+        stages.push_back({program.binary.stage, &result, result.pushConstants.empty() ? 0u : pushCursorBytes, program.binary.codeAddress});
         pushCursorBytes += static_cast<std::uint32_t>(result.pushConstants.size());
     }
 
@@ -340,21 +485,19 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
 
     if (recordQueuedLabelsAfterCapture(submission.queue, memory)) return draw(queue, packet, submission, rejected);
 
-    bool rectListBuilt = false;
-
     const auto buildRectList = [&] {
         phaseTiming.Phase(DrawRowVectors);
         require(programs.size() == 2 && programResults[0] != nullptr && programResults[1] != nullptr, "rect-list requires vertex and fragment programs");
         auto rectangle = DrawRectangle(*programs[0].snapshot, programs[1].snapshot, programResults[0]->variantId, programResults[1]->variantId, localDevice->Target());
         rectStages[0] = std::move(rectangle.control);
         rectStages[1] = std::move(rectangle.evaluation);
-        if (rectListBuilt) {
+        if (prepared.rectList) {
             phaseTiming.Phase(DrawRowRectList);
             return;
         }
         require(stages.size() == 2, "rect-list requires vertex and fragment programs");
         stages.insert(stages.begin() + 1, {{Stage::TessellationControl, &rectStages[0], 0}, {Stage::TessellationEvaluation, &rectStages[1], 0}});
-        rectListBuilt = true;
+        prepared.rectList = true;
         phaseTiming.Phase(DrawRowRectList);
     };
     if (graphics.rectList) buildRectList();
@@ -363,7 +506,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         results.push_back(std::make_shared<const ShaderRecompiler::RecompileResult>(ShaderRecompiler::BuildBarycentricGeometryShader(*programResults[0], *programResults[1], localDevice->Target(), localDevice->GeometryLimits())));
         stages.insert(stages.begin() + 1, Graphics::CompiledShader{Stage::Geometry, results.back().get(), 0});
     }
-    auto& snapshots = scratch->snapshots;
+    auto& snapshots = prepared.snapshots;
     const auto snapshot = [&] {
         snapshots.clear();
         snapshots.reserve(memory.size());
@@ -371,23 +514,6 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     };
     snapshot();
     timing.Mark("post_compile_prepare");
-    const auto lockForDraw = [&] {
-        if (gpuLock.owns_lock()) return;
-        phaseTiming.Phase(DrawRowVectors);
-        GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
-        gpuLock.lock();
-        timing.Mark("gpu_mutex_wait");
-        phaseTiming.Phase(DrawRowLockWait);
-
-        if (auto current = device.Load(); current != nullptr && current != localDevice) {
-            static std::atomic<std::uint64_t> replaced{0};
-            std::fprintf(stderr, "[draw] device replaced during unlocked preparation (%llu)\n", static_cast<unsigned long long>(++replaced));
-            localDevice = std::move(current);
-        }
-
-        recordLabelsForPacket(localDevice.get(), submission.queue);
-        phaseTiming.Phase(DrawRowLabels);
-    };
     if (drawParameters.indirect && indirectCpu) {
 
         const auto indirect = *drawParameters.indirect;
@@ -441,7 +567,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
                 const auto* previous = result.get();
                 const auto pushBytes = result->pushConstants.size();
                 decodeVertexInfo(programIndex);
-                result = materializeDrawStage(programIndex, pushOffsets[programIndex], queue, submission, programs, graphics, pixel, vertexInfos, memory, linked, drawParameters, localDevice, shaderMemory, stageCaptures, recompiled, drawHit, wantRegions, matched, matchedRegions, profile, dumpTarget, dumpSlot1, captures, phaseTiming, phaseMs, rejected);
+                result = materializeDrawStage(programIndex, pushOffsets[programIndex], queue, submission, programs, graphics, pixel, vertexInfos, requests, memory, linked, drawParameters, localDevice, shaderMemory, stageCaptures, recompiled, drawHit, wantRegions, matched, matchedRegions, profile, dumpTarget, dumpSlot1, captures, phaseTiming, phaseMs, rejected);
                 if (!rejected.empty()) return DrawVerdict::Rejected;
                 require(result->pushConstants.size() == pushBytes, "patched program changed its push constant layout");
                 // The stages name the program's result by address: repoint them at the new one.
@@ -457,23 +583,20 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
                 rejected = std::move(*known);
                 return DrawVerdict::Rejected;
             }
-            lockForDraw();
-            noteDrawWriters(stages, submission.queue);
-            phaseTiming.Phase(DrawRowVectors);
-            localDevice->Draw(graphics, direct, stages, snapshots);
-            phaseTiming.Phase(DrawRowGraphics);
+            // Drawn before the next record's patches: they change the stages in place.
+            prepared.parameters = direct;
+            recordPrepared(prepared, gpuLock, timing, phaseTiming);
         }
-        timing.Mark("draw_and_resource_release");
-        return drawn();
+        return drawnVerdict(phaseTiming, captures);
     }
 
-    auto& recipeStages = scratch->recipeStages;
+    auto& recipeStages = prepared.recipeStages;
     if (registerKey && !drawParameters.indirect && Graphics::DrawRecipes()) {
         recipeStages.reserve(programs.size());
         for (std::size_t i = 0; i < programs.size(); ++i) recipeStages.push_back(drawHit ? matched[i] : fresh[i]);
         if (std::all_of(recipeStages.begin(), recipeStages.end(), [](const std::shared_ptr<DispatchVariant>& variant) { return variant == nullptr; })) recipeStages.clear();
     }
-    std::shared_ptr<const DrawRecipe> recipe;
+    auto& recipe = prepared.recipe;
     if (drawHit && !recipeStages.empty()) {
         recipe = findDrawRecipe(drawKey, recipeStages);
         if (recipe == nullptr) VulkanDevice::NoteDrawRecipeMiss(VulkanDevice::DrawRecipePrecheck::NoRecipe);
@@ -484,24 +607,81 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             return DrawVerdict::Rejected;
         }
     }
-    lockForDraw();
-    noteDrawWriters(stages, submission.queue);
+    prepared.parameters = drawParameters;
+    return std::nullopt;
+}
+
+void Driver::recordPrepared(PreparedDraw& prepared, std::unique_lock<GuestMemory::GpuMutexType>& gpuLock, PerformanceTimer& timing, DrawPhaseTiming& phaseTiming) {
+    if (!gpuLock.owns_lock()) {
+        phaseTiming.Phase(DrawRowVectors);
+        GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
+        gpuLock.lock();
+        timing.Mark("gpu_mutex_wait");
+        phaseTiming.Phase(DrawRowLockWait);
+
+        if (auto current = device.Load(); current != nullptr && current != prepared.device) {
+            static std::atomic<std::uint64_t> replaced{0};
+            std::fprintf(stderr, "[draw] device replaced during unlocked preparation (%llu)\n", static_cast<unsigned long long>(++replaced));
+            prepared.device = std::move(current);
+        }
+
+        recordLabelsForPacket(prepared.device.get(), prepared.queue);
+        phaseTiming.Phase(DrawRowLabels);
+    }
+    noteDrawWriters(prepared.stages, prepared.queue);
     phaseTiming.Phase(DrawRowVectors);
-    if (recipe != nullptr) {
-        if (localDevice->DrawFromRecipe(graphics, drawParameters, stages, snapshots, recipe) == RecipeOutcome::Recorded) {
+    const auto& graphics = prepared.decode->state;
+    if (prepared.recipe != nullptr) {
+        if (prepared.device->DrawFromRecipe(graphics, prepared.parameters, prepared.stages, prepared.snapshots, prepared.recipe) == RecipeOutcome::Recorded) {
             phaseTiming.Phase(DrawRowGraphics);
             timing.Mark("draw_and_resource_release");
-            return drawn();
+            return;
         }
 
         VulkanDevice::NoteRecipe(VulkanDevice::RecipeEvent::Restart, VulkanDevice::RecipeKind::Draw);
     }
     std::shared_ptr<const DrawRecipe> built;
-    localDevice->Draw(graphics, drawParameters, stages, snapshots, recipeStages.empty() ? nullptr : &built);
+    prepared.device->Draw(graphics, prepared.parameters, prepared.stages, prepared.snapshots, prepared.recipeStages.empty() ? nullptr : &built);
     phaseTiming.Phase(DrawRowGraphics);
-    if (built != nullptr) attachDrawRecipe(drawKey, recipeStages, std::move(built));
+    if (built != nullptr) attachDrawRecipe(prepared.drawKey, prepared.recipeStages, std::move(built));
     timing.Mark("draw_and_resource_release");
-    return drawn();
+}
+
+void Driver::runDrawThread(DrawThread& back) noexcept {
+    onWorkerThread() = true;
+    {
+        char role[32];
+        std::snprintf(role, sizeof role, "draw thread 0x%x", back.queue);
+        PinWorkerThread(role);
+    }
+    GuestMemory::TagGpuLockThread(back.queue);
+    if (back.collectMemo != nullptr) GuestMemory::AdoptCollectMemo(back.collectMemo);
+    std::array<double, DrawDriverPhaseCount> phaseMs{};
+    std::chrono::steady_clock::time_point phaseLap{};
+    DrawPhaseTiming phaseTiming{false, phaseMs, phaseLap};
+    try {
+        for (std::uint32_t taken = 0; back.AwaitRecord(taken); ++taken) {
+            auto& prepared = back.Record(taken);
+            GuestMemory::AdoptCollectEpoch(prepared.collectEpoch);
+            PerformanceTimer timing("Driver.Draw");
+            std::unique_lock gpuLock(GuestMemory::GpuMutex(), std::defer_lock);
+            try {
+                recordPrepared(prepared, gpuLock, timing, phaseTiming);
+            } catch (const std::exception& error) {
+                // The worker's packet has moved on: reported without its register dump.
+                CaptureTrace::Log("draw-error queue=%x reason=%.256s (draw thread)", back.queue, error.what());
+                reportSkip("draw", std::string(error.what()) + " [draw thread]");
+            }
+            // Emptied under the mutex, as draw() empties its record: the last reference to a device
+            // ends its recorder, which needs it.
+            if (!gpuLock.owns_lock()) gpuLock.lock();
+            prepared.Clear();
+            gpuLock.unlock();
+            back.Recorded(taken + 1);
+        }
+    } catch (...) {
+        back.Abandon();
+    }
 }
 
 }

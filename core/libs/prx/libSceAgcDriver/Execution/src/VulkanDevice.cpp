@@ -275,6 +275,7 @@ struct VulkanDevice::State {
     bool imageViewMinLod = false;
     bool pipelineExecutableInfo = false;
     bool maintenance8 = false;
+    bool pushDescriptors = false;
     std::uint32_t srgbDecodeFormats = 0;
     bool storageImageWithoutFormat = false;
     bool depthClamp = false;
@@ -625,7 +626,11 @@ struct VulkanDevice::State {
     ~State() {
         contextReady = false;
         if (device != VK_NULL_HANDLE) {
-            const auto idle = reinterpret_cast<PFN_vkDeviceWaitIdle>(deviceProc(device, "vkDeviceWaitIdle"))(device);
+            VkResult idle;
+            {
+                std::lock_guard queue(GuestMemory::QueueMutex());
+                idle = reinterpret_cast<PFN_vkDeviceWaitIdle>(deviceProc(device, "vkDeviceWaitIdle"))(device);
+            }
             if (idle != VK_SUCCESS && idle != VK_ERROR_DEVICE_LOST) std::terminate();
             // Resident images kept for unfinished presentations go before the caches they came from.
             {
@@ -1082,6 +1087,8 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
     }
     maintenance8Features = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_8_FEATURES_KHR};
     maintenance8Features.maintenance8 = VK_TRUE;
+    state->pushDescriptors = hasExtension(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME);
+    if (state->pushDescriptors) deviceExtensions.push_back(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME);
     VkPhysicalDeviceDepthClipControlFeaturesEXT depthClipFeatures{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_CONTROL_FEATURES_EXT};
     if (hasExtension(VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME)) {
         VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &depthClipFeatures};
@@ -1482,11 +1489,31 @@ void VulkanDevice::WaitIdle() {
         if (!state->recorder->Idle()) Graphics::Recorder::CountSync(0, __builtin_return_address(0));
         state->recorder->Sync();
     }
-    check(state->DeviceFunction<PFN_vkDeviceWaitIdle>("vkDeviceWaitIdle")(state->device), "vkDeviceWaitIdle");
+    VkResult idle;
+    {
+        std::lock_guard queue(GuestMemory::QueueMutex());
+        idle = state->DeviceFunction<PFN_vkDeviceWaitIdle>("vkDeviceWaitIdle")(state->device);
+    }
+    check(idle, "vkDeviceWaitIdle");
     APS5_LOG_CHARS_OUT_DEBUG("VulkanDevice::WaitIdle complete");
 }
 
 namespace {
+
+// APS5_PROFILE_GPU: one recorder setup range for a scope (Recorder::BeginSetupTiming): what a
+// dispatch records ahead of its own ranges (its resource build's uploads and conversions), closed
+// by recordDispatch or when the dispatch returns; a CB metadata or depth clear pass, whole.
+struct SetupTiming {
+    SetupTiming(Graphics::Recorder* recorder, Graphics::Recorder::CommandClass which) : recorder(Graphics::Recorder::GpuTimingEnabled() ? recorder : nullptr) {
+        if (this->recorder != nullptr) this->recorder->BeginSetupTiming(which);
+    }
+    ~SetupTiming() {
+        if (recorder != nullptr) recorder->EndSetupTiming();
+    }
+    SetupTiming(const SetupTiming&) = delete;
+    SetupTiming& operator=(const SetupTiming&) = delete;
+    Graphics::Recorder* recorder;
+};
 
 bool OpportunisticReap() {
     static const bool enabled = std::getenv("APS5_NO_OPPORTUNISTIC_REAP") == nullptr;
@@ -2190,6 +2217,7 @@ void VulkanDevice::PresentPixels(std::uint32_t width, std::uint32_t height, std:
     // Tests and tools present pixels synchronously; the game path splits the steps (see Driver::Present).
     if (!present(width, height, true, pixels)) return;
     FinishPresent();
+    std::lock_guard queue(GuestMemory::QueueMutex());
     QueuePresent();
 }
 
@@ -2385,6 +2413,16 @@ bool VulkanDevice::PresentDisplayBuffer(const DisplayBuffer& buffer) {
         const auto channel = [&](std::size_t index) { return static_cast<float>(std::to_integer<unsigned>((*cleared)[index])) / 255.0f; };
         uniform = {{channel(2), channel(1), channel(0), channel(3)}};
     }
+    {
+        // Each display path once: which one a title's frames take.
+        static std::set<std::tuple<std::uint64_t, int, int>> reported;
+        const int path = cleared ? 0 : resident == nullptr ? 1 : convert ? 2 : 3;
+        const int storage = resident != nullptr ? static_cast<int>(Graphics::StorageFormatForGuest(graphicsContext(), resident->Descriptor().format)) : -1;
+        if (reported.insert({buffer.pixelFormat, storage, path}).second) {
+            static const char* const names[] = {"a fast-cleared buffer", "guest memory", "the resident image, converted", "the resident image, blitted"};
+            std::fprintf(stderr, "[present] display %ux%u pixel format 0x%llx presents from %s (storage vk format %d)\n", buffer.width, buffer.height, static_cast<unsigned long long>(buffer.pixelFormat), names[path], storage);
+        }
+    }
     if (!present(buffer.width, buffer.height, true, {}, cleared ? nullptr : &buffer, resident, filter, dumpFrame, convert, cleared ? &uniform : nullptr)) {
         // A dropped frame (swapchain out of date) keeps the dump numbering contiguous.
         if (dumpFrame) --dumps.dumped;
@@ -2529,8 +2567,16 @@ bool VulkanDevice::present(std::uint32_t width, std::uint32_t height, bool opaqu
             pipelineBarrier(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &residentBarrier);
             Graphics::Recorder::CountBarriers(CommandClass::PresentBlit);
             if (residentConvert) {
-                state->colorTransfer->DetileImage(commands, resident->Image(), VK_IMAGE_LAYOUT_GENERAL, width, height, Graphics::ColorTileMode::RenderTarget, DisplayRedLow(display->pixelFormat), DisplayTenBit(display->pixelFormat), DisplayHalfFloat(display->pixelFormat));
-                state->scaler->RecordUpload(commands, state->colorTransfer->LinearBuffer());
+                // Bytes already in the source's order (no red/blue swap, no 10-bit narrowing) are
+                // copied as they are: the conversion pass would move them through a buffer and back
+                // unchanged. APS5_PRESENT_CONVERT_PASS=1 always runs the pass.
+                static const bool convertPass = std::getenv("APS5_PRESENT_CONVERT_PASS") != nullptr;
+                if (!convertPass && !DisplayRedLow(display->pixelFormat) && !DisplayTenBit(display->pixelFormat) && !DisplayHalfFloat(display->pixelFormat)) {
+                    state->scaler->RecordCopyFrom(commands, resident->Image(), VK_IMAGE_LAYOUT_GENERAL);
+                } else {
+                    state->colorTransfer->DetileImage(commands, resident->Image(), VK_IMAGE_LAYOUT_GENERAL, width, height, Graphics::ColorTileMode::RenderTarget, DisplayRedLow(display->pixelFormat), DisplayTenBit(display->pixelFormat), DisplayHalfFloat(display->pixelFormat));
+                    state->scaler->RecordUpload(commands, state->colorTransfer->LinearBuffer());
+                }
             }
         } else {
             if (display != nullptr) {
@@ -2600,7 +2646,10 @@ bool VulkanDevice::present(std::uint32_t width, std::uint32_t height, bool opaqu
     timing.Mark("command_record_scale");
     // The slot's fence signaled (retired above) or was never used: the reset cannot block.
     check(state->DeviceFunction<PFN_vkResetFences>("vkResetFences")(state->device, 1, &slot.fence), "vkResetFences present");
-    check(state->DeviceFunction<PFN_vkQueueSubmit>("vkQueueSubmit")(state->queue, 1, &submit, slot.fence), "vkQueueSubmit clear");
+    {
+        std::lock_guard queue(GuestMemory::QueueMutex());
+        check(state->DeviceFunction<PFN_vkQueueSubmit>("vkQueueSubmit")(state->queue, 1, &submit, slot.fence), "vkQueueSubmit clear");
+    }
     const auto submittedAt = std::chrono::steady_clock::now();
     timing.Mark("queue_submit");
     APS5_LOG_CHARS_OUT_DEBUG("Presentation vkQueueSubmit OK");
@@ -2865,6 +2914,8 @@ Graphics::Context VulkanDevice::buildContext() const {
     context.placeholderImages = state->placeholderImages.get();
     context.primitiveListRestart = state->primitiveListRestart;
     context.imageViewMinLod = state->imageViewMinLod;
+    context.depthColorCopies = state->maintenance8;
+    context.pushDescriptors = state->pushDescriptors;
     context.pipelineExecutableInfo = state->pipelineExecutableInfo;
     context.srgbDecodeFormats = state->srgbDecodeFormats;
     context.memoryProperties2 = state->memoryBudget ? state->InstanceFunction<PFN_vkGetPhysicalDeviceMemoryProperties2>("vkGetPhysicalDeviceMemoryProperties2") : nullptr;
@@ -2882,10 +2933,12 @@ std::optional<std::string> VulkanDevice::KnownDrawRejection(const Graphics::Stat
 }
 
 void VulkanDevice::ColorMetadataPass(const Graphics::ColorMetadataPass& pass) {
+    const SetupTiming timing(state->recorder.get(), Graphics::Recorder::CommandClass::MetadataPass);
     Graphics::RunColorMetadataPass(graphicsContext(), pass);
 }
 
 void VulkanDevice::DepthClearPass(const Graphics::DepthClearPass& pass) {
+    const SetupTiming timing(state->recorder.get(), Graphics::Recorder::CommandClass::DepthClearPass);
     Graphics::ClearDepthSurface(graphicsContext(), pass.target, pass.depth, pass.stencil);
 }
 
@@ -3643,6 +3696,7 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
         recordStep(PhaseRecordDataRefresh);
     }
     using CommandClass = Graphics::Recorder::CommandClass;
+    recorder.EndSetupTiming();
     if (Graphics::Recorder::BarrierValidate()) {
         if (argumentImport != nullptr) {
             const std::pair<std::uint64_t, std::uint64_t> argumentRange{arguments, arguments + 12};
@@ -3720,6 +3774,7 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
     state->recorder->BoundKeptBytes();
     ShaderRecompiler::RuntimeAbi::RequireVersion(shader.runtimeAbiVersion);
     PerformanceTimer timing("Vulkan.Dispatch");
+    const SetupTiming setupTiming(state->recorder.get(), Graphics::Recorder::CommandClass::DispatchSetup);
     if (recipeOut != nullptr) *recipeOut = nullptr;
     // Group counts for the trace lines; an indirect dispatch does not know them.
     char groupsText[40];
@@ -3773,6 +3828,8 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
         ReapRecorded(prepared->presyncSerial);
         timer.phase(PhaseReap);
     }
+    // APS5_PROFILE_GPU: the setup range goes on as dispatch-resources (the build or the proof).
+    if (Graphics::Recorder::GpuTimingEnabled()) state->recorder->BeginSetupTiming(Graphics::Recorder::CommandClass::DispatchResources);
     // The 'resources' phase below, split (APS5_PROFILE_DRAW) into what runs under the mutex: the
     // sub-phases are extra rows named "resources: ..." in the [dispatch] totals and the [indirect]
     // line, so the hold's biggest part (stage B's image lookups, the whole build of an address-based
@@ -3887,6 +3944,8 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
     }
     timing.Mark("shader_resources");
     timer.phase(PhaseResources);
+    // APS5_PROFILE_GPU: and as dispatch-pipeline (the pipeline objects, the record's own setup).
+    if (Graphics::Recorder::GpuTimingEnabled()) state->recorder->BeginSetupTiming(Graphics::Recorder::CommandClass::DispatchPipeline);
     if (objects == nullptr) {
         objects = std::make_shared<ComputePipelineObjects>();
         objects->device = state->device;
@@ -4016,6 +4075,7 @@ RecipeOutcome VulkanDevice::DispatchRecipe(const ShaderRecompiler::RecompileResu
     state->recorder->BoundKeptBytes();
     ShaderRecompiler::RuntimeAbi::RequireVersion(shader.runtimeAbiVersion);
     PerformanceTimer timing("Vulkan.DispatchRecipe");
+    const SetupTiming setupTiming(state->recorder.get(), Graphics::Recorder::CommandClass::DispatchSetup);
     outcome = {0, 0};
     char groupsText[40];
     if (arguments != 0) std::snprintf(groupsText, sizeof(groupsText), "indirect");
@@ -4049,6 +4109,7 @@ RecipeOutcome VulkanDevice::DispatchRecipe(const ShaderRecompiler::RecompileResu
         ReapRecorded(hit->presyncSerial);
         timer.phase(PhaseReap);
     }
+    if (Graphics::Recorder::GpuTimingEnabled()) state->recorder->BeginSetupTiming(Graphics::Recorder::CommandClass::DispatchResources);
     if (verify != nullptr) {
         // APS5_VERIFY_RECIPE=1: the ordinary path's answers beside the recipe's. The found object
         // is the cache's under the content key (PrepareDispatch's Find), the pipeline objects the

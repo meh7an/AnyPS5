@@ -324,12 +324,21 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
             auto* recorder = dumpWanted || syncUploads ? nullptr : Recorder::Active();
             std::unique_ptr<CommandBatch> batch;
             VkCommandBuffer commands = VK_NULL_HANDLE;
+            // The upload's [gputime] range (APS5_PROFILE_GPU), tagged with the texture.
+            auto uploadTiming = Recorder::NoTiming;
             if (recorder != nullptr) {
                 commands = recorder->Commands();
                 recorder->Keep(staging, static_cast<std::size_t>(guestBytes));
                 recorder->Keep(tiled, static_cast<std::size_t>(guestBytes));
                 recorder->Keep(linear, static_cast<std::size_t>(linearBytes));
                 recorder->Keep(owned);
+                // After the keeps, which may submit: the range stays in one batch.
+                if (Recorder::GpuTimingEnabled()) {
+                    char name[96];
+                    std::snprintf(name, sizeof(name), "%ux%u format %u, %u mips, %u layers, tile %u", descriptor.width, descriptor.height, descriptor.format, descriptor.mipCount, arrayLayers, static_cast<unsigned>(descriptor.tileMode));
+                    uploadTiming = recorder->BeginGpuTiming(Recorder::CommandClass::TextureUpload, descriptor.baseAddress, name);
+                    commands = recorder->Commands();
+                }
             } else {
                 batch = std::make_unique<CommandBatch>(context);
                 commands = batch->Handle();
@@ -405,6 +414,7 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
             toShaderRead.image = image;
             toShaderRead.subresourceRange = toTransferDst.subresourceRange;
             context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &toShaderRead);
+            if (recorder != nullptr) recorder->EndGpuTiming(uploadTiming, guestBytes);
 
             if (batch) batch->SubmitAndWait();
             else ++Profile().recordedUploads;
@@ -1557,7 +1567,7 @@ bool StorageTexture::Refresh() {
     if (alias != nullptr && !(ProvedClearKeys(descriptor, guestBytes, keyProof) == DccKeys::Uncompressed && HostImportFor(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes)) != nullptr)) alias = nullptr;
     if (alias != nullptr) {
         std::vector<std::uint8_t> aliasStamped(trackedLayers);
-        if (!GuestMemory::ChangedBlocks(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), alias->layerGeneration, aliasStamped)) alias = nullptr;
+        if (!GuestMemory::ChangedBlocks(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), alias->layerGeneration.all(), aliasStamped)) alias = nullptr;
         for (std::uint32_t unit = 0; alias != nullptr && unit < trackedLayers; ++unit) {
             if (!alias->layerPending[unit]) continue;
             if (alias->layerGeneration[unit] == 0 || aliasStamped[unit] == GuestMemory::BlockMaybeWritten || (aliasStamped[unit] == GuestMemory::BlockUnchanged && layerPending[unit])) {
@@ -1627,7 +1637,7 @@ bool StorageTexture::Refresh() {
                 scanBlocks();
                 for (std::uint32_t unit = 0; unit < trackedLayers; ++unit) {
                     if (stampedBlocks[unit] == 0) {
-                        layerGeneration[unit] = current;
+                        layerGeneration.at(unit) = current;
                         continue;
                     }
                     changed[unit] = true;
@@ -1677,7 +1687,7 @@ bool StorageTexture::Refresh() {
             // already holding them at the same alias version stay as they are.
             const bool sameBorrow = borrowedFrom.lock() == alias && borrowedVersion == alias->version && borrowedUnits.size() == trackedLayers;
             std::vector<std::uint8_t> aliasStamped(trackedLayers);
-            const bool aliasTracked = GuestMemory::ChangedBlocks(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), alias->layerGeneration, aliasStamped);
+            const bool aliasTracked = GuestMemory::ChangedBlocks(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), alias->layerGeneration.all(), aliasStamped);
             borrowed.assign(trackedLayers, false);
             for (std::uint32_t unit = 0; unit < trackedLayers; ++unit) {
                 if (!aliasTracked || !alias->layerPending[unit] || aliasStamped[unit] != 0 || alias->layerGeneration[unit] == 0 || layerPending[unit]) continue;
@@ -1787,7 +1797,7 @@ bool StorageTexture::Refresh() {
         uploadReason = "alias";
         borrowUnits(*alias, borrowed);
         for (std::uint32_t unit = 0; unit < trackedLayers; ++unit) {
-            if (borrowed[unit]) layerGeneration[unit] = current;
+            if (borrowed[unit]) layerGeneration.at(unit) = current;
         }
         refreshGeneration();
     }
@@ -1961,7 +1971,7 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
         }
         for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
             if (!whole && !(*layers)[layer]) continue;
-            layerGeneration[layer] = now;
+            layerGeneration.at(layer) = now;
             if (whole || generationBaseline.size() != guestBytes) continue;
             const auto offset = static_cast<std::size_t>(layerBegin(layer) - descriptor.baseAddress);
             GuestMemory::ReadCommitted(layerBegin(layer), std::span<std::byte>(generationBaseline).subspan(offset, static_cast<std::size_t>(layerBytes(layer))));
@@ -2806,7 +2816,7 @@ bool StorageTexture::anyLayerPending() const {
 }
 
 void StorageTexture::refreshGeneration() {
-    generation = *std::min_element(layerGeneration.begin(), layerGeneration.end());
+    generation = layerGeneration.oldest();
 }
 
 void StorageTexture::markLayersPending(std::uint32_t first, std::uint32_t count) {
@@ -3607,7 +3617,7 @@ bool StorageTexture::FillClear(std::span<const std::uint32_t, 4> pattern, std::u
         const auto first = blockUnits ? static_cast<std::uint32_t>((begin - descriptor.baseAddress) / trackedLayerBytes) : layer;
         const auto count = blockUnits ? static_cast<std::uint32_t>(bytes / trackedLayerBytes) : 1u;
         const auto now = GuestMemory::CollectWritesUncached(begin, bytes);
-        for (auto unit = first; unit < first + count; ++unit) layerGeneration[unit] = now;
+        for (auto unit = first; unit < first + count; ++unit) layerGeneration.at(unit) = now;
         refreshGeneration();
         forgetBorrowed(first, count);
         markLayersPending(first, count);
@@ -3791,7 +3801,7 @@ void StorageTexture::advanceAdjacent(const std::vector<Adjacent>& adjacent, std:
         if (begin < beforeEnd && !GuestMemory::UnchangedSince(begin, static_cast<std::size_t>(beforeEnd - begin), seen)) continue;
         if (afterBegin < end && !GuestMemory::UnchangedSince(afterBegin, static_cast<std::size_t>(end - afterBegin), seen)) continue;
         if (trace) std::fprintf(stderr, "[flush] adjacent pending image 0x%llx+0x%llx layer %u advanced past a write-back's stamps (generation %llu -> %llu)\n", static_cast<unsigned long long>(texture->descriptor.baseAddress), static_cast<unsigned long long>(texture->guestBytes), layer, static_cast<unsigned long long>(seen), static_cast<unsigned long long>(now));
-        texture->layerGeneration[layer] = now;
+        texture->layerGeneration.at(layer) = now;
         texture->refreshGeneration();
     }
 }
@@ -4060,7 +4070,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
         if (allKept || !adjacent.empty()) {
             const auto now = memoizedCollect ? GuestMemory::CollectWrites(firstStored, static_cast<std::size_t>(lastStored - firstStored)) : GuestMemory::CollectWritesUncached(firstStored, static_cast<std::size_t>(lastStored - firstStored));
             for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
-                if (layers[layer] && !skippedLayer[layer]) layerGeneration[layer] = now;
+                if (layers[layer] && !skippedLayer[layer]) layerGeneration.at(layer) = now;
             }
             refreshGeneration();
             advanceAdjacent(adjacent, now, firstBlock, lastBlock);

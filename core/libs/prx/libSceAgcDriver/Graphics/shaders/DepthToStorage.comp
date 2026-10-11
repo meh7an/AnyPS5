@@ -1,0 +1,17 @@
+#version 450
+#extension GL_EXT_samplerless_texture_functions : require
+
+// A depth surface's depth plane into a storage image of 32-bit texels, bit for bit
+// (DepthSurface.cpp, DepthTransferPasses).
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 0) uniform texture2D depthPlane;
+layout(set = 0, binding = 1, r32ui) uniform writeonly uimage2D texels;
+layout(push_constant) uniform Parameters {
+    uvec2 extent;
+} parameters;
+
+void main() {
+    const ivec2 position = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(gl_GlobalInvocationID.xy, parameters.extent))) return;
+    imageStore(texels, position, uvec4(floatBitsToUint(texelFetch(depthPlane, position, 0).r)));
+}

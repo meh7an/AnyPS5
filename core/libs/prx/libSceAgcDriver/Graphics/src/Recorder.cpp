@@ -158,7 +158,8 @@ std::string ThreadSyncReport() {
 }
 // Unlocked timeline waits (WaitSerial): count and time, for the [recorder] line.
 std::atomic<std::uint64_t> unlockedWaits{0}, unlockedWaitedUs{0};
-// vkQueueSubmit calls and their time (APS5_PROFILE_DRAW; Submit runs under the GpuMutex).
+// vkQueueSubmit calls and their time, the wait for the queue included (APS5_PROFILE_DRAW; Submit
+// runs under the GpuMutex).
 std::uint64_t submitCount = 0;
 double submitUs = 0, submitMaxUs = 0;
 // Threads inside a timeline wait with the GpuMutex released (WaitSerial, syncThroughUnlocked): a
@@ -528,6 +529,13 @@ bool CountAllCompletionLabels() {
 bool ProcTable() {
     static const bool table = std::getenv("APS5_NO_PROC_TABLE") == nullptr;
     return table;
+}
+
+// APS5_BATCH_FENCES=1: with a timeline as well, every batch signals a fence of its own and its
+// completion is asked of the fence, as before the batches went fenceless.
+bool BatchFences() {
+    static const bool fences = std::getenv("APS5_BATCH_FENCES") != nullptr;
+    return fences;
 }
 // The pending-label table's own mutex: every mutation of a recorder's `labels` holds it (under the
 // GPU mutex), so a WAIT_REG_MEM looks a label up with this small lock alone (Recorder::LookupLabel)
@@ -1145,6 +1153,14 @@ Recorder::Recorder(const Context& context, bool timelineSemaphores) : context(co
     if (result != VK_SUCCESS) {
         std::fprintf(stderr, "[gpu] timeline semaphore creation failed (Vulkan result %d); drains wait under the GPU mutex\n", static_cast<int>(result));
         timeline = VK_NULL_HANDLE;
+        return;
+    }
+    // The timeline's signal covers everything submitted before it, as a fence's does: the batches
+    // need no fence of their own.
+    fenceless = !BatchFences();
+    if (ProcTable() && context.deviceProc != nullptr) {
+        getSemaphoreCounterValue = context.Function<PFN_vkGetSemaphoreCounterValueKHR>("vkGetSemaphoreCounterValueKHR");
+        waitSemaphores = context.Function<PFN_vkWaitSemaphoresKHR>("vkWaitSemaphoresKHR");
     }
 }
 
@@ -1205,7 +1221,7 @@ Recorder::~Recorder() {
     }
     for (auto& [commands, fence] : spare) {
         context.Function<PFN_vkFreeCommandBuffers>("vkFreeCommandBuffers")(context.device, context.pool, 1, &commands);
-        context.Function<PFN_vkDestroyFence>("vkDestroyFence")(context.device, fence, nullptr);
+        if (fence != VK_NULL_HANDLE) context.Function<PFN_vkDestroyFence>("vkDestroyFence")(context.device, fence, nullptr);
     }
     spare.clear();
     for (const auto pool : sparePools) context.Function<PFN_vkDestroyQueryPool>("vkDestroyQueryPool")(context.device, pool, nullptr);
@@ -1400,6 +1416,10 @@ VkCommandBuffer Recorder::Commands(VkAccessFlags* coveredAccess) {
     // for a caller whose ranges overlap a queued store: FlushStores).
     if (open->renderPass.open) endOpenRenderPass();
     if (open->run.open && !LabelRunsPerBatch()) closeStoreRun();
+    if (SiteProbes()) {
+        if (open->siteTiming != NoTiming) EndGpuTiming(std::exchange(open->siteTiming, NoTiming));
+        open->siteTiming = beginTiming(SiteKeyBase | reinterpret_cast<std::uintptr_t>(__builtin_return_address(0)));
+    }
     if (coveredAccess != nullptr) *coveredAccess = open->coveredAccess;
     open->coveredAccess = 0;
     return open->commands;
@@ -1441,6 +1461,7 @@ void Recorder::LeaveRenderPassOpen(std::uint64_t key, std::uint32_t timing, bool
         pass.timing = timing;
         pass.afterPass = std::move(afterPass);
     }
+    if (pass.timing < open->timedDraws.size()) ++open->timedDraws[pass.timing];
     pass.open = true;
     pass.key = key;
     pass.fenced = pass.fenced || fenced;
@@ -1546,8 +1567,10 @@ void Recorder::ensureOpen() {
                 allocation.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
                 allocation.commandBufferCount = 1;
                 Check(context.Function<PFN_vkAllocateCommandBuffers>("vkAllocateCommandBuffers")(context.device, &allocation, &batch->commands), "vkAllocateCommandBuffers recorder");
-                VkFenceCreateInfo info{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
-                Check(context.Function<PFN_vkCreateFence>("vkCreateFence")(context.device, &info, nullptr, &batch->fence), "vkCreateFence recorder");
+                if (!fenceless) {
+                    VkFenceCreateInfo info{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+                    Check(context.Function<PFN_vkCreateFence>("vkCreateFence")(context.device, &info, nullptr, &batch->fence), "vkCreateFence recorder");
+                }
             }
             VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
             begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
@@ -1765,9 +1788,9 @@ void Recorder::FlushStores() {
 
 namespace {
 
-constexpr std::uint32_t MaxTimedRanges = 512;
+constexpr std::uint32_t MaxTimedRanges = 2048;
 constexpr std::size_t CommandClasses = static_cast<std::size_t>(Recorder::CommandClass::Count);
-constexpr const char* CommandClassNames[CommandClasses] = {"dispatch-lead", "dispatch-trail", "indirect-args", "label-run", "fill", "fill-clear", "copy", "staging-in", "staging-out", "draw", "storage-upload", "storage-writeback", "dcc-clear", "dcc-keys", "present-blit", "shadow-publish", "template-refresh"};
+constexpr const char* CommandClassNames[CommandClasses] = {"dispatch-lead", "dispatch-trail", "indirect-args", "label-run", "fill", "fill-clear", "copy", "staging-in", "staging-out", "draw", "storage-upload", "storage-writeback", "dcc-clear", "dcc-keys", "present-blit", "shadow-publish", "template-refresh", "draw-setup", "dispatch-setup", "metadata-pass", "depth-clear-pass", "texture-upload", "dispatch-resources", "dispatch-pipeline", "depth-transfer", "input-mirror"};
 // [barriers] counters by class (relaxed: only reported) and the [gputime] totals, which the
 // presenter's thread adds to without the GPU mutex (AddGpuTiming).
 std::atomic<std::uint64_t> classBarriers[CommandClasses]{};
@@ -1791,6 +1814,25 @@ AgcDriver::Mutex timingMutex;
 std::map<std::uint64_t, TimingTotals> timingByKey;
 double timingProgramMs = 0, timingClassMs = 0, timingUnionMs = 0, timingBatchMs = 0;
 std::uint64_t timingBatches = 0;
+// The [gputime] breakdowns: the untimed gaps by the ranges around them (keys as below, programs
+// as TimingProgramKey, the batch's ends as TimingStartKey and TimingEndKey), and the draw pass
+// ranges by their first color target, with the target's description.
+constexpr std::uint64_t TimingStartKey = 0x0;
+constexpr std::uint64_t TimingProgramKey = 0x1;
+constexpr std::uint64_t TimingEndKey = 0x2;
+struct GapTotals { std::uint64_t count = 0; double ms = 0; };
+std::map<std::pair<std::uint64_t, std::uint64_t>, GapTotals> timingGaps;
+struct PassTotals { std::uint64_t count = 0; double ms = 0; std::uint64_t draws = 0; };
+std::map<std::uint64_t, PassTotals> timingPasses;
+// Sampled texture uploads (TextureUpload) by texture address, named like the passes.
+std::map<std::uint64_t, TimingTotals> timingUploads;
+std::map<std::uint64_t, std::string> timingPassNames;
+// Draw commands (APS5_PROFILE_GPU_DRAWS) by a mix of their vertex and pixel program addresses, with
+// the programs and the first pass seen; their ranges nest in the pass ranges and enter no other
+// total.
+constexpr std::uint64_t DrawProgramKey = 0x4;
+std::map<std::uint64_t, TimingTotals> timingDrawPrograms;
+std::map<std::uint64_t, std::string> timingDrawNames;
 
 bool DrawOrGpuProfiled() {
     static const bool profiled = std::getenv("APS5_PROFILE_DRAW") != nullptr || Recorder::GpuTimingEnabled();
@@ -1967,10 +2009,59 @@ std::uint32_t Recorder::beginTiming(std::uint64_t key) {
     const auto index = static_cast<std::uint32_t>(open->timedKeys.size());
     open->timedKeys.push_back(key);
     open->timedBytes.push_back(0);
+    open->timedTags.push_back(0);
+    open->timedDraws.push_back(0);
     // Both stamps wait for everything before them to complete, so the range is the timed work alone
     // (a top-of-pipe stamp is not held back by the barrier that precedes the work).
     context.Function<PFN_vkCmdWriteTimestamp>("vkCmdWriteTimestamp")(commands, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, open->queries, index * 2);
     return index;
+}
+
+std::uint32_t Recorder::BeginGpuTiming(CommandClass which, std::uint64_t tag, std::string_view name) {
+    const auto index = BeginGpuTiming(which);
+    if (index == NoTiming) return index;
+    open->timedTags[index] = tag;
+    std::lock_guard lock(timingMutex);
+    if (!timingPassNames.contains(tag)) timingPassNames.emplace(tag, name);
+    return index;
+}
+
+bool Recorder::SiteProbes() {
+    static const bool enabled = GpuTimingEnabled() && std::getenv("APS5_PROFILE_GPU_SITES") != nullptr;
+    return enabled;
+}
+
+bool Recorder::DrawProgramTiming() {
+    static const bool enabled = GpuTimingEnabled() && std::getenv("APS5_PROFILE_GPU_DRAWS") != nullptr;
+    return enabled;
+}
+
+std::uint32_t Recorder::BeginDrawTiming(std::uint64_t vertex, std::uint64_t pixel, std::string_view pass) {
+    // The pass's own range made the batch's query pool: a pool's reset cannot be recorded in a pass.
+    if (!DrawProgramTiming() || open == nullptr || open->queries == VK_NULL_HANDLE) return NoTiming;
+    const auto index = beginTiming(DrawProgramKey);
+    if (index == NoTiming) return index;
+    const auto tag = vertex * 0x9e3779b97f4a7c15ull ^ pixel;
+    open->timedTags[index] = tag;
+    std::lock_guard lock(timingMutex);
+    if (!timingDrawNames.contains(tag)) {
+        char name[160];
+        std::snprintf(name, sizeof(name), "vs 0x%llx ps 0x%llx (%.*s)", static_cast<unsigned long long>(vertex), static_cast<unsigned long long>(pixel), static_cast<int>(pass.size()), pass.data());
+        timingDrawNames.emplace(tag, name);
+    }
+    return index;
+}
+
+void Recorder::BeginSetupTiming(CommandClass which) {
+    if (!GpuTimingEnabled() || (which == CommandClass::DrawSetup && open != nullptr && open->renderPass.open)) return;
+    EndSetupTiming();
+    const auto index = BeginGpuTiming(which);
+    if (open != nullptr) open->setupTiming = index;
+}
+
+void Recorder::EndSetupTiming() {
+    if (open == nullptr || open->setupTiming == NoTiming) return;
+    EndGpuTiming(std::exchange(open->setupTiming, NoTiming));
 }
 
 void Recorder::EndGpuTiming(std::uint32_t index, std::uint64_t bytes) {
@@ -2403,7 +2494,15 @@ void Recorder::readGpuTiming(Batch& batch) {
     static auto lastReport = std::chrono::steady_clock::now();
     // The union of the timed ranges (class ranges nest program ranges: a copy's transfer inside
     // its class range) against the batch span gives what no range covers.
-    std::vector<std::pair<std::uint64_t, std::uint64_t>> intervals;
+    struct Interval {
+        std::uint64_t begin;
+        std::uint64_t end;
+        // The range as a neighbour of a gap: its class key, or TimingProgramKey.
+        std::uint64_t neighbour;
+        // Its own key (a program's address), for APS5_TRACE_GPU_GAPS.
+        std::uint64_t key;
+    };
+    std::vector<Interval> intervals;
     intervals.reserve(batch.timedKeys.size());
     std::unique_lock lock(timingMutex);
     for (std::size_t i = 0; i < batch.timedKeys.size(); ++i) {
@@ -2415,22 +2514,85 @@ void Recorder::readGpuTiming(Batch& batch) {
             timingBatchMs += ns / 1e6;
             continue;
         }
+        if (batch.timedKeys[i] == DrawProgramKey) {
+            auto& draw = timingDrawPrograms[batch.timedTags[i]];
+            ++draw.count;
+            draw.ms += ns / 1e6;
+            continue;
+        }
         const auto key = batch.timedKeys[i];
         auto& totals = timingByKey[key];
         ++totals.count;
         totals.ms += ns / 1e6;
         totals.bytes += batch.timedBytes[i];
-        (key >= ClassKey(CommandClass::DispatchLeading) && key < ClassKey(CommandClass::Count) ? timingClassMs : timingProgramMs) += ns / 1e6;
-        intervals.emplace_back(stamps[i * 2], stamps[i * 2 + 1]);
+        const bool classKey = key >= ClassKey(CommandClass::DispatchLeading) && key < ClassKey(CommandClass::Count);
+        (classKey ? timingClassMs : timingProgramMs) += ns / 1e6;
+        if (key == ClassKey(CommandClass::Draw)) {
+            auto& pass = timingPasses[batch.timedTags[i]];
+            ++pass.count;
+            pass.ms += ns / 1e6;
+            pass.draws += batch.timedDraws[i];
+        } else if (key == ClassKey(CommandClass::TextureUpload)) {
+            auto& upload = timingUploads[batch.timedTags[i]];
+            ++upload.count;
+            upload.ms += ns / 1e6;
+            upload.bytes += batch.timedBytes[i];
+        }
+        intervals.push_back({stamps[i * 2], stamps[i * 2 + 1], classKey ? key : TimingProgramKey, key});
     }
-    std::sort(intervals.begin(), intervals.end());
+    std::sort(intervals.begin(), intervals.end(), [](const Interval& a, const Interval& b) { return a.begin < b.begin; });
     std::uint64_t coveredTicks = 0, unionEnd = 0;
-    for (const auto& [begin, end] : intervals) {
-        const auto from = std::max(begin, unionEnd);
-        if (end > from) coveredTicks += end - from;
-        unionEnd = std::max(unionEnd, end);
+    for (const auto& interval : intervals) {
+        const auto from = std::max(interval.begin, unionEnd);
+        if (interval.end > from) coveredTicks += interval.end - from;
+        unionEnd = std::max(unionEnd, interval.end);
     }
     timingUnionMs += static_cast<double>(coveredTicks) * period / 1e6;
+    // The gaps no range covers, from the batch's first command to its last, by the ranges before
+    // and after them.
+    if (batch.batchTiming < batch.timedKeys.size()) {
+        auto cursor = stamps[batch.batchTiming * 2];
+        auto before = TimingStartKey;
+        // APS5_TRACE_GPU_GAPS=<n>: the first n gaps of 0.25 ms or more, with the ranges around them.
+        static std::atomic<int> gapTraces{[] {
+            const char* text = std::getenv("APS5_TRACE_GPU_GAPS");
+            return text != nullptr ? std::atoi(text) : 0;
+        }()};
+        const auto batchBegin = stamps[batch.batchTiming * 2];
+        const auto traceGap = [&](std::size_t next, double ms) {
+            if (ms < 0.25 || gapTraces.load(std::memory_order_relaxed) <= 0 || gapTraces.fetch_sub(1, std::memory_order_relaxed) <= 0) return;
+            std::string text;
+            for (auto i = next > 6 ? next - 6 : 0; i < intervals.size() && i < next + 3; ++i) {
+                const auto& range = intervals[i];
+                const auto key = range.key;
+                char name[32];
+                if (key >= ClassKey(CommandClass::DispatchLeading) && key < ClassKey(CommandClass::Count)) std::snprintf(name, sizeof(name), "%s", CommandClassNames[key - ClassKey(CommandClass::DispatchLeading)]);
+                else std::snprintf(name, sizeof(name), "0x%llx", static_cast<unsigned long long>(key));
+                char item[96];
+                std::snprintf(item, sizeof(item), "%s %s@%.0fus+%.0fus", i == next ? " | GAP |" : "", name, static_cast<double>(range.begin - batchBegin) * period / 1e3, static_cast<double>(range.end - range.begin) * period / 1e3);
+                text += item;
+            }
+            std::fprintf(stderr, "[gpugap] %.2f ms before range %zu of %zu:%s\n", ms, next, intervals.size(), text.c_str());
+        };
+        std::size_t next = 0;
+        const auto gap = [&](std::uint64_t until, std::uint64_t after) {
+            if (until <= cursor) return;
+            auto& totals = timingGaps[{before, after}];
+            ++totals.count;
+            const auto ms = static_cast<double>(until - cursor) * period / 1e6;
+            totals.ms += ms;
+            traceGap(next, ms);
+        };
+        for (const auto& interval : intervals) {
+            gap(interval.begin, interval.neighbour);
+            ++next;
+            if (interval.end > cursor) {
+                cursor = interval.end;
+                before = interval.neighbour;
+            }
+        }
+        gap(stamps[batch.batchTiming * 2 + 1], TimingEndKey);
+    }
     ++timingBatches;
     const auto now = std::chrono::steady_clock::now();
     if (now - lastReport < std::chrono::seconds(10)) return;
@@ -2451,8 +2613,60 @@ void Recorder::readGpuTiming(Batch& batch) {
     std::sort(hot.begin(), hot.end(), [](const auto& a, const auto& b) { return a.second.ms > b.second.ms; });
     // The first field stays the program sum: the measure scripts match on it.
     AgcDriver::ProfilePrint_nid_no_patch("[gputime] %.0f ms of GPU time in %llu batches over 10 s (batch %.0f ms first to last command; classes %.0f ms, all ranges %.0f ms, untimed %.0f ms outside every range; %llu presents; %llu ranges dropped at the %u cap); by program:", timingProgramMs, static_cast<unsigned long long>(timingBatches), timingBatchMs, timingClassMs, timingUnionMs, timingBatchMs - timingUnionMs, static_cast<unsigned long long>(presents), static_cast<unsigned long long>(timingDropped.exchange(0, std::memory_order_relaxed)), MaxTimedRanges);
-    for (std::size_t i = 0; i < hot.size() && i < 12; ++i) AgcDriver::ProfilePrint_nid_no_patch(" 0x%llx x%llu %.0fms", static_cast<unsigned long long>(hot[i].first), static_cast<unsigned long long>(hot[i].second.count), hot[i].second.ms);
+    for (std::size_t i = 0; i < hot.size() && i < (SiteProbes() ? 32u : 12u); ++i) AgcDriver::ProfilePrint_nid_no_patch(" 0x%llx x%llu %.0fms", static_cast<unsigned long long>(hot[i].first), static_cast<unsigned long long>(hot[i].second.count), hot[i].second.ms);
+    if (SiteProbes()) AgcDriver::ProfilePrint_nid_no_patch(" (sites: Recorder::SiteProbes at 0x%llx)", static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(&Recorder::SiteProbes)));
     AgcDriver::ProfilePrint_nid_no_patch("; by class:%s\n", classes.c_str());
+    const auto neighbourName = [](std::uint64_t key) -> const char* {
+        if (key == TimingStartKey) return "start";
+        if (key == TimingEndKey) return "end";
+        if (key == TimingProgramKey) return "program";
+        return CommandClassNames[key - ClassKey(CommandClass::DispatchLeading)];
+    };
+    std::vector<std::pair<std::pair<std::uint64_t, std::uint64_t>, GapTotals>> gaps(timingGaps.begin(), timingGaps.end());
+    std::sort(gaps.begin(), gaps.end(), [](const auto& a, const auto& b) { return a.second.ms > b.second.ms; });
+    std::string gapText;
+    for (std::size_t i = 0; i < gaps.size() && i < 10; ++i) {
+        char text[128];
+        std::snprintf(text, sizeof(text), " %s->%s x%.1f %.2fms", neighbourName(gaps[i].first.first), neighbourName(gaps[i].first.second), static_cast<double>(gaps[i].second.count) * perPresent, gaps[i].second.ms * perPresent);
+        gapText += text;
+    }
+    AgcDriver::ProfilePrint_nid_no_patch("[gputime] untimed gaps by the ranges around them (before->after, per present):%s\n", gapText.c_str());
+    std::vector<std::pair<std::uint64_t, PassTotals>> passes(timingPasses.begin(), timingPasses.end());
+    std::sort(passes.begin(), passes.end(), [](const auto& a, const auto& b) { return a.second.ms > b.second.ms; });
+    std::string passText;
+    for (std::size_t i = 0; i < passes.size() && i < 12; ++i) {
+        const auto named = timingPassNames.find(passes[i].first);
+        char text[192];
+        std::snprintf(text, sizeof(text), " 0x%llx (%s) x%.1f %.2fms %.1f draws;", static_cast<unsigned long long>(passes[i].first), named != timingPassNames.end() ? named->second.c_str() : "?", static_cast<double>(passes[i].second.count) * perPresent, passes[i].second.ms * perPresent, static_cast<double>(passes[i].second.draws) * perPresent);
+        passText += text;
+    }
+    AgcDriver::ProfilePrint_nid_no_patch("[gputime] draw passes by first color target (the depth target without one), costliest first (per present: passes, GPU time, draws):%s\n", passText.c_str());
+    if (DrawProgramTiming()) {
+        std::vector<std::pair<std::uint64_t, TimingTotals>> draws(timingDrawPrograms.begin(), timingDrawPrograms.end());
+        std::sort(draws.begin(), draws.end(), [](const auto& a, const auto& b) { return a.second.ms > b.second.ms; });
+        std::string drawText;
+        for (std::size_t i = 0; i < draws.size() && i < 20; ++i) {
+            const auto named = timingDrawNames.find(draws[i].first);
+            char text[224];
+            std::snprintf(text, sizeof(text), " %s x%.1f %.3fms;", named != timingDrawNames.end() ? named->second.c_str() : "?", static_cast<double>(draws[i].second.count) * perPresent, draws[i].second.ms * perPresent);
+            drawText += text;
+        }
+        AgcDriver::ProfilePrint_nid_no_patch("[gputime] draws by vertex and pixel program, costliest first (per present: draws, GPU time):%s\n", drawText.c_str());
+    }
+    std::vector<std::pair<std::uint64_t, TimingTotals>> uploads(timingUploads.begin(), timingUploads.end());
+    std::sort(uploads.begin(), uploads.end(), [](const auto& a, const auto& b) { return a.second.ms > b.second.ms; });
+    std::string uploadText;
+    for (std::size_t i = 0; i < uploads.size() && i < 8; ++i) {
+        const auto named = timingPassNames.find(uploads[i].first);
+        char text[192];
+        std::snprintf(text, sizeof(text), " 0x%llx (%s) x%.1f %.2fms %.1fMiB;", static_cast<unsigned long long>(uploads[i].first), named != timingPassNames.end() ? named->second.c_str() : "?", static_cast<double>(uploads[i].second.count) * perPresent, uploads[i].second.ms * perPresent, uploads[i].second.bytes / 1048576.0 * perPresent);
+        uploadText += text;
+    }
+    AgcDriver::ProfilePrint_nid_no_patch("[gputime] sampled texture uploads by texture, costliest first (per present: uploads, GPU time, guest MiB):%s\n", uploadText.c_str());
+    timingGaps.clear();
+    timingPasses.clear();
+    timingUploads.clear();
+    timingDrawPrograms.clear();
     timingByKey.clear();
     timingProgramMs = timingClassMs = timingUnionMs = timingBatchMs = 0;
     timingBatches = 0;
@@ -2521,6 +2735,7 @@ template <typename Entries>
 void Recorder::eraseDrawSnapshot(Entries& entries, typename Entries::iterator entry) {
     auto& pool = drawSnapshotPools[SnapshotPool(std::get<1>(entry->first))];
     if (entry->second.buffer != nullptr) pool.bytes -= std::get<2>(entry->first);
+    if (entry->second.device != nullptr) drawInputMirrorBytes -= std::get<2>(entry->first);
     pool.recency.erase(entry->second.recent);
     entries.erase(entry);
 }
@@ -2543,7 +2758,10 @@ std::shared_ptr<Buffer> Recorder::ReusableDrawSnapshot(std::uint64_t address, st
         auto& recency = drawSnapshotPools[SnapshotPool(use)].recency;
         recency.splice(recency.end(), recency, found->second.recent);
         if (derived != nullptr) *derived = found->second.derived;
-        return found->second.buffer;
+        static const bool mirrors = std::getenv("APS5_NO_INPUT_MIRRORS") == nullptr;
+        if (use == SnapshotUse::Storage || !mirrors) return found->second.buffer;
+        if (found->second.device == nullptr) found->second.device = mirrorDrawInput(found->second.buffer, std::get<2>(found->first));
+        return found->second.device != nullptr ? found->second.device : found->second.buffer;
     };
     if (use == SnapshotUse::Vertex) {
         const auto found = vertexSnapshots.lower_bound({address, use, bytes});
@@ -2623,14 +2841,33 @@ void Recorder::KeepDrawSnapshot(std::uint64_t address, std::size_t bytes, std::u
     pool.bytes += keptBytes;
 }
 
+std::shared_ptr<Buffer> Recorder::mirrorDrawInput(const std::shared_ptr<Buffer>& host, std::size_t bytes) {
+    if (drawInputMirrorBytes + bytes > DrawInputMirrorBudget) return nullptr;
+    auto device = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    // Recording ends an open render pass: the draw begins its own, whose leading barrier covers
+    // vertex and index reads, but the copy's barrier is its own for any later reader.
+    const auto timing = BeginGpuTiming(CommandClass::InputMirror);
+    const auto commands = Commands();
+    CopyBuffer(context, commands, host->Handle(), 0, device->Handle(), 0, bytes);
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_VERTEX_INPUT_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_INDEX_READ_BIT);
+    CountBarriers(CommandClass::InputMirror);
+    EndGpuTiming(timing, bytes);
+    // The snapshot may leave the cache before the copy runs.
+    Keep(host);
+    drawInputMirrorBytes += bytes;
+    return device;
+}
+
 std::pair<std::size_t, std::size_t> Recorder::DrawSnapshotPoolUse(SnapshotUse use) const {
     const auto& pool = drawSnapshotPools[SnapshotPool(use)];
     return {pool.recency.size(), pool.bytes};
 }
 
 Recorder::UploadSlice Recorder::DrawUpload(std::size_t bytes) {
+    // A power of two (Vulkan requires it of the limit): a mask rounds up, where a division was a
+    // visible share of the per-draw work.
     const VkDeviceSize alignment = std::max<VkDeviceSize>(context.limits.minStorageBufferOffsetAlignment, 16);
-    auto offset = (drawUploadUsed + alignment - 1) / alignment * alignment;
+    auto offset = (drawUploadUsed + alignment - 1) & ~(alignment - 1);
     if (drawUpload == nullptr || offset + bytes > drawUpload->Bytes().size()) {
         drawUpload = std::make_shared<Buffer>(context, std::max(DrawUploadChunk, bytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
         offset = 0;
@@ -2766,7 +3003,20 @@ bool Recorder::OpenWriteOverlaps(std::uint64_t address, std::size_t bytes) const
 }
 
 bool Recorder::signaled(const Batch& batch) const {
-    return batch.submitted && fenceStatus(batch.fence) == VK_SUCCESS;
+    return batch.submitted && gpuDone(batch);
+}
+
+std::uint64_t Recorder::readTimeline() const {
+    // A failed read (a lost device) leaves the value: nothing more counts as done, and the next
+    // wait reports the failure.
+    std::uint64_t value = 0;
+    if (function(getSemaphoreCounterValue, "vkGetSemaphoreCounterValueKHR")(context.device, timeline, &value) == VK_SUCCESS && value > reachedSerial) reachedSerial = value;
+    return reachedSerial;
+}
+
+bool Recorder::gpuDone(const Batch& batch) const {
+    if (!fenceless) return fenceStatus(batch.fence) == VK_SUCCESS;
+    return batch.serial != 0 && (batch.serial <= reachedSerial || batch.serial <= readTimeline());
 }
 
 bool Recorder::PendingWriteSettled(std::uint64_t address, std::size_t bytes) const {
@@ -2907,8 +3157,8 @@ std::optional<Recorder::PendingWriteInfo> Recorder::DescribePendingWrite(std::ui
     for (auto it = inFlight.rbegin(); it != inFlight.rend(); ++it, --finished) {
         const auto* range = firstOverlap(**it);
         if (range == nullptr) continue;
-        // In flight means submitted, so the fence is live; signaled = the GPU already ran it.
-        const bool signaled = fenceStatus((*it)->fence) == VK_SUCCESS;
+        // In flight means submitted; signaled = the GPU already ran it.
+        const bool signaled = gpuDone(**it);
         if (syncAll) return PendingWriteInfo{submissions + (open != nullptr ? 1 : 0), open != nullptr, signaled, range->first, range->second, allBatches};
         return PendingWriteInfo{(*it)->serial, false, signaled, range->first, range->second, finished};
     }
@@ -3052,7 +3302,7 @@ std::optional<Recorder::LabelHit> Recorder::lookupLabel(std::uint64_t address, s
 
 bool Recorder::unsignaled(std::uint64_t serial) const {
     for (const auto& batch : inFlight) {
-        if (batch->serial == serial) return fenceStatus(batch->fence) != VK_SUCCESS;
+        if (batch->serial == serial) return !gpuDone(*batch);
     }
     return false;
 }
@@ -3175,6 +3425,8 @@ void Recorder::Submit() {
         recordBarrier(open->commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
         CountBarriers(CommandClass::Draw);
     }
+    EndSetupTiming();
+    if (open->siteTiming != NoTiming) EndGpuTiming(std::exchange(open->siteTiming, NoTiming));
     EndGpuTiming(open->batchTiming);
     if (!GpuTimingEnabled()) reportBarriers();
     if (FlipReadCheck()) {
@@ -3199,7 +3451,11 @@ void Recorder::Submit() {
         submission.pSignalSemaphores = &timeline;
     }
     const auto submitStart = DrawProfiled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-    Check(function(queueSubmit, "vkQueueSubmit")(context.queue, 1, &submission, batch->fence), "vkQueueSubmit recorder");
+    {
+        // The presenter may be queueing a presentation without the GpuMutex (GuestMemory::QueueMutex).
+        std::lock_guard queue(GuestMemory::QueueMutex());
+        Check(function(queueSubmit, "vkQueueSubmit")(context.queue, 1, &submission, batch->fence), "vkQueueSubmit recorder");
+    }
     batch->submitted = true;
     batch->serial = ++submissions;
     batch->submittedAt = std::chrono::steady_clock::now();
@@ -3270,7 +3526,7 @@ void Recorder::WaitSerial(std::uint64_t serial) {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const UnlockedWaiter waiter{id};
-    const auto result = WaitTimeline(context.device, timeline, context.Function<PFN_vkWaitSemaphoresKHR>("vkWaitSemaphoresKHR"), serial);
+    const auto result = WaitTimeline(context.device, timeline, function(waitSemaphores, "vkWaitSemaphoresKHR"), serial);
     if (profile) {
         unlockedWaits.fetch_add(1, std::memory_order_relaxed);
         unlockedWaitedUs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count()), std::memory_order_relaxed);
@@ -3473,7 +3729,7 @@ bool Recorder::syncThroughUnlocked(std::uint64_t address, std::uint64_t end, int
     const auto myId = id;
     const auto device = context.device;
     const auto semaphore = timeline;
-    const auto waitSemaphores = context.Function<PFN_vkWaitSemaphoresKHR>("vkWaitSemaphoresKHR");
+    const auto wait = function(waitSemaphores, "vkWaitSemaphoresKHR");
     // The site entry is taken under the mutex (the table is only touched under it; entries are
     // appended, never removed, so the index stays valid across the release).
     const RestoreSyncSite restoreSite{BeginSyncSite(source, site)};
@@ -3486,12 +3742,11 @@ bool Recorder::syncThroughUnlocked(std::uint64_t address, std::uint64_t end, int
     std::chrono::steady_clock::time_point targetSubmittedAt{};
     std::map<std::uint32_t, std::uint64_t> aheadByQueue;
     if (profile || trace) {
-        const auto status = context.Function<PFN_vkGetFenceStatus>("vkGetFenceStatus");
         for (const auto& batch : inFlight) {
             if (batch->serial > targetSerial) break;
             ++batchesToTarget;
             ++aheadByQueue[batch->queue];
-            if (status(context.device, batch->fence) != VK_SUCCESS) ++unsignaledAtStart;
+            if (!gpuDone(*batch)) ++unsignaledAtStart;
             if (batch->serial != targetSerial) continue;
             targetSubmittedAt = batch->submittedAt;
             targetRanges = batch->writes.size();
@@ -3511,7 +3766,7 @@ bool Recorder::syncThroughUnlocked(std::uint64_t address, std::uint64_t end, int
         // Registered before the release: a teardown can only start once the mutex is free.
         const UnlockedWaiter waiter{myId};
         mutex.unlock();
-        result = WaitTimeline(device, semaphore, waitSemaphores, targetSerial);
+        result = WaitTimeline(device, semaphore, wait, targetSerial);
         // Read before the relock: the GPU wait, not the wait for the mutex behind it.
         if (profile || trace) waited = std::chrono::steady_clock::now();
     }
@@ -3576,8 +3831,10 @@ bool Recorder::Reap() {
     const bool profile = DrawProfiled();
     const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     std::uint64_t retired = 0;
+    // Fenceless, one timeline read answers for every batch (a fence query each otherwise).
+    if (fenceless && !inFlight.empty() && inFlight.back()->serial > reachedSerial) readTimeline();
     while (!inFlight.empty()) {
-        if (fenceStatus(inFlight.front()->fence) != VK_SUCCESS) break;
+        if (fenceless ? inFlight.front()->serial > reachedSerial : fenceStatus(inFlight.front()->fence) != VK_SUCCESS) break;
         auto batch = std::move(inFlight.front());
         inFlight.pop_front();
         finish(std::move(batch), false, 4);
@@ -3621,9 +3878,9 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
         static std::uint64_t waits = 0;
         static auto lastReport = std::chrono::steady_clock::now();
         const auto waitStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-        // A fence still unsignaled here makes this a real GPU wait under the mutex (finish runs
+        // A batch not yet completed here makes this a real GPU wait under the mutex (finish runs
         // under it): the [lock] line's 'locked GPU waits'.
-        const bool signaledAtStart = !profile || context.Function<PFN_vkGetFenceStatus>("vkGetFenceStatus")(context.device, batch->fence) == VK_SUCCESS;
+        const bool signaledAtStart = !profile || gpuDone(*batch);
         struct Report {
             bool enabled;
             int source;
@@ -3651,20 +3908,32 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
                 }
             }
         } report{profile, source, waitStart, *this, signaledAtStart};
-        const auto waitFences = function(waitForFences, "vkWaitForFences");
-        auto result = waitFences(context.device, 1, &batch->fence, VK_TRUE, 5'000'000'000ull);
-        for (int waited = 5; result == VK_TIMEOUT; waited += 5) {
-            // A batch still running after 5 s is reported (every 5 s) so a GPU-side hang is visible.
-            std::fprintf(stderr, "[gpu] recorded batch still running on the GPU after %d s\n", waited);
+        VkResult result = VK_SUCCESS;
+        if (fenceless) {
+            // One read answers for a run of completed batches (FinishUpTo, Sync); the timeline wait
+            // reports a hung batch every 5 s as well.
+            if (batch->serial > reachedSerial && batch->serial > readTimeline()) result = WaitTimeline(context.device, timeline, function(waitSemaphores, "vkWaitSemaphoresKHR"), batch->serial);
+            if (result == VK_SUCCESS) reachedSerial = std::max(reachedSerial, batch->serial);
+        } else {
+            const auto waitFences = function(waitForFences, "vkWaitForFences");
             result = waitFences(context.device, 1, &batch->fence, VK_TRUE, 5'000'000'000ull);
+            for (int waited = 5; result == VK_TIMEOUT; waited += 5) {
+                // A batch still running after 5 s is reported (every 5 s) so a GPU-side hang is visible.
+                std::fprintf(stderr, "[gpu] recorded batch still running on the GPU after %d s\n", waited);
+                result = waitFences(context.device, 1, &batch->fence, VK_TRUE, 5'000'000'000ull);
+            }
         }
         if (result != VK_SUCCESS && result != VK_ERROR_DEVICE_LOST) {
-            const auto idle = context.Function<PFN_vkDeviceWaitIdle>("vkDeviceWaitIdle")(context.device);
+            VkResult idle;
+            {
+                std::lock_guard queue(GuestMemory::QueueMutex());
+                idle = context.Function<PFN_vkDeviceWaitIdle>("vkDeviceWaitIdle")(context.device);
+            }
             Check(idle, "vkDeviceWaitIdle after recorder fence failure");
         }
         if (result != VK_SUCCESS) {
             release(*batch);
-            Check(result, "vkWaitForFences recorder");
+            Check(result, fenceless ? "vkWaitSemaphoresKHR recorder" : "vkWaitForFences recorder");
         }
     }
     readGpuTiming(*batch);
@@ -3759,9 +4028,10 @@ void Recorder::release(Batch& batch) noexcept {
     batch.samplePool.reset();
     batch.segments = VK_NULL_HANDLE;
     batch.segmentPool.reset();
-    // A completed (or never submitted) batch's objects are kept for reuse: the fence is signaled or
-    // untouched, so resetting it cannot block, and the command buffer is no longer pending.
-    if (batch.commands != VK_NULL_HANDLE && batch.fence != VK_NULL_HANDLE && spare.size() < 64 && function(resetFences, "vkResetFences")(context.device, 1, &batch.fence) == VK_SUCCESS) {
+    // A completed (or never submitted) batch's objects are kept for reuse: the fence (none when
+    // fenceless) is signaled or untouched, so resetting it cannot block, and the command buffer is
+    // no longer pending.
+    if (batch.commands != VK_NULL_HANDLE && (fenceless || batch.fence != VK_NULL_HANDLE) && spare.size() < 64 && (batch.fence == VK_NULL_HANDLE || function(resetFences, "vkResetFences")(context.device, 1, &batch.fence) == VK_SUCCESS)) {
         spare.emplace_back(batch.commands, batch.fence);
         batch.commands = VK_NULL_HANDLE;
         batch.fence = VK_NULL_HANDLE;

@@ -95,6 +95,16 @@ bool StoredOver(std::uint64_t address, std::size_t bytes, std::uint64_t generati
 // workers bump before every packet as before. CollectEpochBumps counts the bumps ([guestmem] line).
 void BumpCollectEpoch();
 std::uint64_t CollectEpoch();
+// The calling thread's epoch (0 if it never bumped), and taking a given one: a queue's draw back
+// thread records each draw in the epoch its worker prepared it in, as the worker would have.
+std::uint64_t ThreadCollectEpoch();
+void AdoptCollectEpoch(std::uint64_t epoch);
+// The worker's collect memo for its draw thread: ShareCollectMemo, on the worker, returns its ring
+// (both threads lock it from then on), AdoptCollectMemo has the calling thread use that ring. The
+// worker's walks then serve the draw thread's checks; separate rings made its draws copy buffers
+// the worker's walks had already found unwritten. The ring lives until the worker exits.
+void* ShareCollectMemo();
+void AdoptCollectMemo(void* memo);
 std::uint64_t CollectEpochBumps();
 std::uint64_t CollectWritesUncached(std::uint64_t address, std::size_t bytes);
 // The tracker's current generation (every collect and MarkWritten bumps it): a stamp taken after
@@ -149,10 +159,47 @@ private:
     std::uint32_t depth = 0;
 };
 GpuMutexType& GpuMutex();
+// Host access to the device's queue: vkQueueSubmit, vkQueueWaitIdle, vkDeviceWaitIdle and
+// vkQueuePresentKHR must not overlap (Vulkan's external synchronization), so each call holds this
+// mutex around just that call. A thread holding GpuMutex may take it, never the other way around:
+// the presenter takes it before it gives up GpuMutex and queues its presentation holding only this
+// one, so the presentation stays right behind its blit while draws go on. Recursive: that release
+// runs the unlock hook (SetGpuUnlockHook) on the presenter, and an object it destroys there may
+// reach the queue.
+class QueueMutexType {
+public:
+    void lock() noexcept {
+        if (owner.load(std::memory_order_relaxed) == CurrentThreadToken()) {
+            ++depth;
+            return;
+        }
+        mutex.lock();
+        owner.store(CurrentThreadToken(), std::memory_order_relaxed);
+        depth = 1;
+    }
+
+    void unlock() noexcept {
+        if (--depth != 0) return;
+        owner.store(nullptr, std::memory_order_relaxed);
+        mutex.unlock();
+    }
+
+private:
+    Mutex mutex;
+    // The holder's thread token and recursion depth, written by the holder only.
+    std::atomic<const void*> owner{nullptr};
+    std::uint32_t depth = 0;
+};
+QueueMutexType& QueueMutex();
 // Called on the thread that just gave up its outermost hold, right after the mutex was released:
 // work the hold deferred to run without it (the recorder's release of the objects completed batches
 // kept). One hook, set once; it must not take GpuMutex itself.
 void SetGpuUnlockHook(void (*hook)());
+// A queue worker whose draws a back thread records (the driver's DrawThread): before it takes
+// GpuMutex (outermost acquisitions only) `drain` waits until the back thread has recorded every
+// draw handed to it, so nothing the worker records lands ahead of them, and its tries fail while
+// `busy` says a draw is still in flight. One such thread at a time; a null `thread` clears it.
+void SetGpuLockFront(const void* thread, bool (*busy)(void*), void (*drain)(void*), void* context);
 // Debug aid (APS5_ASSERT_GPU_LOCK=1): aborts with a [lock] line naming `where` when the calling
 // thread does not hold GpuMutex. Recording, submits, command batches and the detiler's pools must
 // only be reached under it (a resource build's stage A runs without it, see ShaderResources).

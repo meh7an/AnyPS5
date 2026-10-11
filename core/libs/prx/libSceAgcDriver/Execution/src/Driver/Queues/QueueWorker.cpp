@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawThread.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/WorkerAffinity.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/WaitMemory.hpp"
@@ -74,6 +75,20 @@ void Driver::run(std::uint32_t id) noexcept {
 
     GuestMemory::TagGpuLockThread(id);
     if (id == 0) StartWorkerSampler();
+    // Queue 0's draw back thread records the draws this worker prepares (APS5_NO_DRAW_THREAD=1: none).
+    std::unique_ptr<DrawThread> back;
+    if (id == 0 && DrawThread::Enabled()) {
+        back = std::make_unique<DrawThread>(id);
+        back->collectMemo = GuestMemory::ShareCollectMemo();
+        back->thread = std::thread([this, thread = back.get()] { runDrawThread(*thread); });
+        back->AttachFront();
+    }
+    struct BackStop {
+        std::unique_ptr<DrawThread>& back;
+        ~BackStop() {
+            if (back != nullptr) back->Stop();
+        }
+    } backStop{back};
     Submission submission;
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     auto& costs = submissionCosts(id);

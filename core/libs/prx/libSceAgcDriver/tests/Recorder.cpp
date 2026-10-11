@@ -93,6 +93,15 @@ void ReleaseWatched(void* block, std::size_t bytes) {
 #endif
 }
 
+// A draw's own set the way a recorded draw makes one: its bindings held by an object kept in the
+// recorder's open batch first. Null when the object's set serves the draw as it is.
+std::shared_ptr<ShaderResources::DrawBindings> PrepareDrawBindings(const ShaderResources& resources, Recorder& recorder, std::span<const ShaderResources::MovedBuffer> moved = {}) {
+    auto bindings = std::make_shared<ShaderResources::DrawBindings>();
+    recorder.Keep(bindings);
+    if (!resources.PrepareDrawBindings(recorder, moved, *bindings)) return nullptr;
+    return bindings;
+}
+
 // A compute-capable device with host imports (VK_EXT_external_memory_host) when the host offers
 // them, as the driver creates its own; the recorder's batches need a real queue and real fences.
 class Device {
@@ -232,6 +241,20 @@ public:
                 robustness.pNext = address.pNext;
                 address.pNext = &robustness;
             }
+            // Timeline semaphores when offered, for the fenceless recorder (timelineTests).
+            VkPhysicalDeviceTimelineSemaphoreFeaturesKHR timelineFeatures{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES_KHR};
+            if (hasExtension(VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME)) {
+                VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &timelineFeatures};
+                function<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(context.physical, &features);
+                timeline = timelineFeatures.timelineSemaphore == VK_TRUE;
+            }
+            timelineFeatures = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES_KHR};
+            timelineFeatures.timelineSemaphore = VK_TRUE;
+            if (timeline) {
+                extensionsEnabled.push_back(VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME);
+                timelineFeatures.pNext = address.pNext;
+                address.pNext = &timelineFeatures;
+            }
             VkDeviceCreateInfo device{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &address};
             device.queueCreateInfoCount = 1;
             device.pQueueCreateInfos = &queue;
@@ -262,6 +285,7 @@ public:
     bool NullDescriptors() const { return nullDescriptors; }
     const Context& GetContext() const { return context; }
     bool Graphics() const { return graphics; }
+    bool Timeline() const { return timeline; }
     void WaitQueue() const { Check(context.Function<PFN_vkQueueWaitIdle>("vkQueueWaitIdle")(context.queue), "vkQueueWaitIdle"); }
 
 private:
@@ -289,6 +313,7 @@ private:
     Context context{};
     bool graphics = false;
     bool nullDescriptors = false;
+    bool timeline = false;
 };
 
 using Kind = Recorder::ReadKind;
@@ -337,6 +362,43 @@ void writeSettledTests(const Device& device, Recorder& recorder) {
     Require(!recorder.PendingWriteSettled(0x50000, 0x100) && recorder.PendingWriteSettled(0x50000, 0x80), "a later open write over the range still counts as settled");
     recorder.Sync();
     Require(recorder.Idle() && !recorder.PendingWriteOverlaps(0x50000, 0x100), "writes outlived their batches");
+}
+
+// A recorder with a timeline has fenceless batches: a batch completed when the timeline reached its
+// serial, which the settled and signaled queries, Reap, the waits of Sync and FinishUpTo and the
+// pooled command buffers go by.
+void timelineTests(const Device& device) {
+    if (!device.Timeline()) {
+        std::cout << "no timeline semaphores: fenceless batches untested\n";
+        return;
+    }
+    Recorder recorder(device.GetContext(), true);
+    Require(recorder.HasTimeline(), "the recorder made no timeline");
+    recorder.NotePendingWrite(0x60000, 0x100);
+    recorder.Submit();
+    device.WaitQueue();
+    Require(recorder.PendingWriteSettled(0x60000, 0x100) && recorder.UnsignaledBatches() == 0, "a completed fenceless batch is not settled");
+    Require(!recorder.Idle(), "a settled query reaped the fenceless batch");
+    Require(recorder.Reap() && recorder.Idle() && !recorder.PendingWriteOverlaps(0x60000, 0x100), "Reap left a completed fenceless batch in flight");
+    for (std::uint64_t i = 0; i < 3; ++i) {
+        recorder.NotePendingWrite(0x60000 + 0x100 * i, 0x100);
+        recorder.Submit();
+    }
+    recorder.Sync();
+    Require(recorder.Idle() && !recorder.PendingWriteOverlaps(0x60000, 0x300), "Sync left fenceless batches in flight");
+    recorder.NotePendingWrite(0x60000, 0x100);
+    const auto serial = recorder.SubmitAndEpoch();
+    recorder.WaitSerial(serial);
+    recorder.FinishUpTo(serial);
+    Require(recorder.Idle(), "FinishUpTo left a fenceless batch in flight");
+    // A run of batches reuses the pooled command buffers.
+    for (int i = 0; i < 200; ++i) {
+        recorder.NotePendingWrite(0x60000, 0x10);
+        recorder.Submit();
+        recorder.Reap();
+    }
+    recorder.Sync();
+    Require(recorder.Idle() && recorder.Submissions() == 205, "a run of fenceless batches did not complete");
 }
 
 // Completion counting: a write-back completion (OnComplete) is pending until its batch finished;
@@ -1185,10 +1247,10 @@ void resourceReadTests(const Device& device, Recorder& recorder) {
         Recorder snapshotRecorder(snapshotContext);
         snapshotRecorder.Activate();
         ShaderResources resources(snapshotContext, compute);
-        auto first = resources.PrepareDrawBindings(snapshotRecorder);
+        auto first = PrepareDrawBindings(resources, snapshotRecorder);
         Require(first != nullptr && first->snapshots.size() == 1, "read-only draw input was not snapshotted");
         std::memset(reinterpret_cast<void*>(element), 0x22, elementBytes);
-        auto second = resources.PrepareDrawBindings(snapshotRecorder);
+        auto second = PrepareDrawBindings(resources, snapshotRecorder);
         Require(second != nullptr && second->snapshots.size() == 1, "cached draw input was not snapshotted again");
         Require(first->allocation.set != second->allocation.set, "in-flight draws share mutable descriptor bindings");
         std::memset(reinterpret_cast<void*>(element), 0x33, elementBytes);
@@ -1211,7 +1273,7 @@ void resourceReadTests(const Device& device, Recorder& recorder) {
         Require(std::all_of(contents.begin(), contents.begin() + elementBytes, [](std::byte value) { return value == std::byte{0x11}; }), "first draw observed overwritten input");
         Require(std::all_of(contents.begin() + elementBytes, contents.end(), [](std::byte value) { return value == std::byte{0x22}; }), "second draw observed overwritten input");
         snapshotRecorder.NotePendingWrite(element, elementBytes);
-        Require(resources.PrepareDrawBindings(snapshotRecorder) == nullptr, "GPU-produced input was replaced with stale CPU memory");
+        Require(PrepareDrawBindings(resources, snapshotRecorder) == nullptr, "GPU-produced input was replaced with stale CPU memory");
         snapshotRecorder.Sync();
     }
     Require(snapshotLifetime.expired(), "draw snapshots outlived their recorder");
@@ -1370,9 +1432,9 @@ void misalignedRegionTests(const Device& device, Recorder& recorder) {
         const auto adjustment = static_cast<std::uint32_t>(push[0]);
         Require(adjustment == (view - import->base) % alignment, "the misaligned region's push constant offset is not its distance from the aligned binding offset");
         const auto check = [&] {
-            const auto bindings = resources.PrepareDrawBindings(regionRecorder);
+            const auto bindings = PrepareDrawBindings(resources, regionRecorder);
             Require(bindings != nullptr && bindings->snapshots.size() == 1, "the read-only misaligned draw input was not snapshotted");
-            const auto contents = bindings->snapshots.front().buffer->Bytes();
+            const auto contents = bindings->snapshots.front().Bytes();
             Require(bindings->snapshots.front().address == view - adjustment && contents.size() == adjustment + elementBytes, "the draw snapshot does not start at the aligned offset below the view");
             Require(std::memcmp(contents.data() + adjustment, guest + offset, elementBytes) == 0, "the shader's patched offset into the draw snapshot misses the view's bytes");
         };
@@ -1454,7 +1516,7 @@ void misalignedSnapshotTests(const Device& device, Recorder& recorder) {
         resources.PatchPushConstants(push);
         const auto adjustment = std::to_integer<std::uint32_t>(push[1]);
         Require(push[0] == std::byte{0} && adjustment == offset % alignment, "the inner view's shader offset is not its distance from the binding");
-        const auto bindings = resources.PrepareDrawBindings(snapshotRecorder);
+        const auto bindings = PrepareDrawBindings(resources, snapshotRecorder);
         Require(bindings != nullptr && bindings->snapshots.size() == 2, "read-only draw inputs were not snapshotted");
         const auto outerContents = bindings->snapshots[0].Bytes();
         Require(outerContents.size() >= outerBytes && std::memcmp(outerContents.data(), guest + outer, outerBytes) == 0, "an aligned draw snapshot misses its view's bytes");
@@ -1539,16 +1601,21 @@ void drawDescriptorWriteTests(const Device& device, Recorder& recorder) {
         const auto original = updates.calls.front();
         Require(original.buffers.size() == 2 && original.images.size() == 2, "descriptor test lacks mixed bindings and an image array");
         for (std::size_t allocation = 0; allocation < 2; ++allocation) {
-            const ShaderResources::MovedBuffer moved{allocation, 0, 16, {5, 6, 7, 8}};
-            const auto draw = resources.PrepareDrawBindings(snapshots, std::span(&moved, 1));
+            const std::array<std::uint32_t, 4> words{5, 6, 7, 8};
+            const ShaderResources::MovedBuffer moved{allocation, 0, 16, words};
+            const auto draw = PrepareDrawBindings(resources, snapshots, std::span(&moved, 1));
             Require(draw != nullptr && draw->snapshots.size() == 1, "moved shader data did not create a draw snapshot");
             Require(updates.calls.size() == allocation + 2 && updates.copies == 0, "draw descriptors copied GPU memory or needed multiple updates");
             const auto& actual = updates.calls.back();
             Require(actual.buffers.size() == original.buffers.size() && actual.images.size() == original.images.size(), "snapshot update omitted unchanged descriptors");
             for (const auto& [key, before] : original.buffers) {
                 const auto after = actual.buffers.at(key);
-                const auto expected = key.first == (allocation == 0 ? 2u : 7u) ? draw->snapshots.front().buffer->Handle() : before.buffer;
-                Require(after.buffer == expected && after.offset == before.offset && after.range == before.range, "snapshot update replaced the wrong buffer or changed its range");
+                // A small copy lives in the recorder's upload chunk at its offset (Recorder::DrawUpload).
+                const auto& snapshot = draw->snapshots.front();
+                const bool replaced = key.first == (allocation == 0 ? 2u : 7u);
+                const auto expected = replaced ? snapshot.buffer->Handle() : before.buffer;
+                const auto offset = replaced ? snapshot.offset : before.offset;
+                Require(after.buffer == expected && after.offset == offset && after.range == before.range, "snapshot update replaced the wrong buffer or changed its range");
             }
             for (const auto& [key, before] : original.images) {
                 const auto after = actual.images.at(key);
@@ -1632,15 +1699,16 @@ void drawSnapshotReuseTests(const Device& device, Recorder& recorder) {
             return contents.size() == smallBytes && std::all_of(contents.begin(), contents.end(), [&](std::byte value) { return value == expected; });
         };
         const auto before = cache.Counters();
-        const auto first = resources.PrepareDrawBindings(snapshotRecorder);
+        const auto first = PrepareDrawBindings(resources, snapshotRecorder);
         Require(first != nullptr && first->snapshots.size() == 1 && holds(first->snapshots[0], std::byte{0x11}), "a small draw input was not uploaded with its guest bytes");
         Require(first->snapshots[0].offset % context.limits.minStorageBufferOffsetAlignment == 0, "a draw upload breaks the storage buffer offset alignment");
         std::memset(reinterpret_cast<void*>(small), 0x44, smallBytes);
-        const auto second = resources.PrepareDrawBindings(snapshotRecorder);
+        const auto second = PrepareDrawBindings(resources, snapshotRecorder);
         Require(second != nullptr && second->snapshots.size() == 1 && holds(second->snapshots[0], std::byte{0x44}), "a draw upload missed a CPU store before its draw");
         Require(holds(first->snapshots[0], std::byte{0x11}), "a later draw's upload overwrote an earlier draw's bytes");
         Require(second->snapshots[0].buffer == first->snapshots[0].buffer && second->snapshots[0].offset >= first->snapshots[0].offset + smallBytes, "consecutive draw uploads do not share the chunk");
         Require(first->allocation.transient && second->allocation.transient && cache.Counters().transientSets == before.transientSets + 2, "draw sets were not taken from the transient pools");
+        Require(cache.Counters().transientCalls == before.transientCalls + 1, "consecutive draw sets of a layout were not taken by one allocate call");
         snapshotRecorder.Sync();
     } else {
         std::cout << "draw uploads disabled: not tested\n";
@@ -1657,7 +1725,7 @@ void drawSnapshotReuseTests(const Device& device, Recorder& recorder) {
         snapshotRecorder.Activate();
         ShaderResources resources(snapshotContext, compute);
         const auto snapshot = [&](std::byte expected) {
-            const auto bindings = resources.PrepareDrawBindings(snapshotRecorder);
+            const auto bindings = PrepareDrawBindings(resources, snapshotRecorder);
             Require(bindings != nullptr && bindings->snapshots.size() == 1, "read-only draw input was not snapshotted");
             const auto buffer = bindings->snapshots[0].buffer;
             const auto contents = bindings->snapshots[0].Bytes();
@@ -1679,7 +1747,7 @@ void drawSnapshotReuseTests(const Device& device, Recorder& recorder) {
         AgcDriver::GuestMemory::MarkWritten(element, 4);
         Require(snapshot(std::byte{0x33}) == afterStore, "a driver store of the same bytes made the draw input copy again");
         reinterpret_cast<std::uint8_t*>(element)[elementBytes - 1] = 0x34;
-        const auto tail = resources.PrepareDrawBindings(snapshotRecorder);
+        const auto tail = PrepareDrawBindings(resources, snapshotRecorder);
         Require(tail != nullptr && tail->snapshots.size() == 1 && tail->snapshots[0].buffer != afterStore && tail->snapshots[0].buffer->Bytes()[elementBytes - 1] == std::byte{0x34}, "a draw snapshot outlived a store that changed its last byte");
         std::memset(reinterpret_cast<void*>(element), 0x33, elementBytes);
         {
@@ -1752,7 +1820,7 @@ void drawSnapshotPatchTests(const Device& device) {
     {
         ShaderResources resources(snapshotContext, compute);
         const auto snapshot = [&] {
-            auto bindings = resources.PrepareDrawBindings(snapshotRecorder);
+            auto bindings = PrepareDrawBindings(resources, snapshotRecorder);
             Require(bindings != nullptr && bindings->snapshots.size() == 1, "read-only draw input was not snapshotted");
             auto buffer = bindings->snapshots[0].buffer;
             const auto contents = buffer->Bytes();
@@ -1839,6 +1907,35 @@ void transientSetTests(const Device& device) {
     Require(second.back().pool == pool && cache.Counters().transientPools == 2, "the reset transient pool was not filled again");
     for (const auto& set : second) cache.Free(set);
     Require(cache.Counters().transientResets == 2, "only the full pool is reset when its sets are released");
+
+    // Sets one allocate call took ahead for a layout wait in their pool; filled by another layout,
+    // the pool drops them (no draw holds them), so releasing the handed-out sets resets it, and the
+    // layout's next set is a new one.
+    DescriptorCache batches(context);
+    const auto otherLayout = batches.Layout(key, std::span<const VkDescriptorSetLayoutBinding>(&layoutBinding, 1));
+    const VkDescriptorSetLayoutBinding pairBinding{0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+    const std::array<std::uint32_t, 4> pairKey{0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2, VK_SHADER_STAGE_COMPUTE_BIT};
+    const auto pairLayout = batches.Layout(pairKey, std::span<const VkDescriptorSetLayoutBinding>(&pairBinding, 1));
+    const std::array<VkDescriptorPoolSize, 1> pairSizes{{{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2}}};
+    const auto waiter = batches.AllocateTransient(otherLayout, sizes);
+    const auto calls = batches.Counters().transientCalls;
+    Require(waiter.set != VK_NULL_HANDLE && calls == 1, "the first transient set took no allocate call");
+    std::vector<DescriptorCache::SetAllocation> filler;
+    while (batches.Counters().transientPools < 2) {
+        filler.push_back(batches.AllocateTransient(pairLayout, pairSizes));
+        Require(filler.back().set != VK_NULL_HANDLE && filler.size() < 100000, "the batch test's pool never filled");
+    }
+    const auto next = filler.back();
+    filler.pop_back();
+    Require(next.pool != waiter.pool && std::all_of(filler.begin(), filler.end(), [&](const auto& set) { return set.pool == waiter.pool; }), "the batch test's pool did not fill");
+    const auto resets = batches.Counters().transientResets;
+    for (const auto& set : filler) batches.Free(set);
+    batches.Free(waiter);
+    Require(batches.Counters().transientResets == resets + 1, "sets waiting for a draw kept a full transient pool from its reset");
+    const auto again = batches.AllocateTransient(otherLayout, sizes);
+    Require(again.set != VK_NULL_HANDLE && batches.Counters().transientCalls > calls, "a set waiting in a reset pool was handed out");
+    batches.Free(again);
+    batches.Free(next);
 }
 
 void drawSnapshotEvictionTests(const Device& device) {
@@ -1860,7 +1957,9 @@ void drawSnapshotEvictionTests(const Device& device) {
     const auto generation = CollectWrites(address, 4096);
     Require(generation != 0, "the watched block has no generation");
     constexpr auto cap = Recorder::DrawSnapshotEntries;
-    cache.KeepDrawSnapshot(address, 16, generation, registry, buffer, Recorder::SnapshotUse::Vertex);
+    // A kept vertex snapshot is the source of its device-local mirror.
+    const auto vertices = std::make_shared<Buffer>(device.GetContext(), 16, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+    cache.KeepDrawSnapshot(address, 16, generation, registry, vertices, Recorder::SnapshotUse::Vertex);
     for (std::size_t size = 1; size <= cap; ++size) cache.KeepDrawSnapshot(address, size, generation, registry, buffer);
     Require(cache.ReusableDrawSnapshot(address, 1) == buffer, "a kept snapshot is not reusable");
     cache.KeepDrawSnapshot(address, cap + 1, generation, registry, buffer);
@@ -1868,7 +1967,11 @@ void drawSnapshotEvictionTests(const Device& device) {
     Require(cache.ReusableDrawSnapshot(address, 1) == buffer && cache.ReusableDrawSnapshot(address, 3) == buffer && cache.ReusableDrawSnapshot(address, cap + 1) == buffer, "eviction dropped a more recently used snapshot");
     cache.KeepDrawSnapshot(address, cap + 2, generation, registry, buffer);
     Require(cache.ReusableDrawSnapshot(address, 4) == nullptr && cache.ReusableDrawSnapshot(address, 1) == buffer, "the second eviction did not take the next oldest");
-    Require(cache.ReusableDrawSnapshot(address, 16, Recorder::SnapshotUse::Vertex) == buffer, "storage snapshots evicted a vertex snapshot");
+    // Reused, it comes back as the mirror its first reuse made, never as the host copy.
+    const auto mirror = cache.ReusableDrawSnapshot(address, 16, Recorder::SnapshotUse::Vertex);
+    Require(mirror != nullptr, "storage snapshots evicted a vertex snapshot");
+    Require(mirror != vertices && !mirror->Mapped(), "a reused vertex snapshot came back without its device-local mirror");
+    Require(cache.ReusableDrawSnapshot(address, 16, Recorder::SnapshotUse::Vertex) == mirror, "a vertex snapshot's mirror was made again");
     cache.KeepDrawSnapshot(address, 1, generation, registry, buffer);
     Require(cache.ReusableDrawSnapshot(address, 1) == buffer && cache.ReusableDrawSnapshot(address, 5) == buffer, "replacing a kept snapshot evicted another");
     cache.KeepDrawSnapshot(address + 8192, Recorder::DrawSnapshotBudget, generation, registry, buffer);
@@ -1904,13 +2007,16 @@ void drawInputReuseTests(const Device& device, Recorder& recorder) {
     const auto first = CopyDrawInput(context, &recorder, address, size, 4, Use::Index32);
     Require(!first.reused && first.generation != 0 && equalsGuest(first), "the first draw input copy is wrong");
     KeepDrawInput(&recorder, address, first, Use::Index32, 189);
+    // Reused, an input comes back as the device-local mirror its first reuse made.
     const auto second = CopyDrawInput(context, &recorder, address, size, 4, Use::Index32);
-    Require(second.reused && second.buffer == first.buffer && second.derived == 189, "an unchanged draw input was copied again");
+    Require(second.reused && second.buffer != nullptr && second.buffer != first.buffer && !second.buffer->Mapped() && second.derived == 189, "an unchanged draw input was copied again");
+    Require(CopyDrawInput(context, &recorder, address, size, 4, Use::Index32).buffer == second.buffer, "a draw input's mirror was made again");
     const auto vertex = CopyDrawInput(context, &recorder, address, size, 1, Use::Vertex);
     const auto narrow = CopyDrawInput(context, &recorder, address, size, 2, Use::Index16);
     Require(!vertex.reused && !narrow.reused && equalsGuest(vertex) && equalsGuest(narrow), "a draw input reused another use's copy");
     KeepDrawInput(&recorder, address, vertex, Use::Vertex, 0);
-    Require(CopyDrawInput(context, &recorder, address, size, 1, Use::Vertex).buffer == vertex.buffer && CopyDrawInput(context, &recorder, address, size, 4, Use::Index32).buffer == first.buffer, "the uses' copies displaced each other");
+    const auto vertexMirror = CopyDrawInput(context, &recorder, address, size, 1, Use::Vertex).buffer;
+    Require(vertexMirror != nullptr && !vertexMirror->Mapped() && vertexMirror != second.buffer && CopyDrawInput(context, &recorder, address, size, 4, Use::Index32).buffer == second.buffer, "the uses' copies displaced each other");
     Require(!CopyDrawInput(context, nullptr, address, size, 4, Use::Index32).reused, "a draw input was reused without a recorder");
     words[5] = 0xdead;
     const auto stored = CopyDrawInput(context, &recorder, address, size, 4, Use::Index32);
@@ -1937,7 +2043,7 @@ void drawInputReuseTests(const Device& device, Recorder& recorder) {
     Require(!whole.reused && std::memcmp(whole.buffer->Bytes().data(), reinterpret_cast<const void*>(pool), 12288) == 0, "the vertex pool copy is wrong");
     KeepDrawInput(&recorder, pool, whole, Use::Vertex, 0);
     const auto prefix = CopyDrawInput(context, &recorder, pool, 4096, 1, Use::Vertex);
-    Require(prefix.reused && prefix.buffer == whole.buffer, "a shorter vertex read did not reuse the longer snapshot");
+    Require(prefix.reused && prefix.buffer != nullptr && !prefix.buffer->Mapped() && CopyDrawInput(context, &recorder, pool, 8192, 1, Use::Vertex).buffer == prefix.buffer, "a shorter vertex read did not reuse the longer snapshot");
     Require(!CopyDrawInput(context, &recorder, pool, 16384, 1, Use::Vertex).reused, "a longer vertex read reused a shorter snapshot");
     Require(!CopyDrawInput(context, &recorder, pool + 4, 4096, 1, Use::Vertex).reused, "a vertex read at another address reused the snapshot");
     Require(!CopyDrawInput(context, &recorder, pool, 4096, 4, Use::Index32).reused, "an index read reused a longer vertex snapshot");
@@ -1945,13 +2051,14 @@ void drawInputReuseTests(const Device& device, Recorder& recorder) {
     KeepDrawInput(&recorder, pool, shorter, Use::Index32, 3);
     Require(!CopyDrawInput(context, &recorder, pool, 4096, 4, Use::Index32).reused, "an index read reused a longer index snapshot");
     words[(8192 + 8192 + 16) / 4] = 0xbeef;
+    // The store lies past the shorter read: a reuse is the mirror made before it, a copy the bytes.
     const auto prefixAfter = CopyDrawInput(context, &recorder, pool, 4096, 1, Use::Vertex);
-    Require(std::memcmp(prefixAfter.buffer->Bytes().data(), reinterpret_cast<const void*>(pool), 4096) == 0, "a shorter vertex read after a store got other bytes");
+    Require(prefixAfter.reused ? prefixAfter.buffer == prefix.buffer : std::memcmp(prefixAfter.buffer->Bytes().data(), reinterpret_cast<const void*>(pool), 4096) == 0, "a shorter vertex read after a store got other bytes");
     const auto after = CopyDrawInput(context, &recorder, pool, 12288, 1, Use::Vertex);
     Require(!after.reused && std::memcmp(after.buffer->Bytes().data(), reinterpret_cast<const void*>(pool), 12288) == 0, "a vertex read over the store reused the old bytes");
     KeepDrawInput(&recorder, pool, after, Use::Vertex, 0);
     const auto small = CopyDrawInput(context, &recorder, pool, 4096, 1, Use::Vertex);
-    Require(small.reused && small.buffer == after.buffer, "the new vertex snapshot does not serve shorter reads");
+    Require(small.reused && small.buffer != nullptr && !small.buffer->Mapped() && small.buffer != prefix.buffer, "the new vertex snapshot does not serve shorter reads");
     // With `sighting`: an unproven range is copied into the upload chunk and only noted; the copy
     // that finds it unchanged since is kept and then reused; a store sends it back to the chunk.
     const auto ring = address + 32768;
@@ -1964,7 +2071,7 @@ void drawInputReuseTests(const Device& device, Recorder& recorder) {
     Require(!proven.uploaded && !proven.reused && proven.offset == 0 && equalsRing(proven), "a range unchanged since its sighting got no copy of its own");
     KeepDrawInput(&recorder, ring, proven, Use::Vertex, 0);
     const auto again = CopyDrawInput(context, &recorder, ring, ringBytes, 1, Use::Vertex, true);
-    Require(again.reused && again.buffer == proven.buffer, "the copy made after the sighting was not kept");
+    Require(again.reused && again.buffer != nullptr && again.buffer != proven.buffer && !again.buffer->Mapped(), "the copy made after the sighting was not kept");
     words[(32768 + 64) / 4] = 0x5157;
     const auto changed = CopyDrawInput(context, &recorder, ring, ringBytes, 1, Use::Vertex, true);
     Require(changed.uploaded && changed.rewritten && equalsRing(changed), "a rewritten range did not go back to the upload chunk");
@@ -4451,7 +4558,7 @@ void imageMemoTests(const Device& device, Recorder& recorder) {
     Require(replaced != other && sample(second) == replaced && sample(first) == remade, "the cache does not answer with the replacements");
     const auto firstWords = linearTextureWords(reinterpret_cast<std::uint64_t>(first), width, height, 56);
     const auto secondWords = linearTextureWords(reinterpret_cast<std::uint64_t>(second), width, height, 56);
-    const auto bindElements = [&](std::initializer_list<std::array<std::uint32_t, 8>> elements, std::vector<bool> depthCompare) {
+    const auto bindElements = [&](std::initializer_list<std::array<std::uint32_t, 8>> elements, ShaderRecompiler::ElementFlags depthCompare) {
         program.bindings[0].count = static_cast<std::uint32_t>(elements.size());
         program.bindings[0].guestDescriptor.clear();
         for (const auto& words : elements) program.bindings[0].guestDescriptor.insert(program.bindings[0].guestDescriptor.end(), words.begin(), words.end());
@@ -5307,6 +5414,7 @@ int main(int argc, char** argv) {
 
         readTrackingTests(device, recorder);
         writeSettledTests(device, recorder);
+        timelineTests(device);
         completionCountTests(device, recorder);
         afterRecordedWorkTests(device, recorder);
         directCompletionLabelTests(recorder);

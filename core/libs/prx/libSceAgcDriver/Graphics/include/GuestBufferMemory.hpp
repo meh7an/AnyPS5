@@ -2,6 +2,7 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_GUESTBUFFERMEMORY_HPP
 
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/InlineList.hpp"
 #include "BdaAbi.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include <memory>
@@ -285,9 +286,14 @@ public:
     // For the recorder's read tracking (ShaderResources::MarkGpuWrites); nothing once committed.
     std::vector<std::pair<std::uint64_t, std::uint64_t>> InPlaceReads() const;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> DeviceReads() const;
+    // The InPlaceReads regions appended to `out`: a list the per-use callers keep inline.
+    void AppendInPlaceReads(InlineList<std::pair<std::uint64_t, std::uint64_t>, 16>& out) const;
     // Whether one of the InPlaceReads regions holds [address, address + bytes) whole, without
     // building the list (the per-draw snapshot pass asks this for every element).
     bool ReadInPlace(std::uint64_t address, std::size_t bytes) const;
+    // Whether one of the InPlaceReads regions overlaps [address, address + bytes), without building
+    // the list.
+    bool InPlaceReadOverlaps(std::uint64_t address, std::size_t bytes) const;
 
 private:
     struct Region {

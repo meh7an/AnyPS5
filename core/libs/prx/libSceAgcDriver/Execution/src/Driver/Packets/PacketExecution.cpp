@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "ThreadOwned.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawThread.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
@@ -32,6 +33,28 @@ void Driver::timed(double WorkerProfile::*bucket, TWork&& work) {
         profile.reported = end;
         AgcDriver::ProfilePrint_nid_no_patch( "[gpu] worker at %.0f s: dispatch %.1f s, draw %.1f s, wait %.1f s\n", std::chrono::duration<double>(end - profile.start).count(), profile.dispatchMs / 1000, profile.drawMs / 1000, profile.waitMs / 1000);
     }
+}
+
+namespace {
+
+// Packets a draw thread may go on recording across (DrawThread): draws, and packets that only
+// change the queue's state (registers, index and instance state, predication setup, constant RAM,
+// markers, context state).
+bool drawThreadPassesOver(std::uint32_t header, std::uint32_t opcode) {
+    switch (opcode) {
+        case 0x10:
+            switch ((header >> 2u) & 0x3fu) {
+                case 0: case 0x09: case 0x0b: case 0x0c: case 0x1a: return true;
+                default: return false;
+            }
+        case 0x11: case 0x12: case 0x13: case 0x20: case 0x26: case 0x2a: case 0x2f:
+        case 0x63: case 0x64: case 0x9f: case 0x69: case 0x76: case 0x79: case 0x7a: case 0x81:
+            return true;
+        default:
+            return Pm4::DrawOpcode(opcode);
+    }
+}
+
 }
 
 void Driver::execute(const Submission& submission) {
@@ -83,6 +106,7 @@ void Driver::execute(const Submission& submission) {
         state = &queues[submission.queue];
     }
     auto& queue = *state;
+    auto* const back = FrontDrawThread();
     static const bool traceGpu = std::getenv("APS5_TRACE_GPU") != nullptr;
     if (traceGpu) std::fprintf(stderr, "[gpu] %.1f execute serial=%llu queue=0x%x dwords=%zu\n", TraceMs(), static_cast<unsigned long long>(submission.serial), submission.queue, submission.commands.size());
 
@@ -133,6 +157,9 @@ void Driver::execute(const Submission& submission) {
         if (APS5_ENABLE_TIMING_LOG && submission.queue == 0 && pendingFrameTiming == nullptr) includeTimingSubmission(submission, false);
         PerformanceContext timingContext(submission.queue == 0 ? pendingFrameTiming.get() : FrameTiming::Async());
         PerformanceTimer timing("Driver.Packet");
+        // The draw thread may still be recording the last draw: any other packet with effects
+        // outside the queue state, or a predicated one (its predicate is read), waits for it.
+        if (back != nullptr && back->Busy() && (!drawThreadPassesOver(header, opcode) || (Pm4::Predicated(header) && queue.predication.operation != 0))) back->Drain(DrawThread::Wait::Packet);
         std::shared_lock deviceUse(deviceReplacement, std::defer_lock);
         if (opcode != 0x3c && opcode != 0x93 && header != RenderingWaitPacketHeader && header != FlipPacketHeader) deviceUse.lock();
 
@@ -322,6 +349,9 @@ void Driver::execute(const Submission& submission) {
         cursor = nextCursor;
     }
 
+    // A submission ends with its draws recorded: its completion, the submit below and the next
+    // submission's first packets all come after them.
+    if (back != nullptr) back->Drain(DrawThread::Wait::End);
     PerformanceContext endContext(submission.queue == 0 ? frameTiming() : FrameTiming::Async());
     PerformanceTimer endTiming("Driver.EndSubmission");
     static const bool submitAtEnd = std::getenv("APS5_SUBMIT_AT_END") != nullptr;

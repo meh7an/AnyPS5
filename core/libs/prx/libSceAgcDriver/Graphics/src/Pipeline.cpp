@@ -134,7 +134,13 @@ void appendKey(std::vector<std::byte>& key, const TValue& value) {
 }
 
 bool fragmentWritesMemory(std::span<const CompiledShader> shaders) {
-    const auto any = [](const std::vector<bool>& written, std::uint32_t count) { return written.size() < count || std::ranges::any_of(written, [](bool element) { return element; }); };
+    const auto any = [](const auto& written, std::uint32_t count) {
+        if (written.size() < count) return true;
+        for (std::size_t element = 0; element < written.size(); ++element) {
+            if (written[element]) return true;
+        }
+        return false;
+    };
     for (const auto& shader : shaders) {
         if (shader.stage != ShaderRecompiler::ShaderStage::Fragment || shader.program == nullptr) continue;
         for (const auto& binding : shader.program->bindings) {

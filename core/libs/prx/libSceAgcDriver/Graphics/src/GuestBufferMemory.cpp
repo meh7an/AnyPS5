@@ -1778,7 +1778,11 @@ void runImportProbe(const Context& context, std::uint64_t base, std::uint64_t by
             VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
             submit.commandBufferCount = 1;
             submit.pCommandBuffers = &buffer;
-            if ((probe.result = context.Function<PFN_vkQueueSubmit>("vkQueueSubmit")(context.queue, 1, &submit, fence)) != VK_SUCCESS) return "vkQueueSubmit";
+            {
+                std::lock_guard queue(GuestMemory::QueueMutex());
+                probe.result = context.Function<PFN_vkQueueSubmit>("vkQueueSubmit")(context.queue, 1, &submit, fence);
+            }
+            if (probe.result != VK_SUCCESS) return "vkQueueSubmit";
             submitted = true;
             if ((probe.result = context.Function<PFN_vkWaitForFences>("vkWaitForFences")(context.device, 1, &fence, VK_TRUE, 10'000'000'000ull)) != VK_SUCCESS) return "vkWaitForFences";
             submitted = false;
@@ -1793,7 +1797,10 @@ void runImportProbe(const Context& context, std::uint64_t base, std::uint64_t by
         return nullptr;
     };
     probe.failure = run();
-    if (submitted) context.Function<PFN_vkQueueWaitIdle>("vkQueueWaitIdle")(context.queue);
+    if (submitted) {
+        std::lock_guard queue(GuestMemory::QueueMutex());
+        context.Function<PFN_vkQueueWaitIdle>("vkQueueWaitIdle")(context.queue);
+    }
     if (fence != VK_NULL_HANDLE) context.Function<PFN_vkDestroyFence>("vkDestroyFence")(context.device, fence, nullptr);
     if (commands[0] != VK_NULL_HANDLE) context.Function<PFN_vkFreeCommandBuffers>("vkFreeCommandBuffers")(context.device, context.pool, 2, commands);
     if (destination != VK_NULL_HANDLE) context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer")(context.device, destination, nullptr);
@@ -3629,6 +3636,32 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> GuestBufferMemory::DeviceRe
         if (region.direct != nullptr || region.mirror != nullptr) result.emplace_back(region.begin, region.end);
     }
     return result;
+}
+
+void GuestBufferMemory::AppendInPlaceReads(InlineList<std::pair<std::uint64_t, std::uint64_t>, 16>& out) const {
+    if (!uploaded || committed) return;
+    if (space != nullptr) {
+        for (const auto& region : space->base) {
+            if (region.direct != nullptr) out.push_back({region.begin, region.end});
+        }
+    }
+    for (const auto& region : regions) {
+        if (region.direct != nullptr) out.push_back({region.begin, region.end});
+    }
+}
+
+bool GuestBufferMemory::InPlaceReadOverlaps(std::uint64_t address, std::size_t bytes) const {
+    if (!uploaded || committed) return false;
+    const auto overlaps = [&](std::uint64_t begin, std::uint64_t end) { return address < end && begin < address + bytes; };
+    if (space != nullptr) {
+        for (const auto& region : space->base) {
+            if (region.direct != nullptr && overlaps(region.begin, region.end)) return true;
+        }
+    }
+    for (const auto& region : regions) {
+        if (region.direct != nullptr && overlaps(region.begin, region.end)) return true;
+    }
+    return false;
 }
 
 bool GuestBufferMemory::ReadInPlace(std::uint64_t address, std::size_t bytes) const {

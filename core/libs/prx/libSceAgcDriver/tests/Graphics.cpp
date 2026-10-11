@@ -12,6 +12,8 @@
 #include "prx/libSceAgcDriver/Graphics/include/ParallelCompare.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/KeptArena.hpp"
+#include "prx/libSceAgcDriver/Execution/include/HashSlotMap.hpp"
 #include "SceShaders.hpp"
 #include "ControlFlow/RequestSerializer.hpp"
 #include "CacheKey.hpp"
@@ -1800,8 +1802,9 @@ VKAPI_ATTR VkResult VKAPI_CALL mockResetDescriptorPool(VkDevice, VkDescriptorPoo
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL mockAllocateDescriptorSets(VkDevice, const VkDescriptorSetAllocateInfo* info, VkDescriptorSet* sets) {
-    Require(info->descriptorSetCount == 1, "exactly one descriptor set must be allocated");
-    sets[0] = makeHandle<VkDescriptorSet>();
+    // One set per call, or a batch of a draw's transient sets (DescriptorCache::AllocateTransient).
+    Require(info->descriptorSetCount >= 1, "no descriptor set was allocated");
+    for (std::uint32_t index = 0; index < info->descriptorSetCount; ++index) sets[index] = makeHandle<VkDescriptorSet>();
     return VK_SUCCESS;
 }
 
@@ -2123,14 +2126,17 @@ void descriptorSnapshotTests() {
             const auto original = findWrite(0).buffers;
             const auto originalThird = findWrite(4).buffers;
             std::vector<ShaderResources::MovedBuffer> moved;
+            std::array<std::vector<std::uint32_t>, 2> words;
             for (std::size_t index = 0; index < 2; ++index) {
                 if ((selected & (1u << index)) == 0) continue;
                 const std::size_t bytes = index == 0 ? 24 : 12;
-                moved.push_back({index, 0, bytes, std::vector<std::uint32_t>(bytes / 4, static_cast<std::uint32_t>(0x12340000u + index))});
+                words[index].assign(bytes / 4, static_cast<std::uint32_t>(0x12340000u + index));
+                moved.push_back({index, 0, bytes, words[index]});
             }
             mock.writes.clear();
-            const auto snapshots = resources.PrepareDrawBindings(recorder, moved);
-            Require(snapshots != nullptr && snapshots->snapshots.size() == moved.size(), "draw snapshots are missing");
+            const auto snapshots = std::make_shared<ShaderResources::DrawBindings>();
+            recorder.Keep(snapshots);
+            Require(resources.PrepareDrawBindings(recorder, moved, *snapshots) && snapshots->snapshots.size() == moved.size(), "draw snapshots are missing");
             Require(mock.copies.empty(), "snapshot descriptor set must be written without descriptor copies");
             Require(mock.writes.size() == 2, "snapshot update must write every binding once");
             const auto& write = mock.writes.front();
@@ -2144,8 +2150,9 @@ void descriptorSnapshotTests() {
                     Require(descriptor.buffer == original[index].buffer && descriptor.offset == original[index].offset && descriptor.range == original[index].range, "snapshot update changed an untouched buffer descriptor");
                 } else {
                     const auto& item = snapshots->snapshots[snapshot];
-                    Require(descriptor.buffer == item.buffer->Handle() && descriptor.offset == 0 && descriptor.range == moved[snapshot].size, "snapshot descriptor used another element's buffer or range");
-                    Require(sameBytes(bufferBytes(descriptor.buffer), moved[snapshot].words.data(), moved[snapshot].size), "snapshot descriptor lost its buffer data");
+                    // A small copy lives in the recorder's upload chunk at its offset (Recorder::DrawUpload).
+                    Require(descriptor.buffer == item.buffer->Handle() && descriptor.offset == item.offset && descriptor.range == moved[snapshot].size, "snapshot descriptor used another element's buffer or range");
+                    Require(sameBytes(bufferBytes(descriptor.buffer).subspan(static_cast<std::size_t>(descriptor.offset)), moved[snapshot].words.data(), moved[snapshot].size), "snapshot descriptor lost its buffer data");
                     ++snapshot;
                 }
             }
@@ -2458,6 +2465,72 @@ void sampledBudgetReportTests() {
     Require(SampledBudgetReportDue(4000 * MiB, 4401 * MiB, seconds(10)), "a budget more than 10% above the reported one is not due after 10 s");
     Require(SampledBudgetReportDue(4000 * MiB, 3599 * MiB, seconds(10)), "a budget more than 10% below the reported one is not due after 10 s");
     Require(!SampledBudgetReportDue(4000 * MiB, 2048 * MiB, seconds(9)), "a budget change is reported again within 10 s of the last report");
+}
+
+// A storage image's unit generations: one assignment moves every unit, a store to one unit fills
+// the list first, and the whole list and the oldest unit see both.
+void unitGenerationTests() {
+    AgcDriver::Graphics::UnitGenerations units;
+    units.assign(4, 0);
+    Require(units.size() == 4 && units[0] == 0 && units[3] == 0 && units.oldest() == 0, "fresh units are not untracked");
+    units.assign(4, 7);
+    Require(units[1] == 7 && units.oldest() == 7, "a uniform assignment did not move every unit");
+    units.at(2) = 9;
+    Require(units[0] == 7 && units[2] == 9 && units[3] == 7 && units.oldest() == 7, "a store to one unit changed the others");
+    const auto all = units.all();
+    Require(all.size() == 4 && all[0] == 7 && all[1] == 7 && all[2] == 9 && all[3] == 7, "the whole list misses the uniform value or the store");
+    units.assign(4, 11);
+    Require(units[2] == 11 && units.oldest() == 11 && units.all()[2] == 11, "a uniform assignment after a store kept the stored unit");
+}
+
+// The kept-object arena: objects carved in order and released from any thread in any order; a block
+// returns to the heap once its objects were released and the arena moved on from it, also when an
+// object outlives the arena.
+void keptArenaTests() {
+    using AgcDriver::Graphics::KeptArena;
+    using Object = std::array<std::byte, 600>;
+    const auto live = KeptArena::LiveBlocks();
+    {
+        KeptArena arena;
+        std::vector<std::shared_ptr<Object>> objects;
+        for (int i = 0; i < 1000; ++i) objects.push_back(std::allocate_shared<Object>(KeptArena::Allocator<Object>(arena)));
+        Require(KeptArena::LiveBlocks() >= live + 9, "a thousand 600-byte objects took fewer blocks than they fill");
+        std::thread other([&] {
+            for (std::size_t i = 0; i < objects.size(); i += 2) objects[i].reset();
+        });
+        other.join();
+        for (auto& object : objects) object.reset();
+        Require(KeptArena::LiveBlocks() == live + 1, "a block outlived its released objects (only the arena's current one stays)");
+    }
+    Require(KeptArena::LiveBlocks() == live, "the arena's current block outlived the arena");
+    std::shared_ptr<int> survivor;
+    {
+        KeptArena arena;
+        survivor = std::allocate_shared<int>(KeptArena::Allocator<int>(arena), 5);
+    }
+    Require(*survivor == 5 && KeptArena::LiveBlocks() == live + 1, "an object outliving its arena lost its block");
+    survivor.reset();
+    Require(KeptArena::LiveBlocks() == live, "the last object's release kept its block");
+}
+
+// The stage memo's map: every key found after inserts, growth and erases, including an erase whose
+// probe run wraps past the end of the table and must move the entries after it back.
+void hashSlotMapTests() {
+    AgcDriver::HashSlotMap<std::uint64_t> map(16);
+    // 15, 31 and 47 share home slot 15 and wrap to slots 0 and 1; 0x1000 (home 0) lands at 2.
+    for (const std::uint64_t key : {15ull, 31ull, 47ull, 0x1000ull}) *map.try_emplace(key).first = key;
+    Require(map.size() == 4 && !map.try_emplace(31).second && *map.find(31) == 31, "a key inserted again was not found as it was");
+    Require(map.erase(15) && map.find(15) == nullptr && map.size() == 3, "an erased key is still found");
+    Require(*map.find(31) == 31 && *map.find(47) == 47 && *map.find(0x1000) == 0x1000, "an erase lost the entries probed past it");
+    Require(!map.erase(15) && map.find(0x2000) == nullptr, "an absent key was found or erased");
+    const auto key = [](std::uint64_t index) { return index * 0x9e3779b97f4a7c15ull; };
+    for (std::uint64_t index = 1; index <= 1000; ++index) *map.try_emplace(key(index)).first = index;
+    bool found = true;
+    for (std::uint64_t index = 1; index <= 1000; ++index) found = found && map.find(key(index)) != nullptr && *map.find(key(index)) == index;
+    Require(found && map.size() == 1003, "growth lost a key");
+    for (std::uint64_t index = 1; index <= 1000; index += 2) map.erase(key(index));
+    for (std::uint64_t index = 1; index <= 1000; ++index) found = found && (map.find(key(index)) != nullptr) == (index % 2 == 0);
+    Require(found && map.size() == 503 && *map.find(31) == 31, "erasing half the keys lost or kept the wrong ones");
 }
 
 void misalignedShaderDataTests() {
@@ -4172,6 +4245,9 @@ int main() {
         resourceTests();
         descriptorSnapshotTests();
         descriptorCacheTests();
+        unitGenerationTests();
+        keptArenaTests();
+        hashSlotMapTests();
         misalignedShaderDataTests();
         debugBranchTests();
         textureCacheBudgetTests();

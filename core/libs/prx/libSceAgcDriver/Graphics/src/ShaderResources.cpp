@@ -1422,6 +1422,17 @@ void ShaderResources::buildPrepare(std::span<const CompiledShader> shaders, cons
             _layout = CreateSetLayout(context, description, updateAfterBind);
             ownsLayout = true;
         }
+        // A draw's own set (PrepareDrawBindings) holds what the layout holds, by type.
+        for (const auto& binding : bindings) {
+            auto* const last = drawSetSizes.data() + drawSetSizeCount;
+            auto* found = std::find_if(drawSetSizes.data(), last, [&](const VkDescriptorPoolSize& entry) { return entry.type == binding.layout.descriptorType; });
+            if (found == last) {
+                Require(drawSetSizeCount < drawSetSizes.size(), "a set uses more descriptor types than expected");
+                *found = {binding.layout.descriptorType, 0};
+                ++drawSetSizeCount;
+            }
+            found->descriptorCount += binding.layout.descriptorCount;
+        }
         if (!bindings.empty()) {
             // The set is sized from the plan: every image element becomes exactly one descriptor
             // when stage B looks it up.
@@ -1651,7 +1662,7 @@ void ShaderResources::reportDescriptorCaches() const {
     const auto descriptors = context.descriptorCache != nullptr ? context.descriptorCache->Counters() : DescriptorCache::Stats{};
     const auto samplerHits = context.samplerCache != nullptr ? context.samplerCache->Hits() : 0;
     const auto samplerMisses = context.samplerCache != nullptr ? context.samplerCache->Misses() : 0;
-    AgcDriver::ProfilePrint_nid_no_patch("[descriptors] layouts %llu hits / %llu created, sets %llu from %llu pools and %llu dedicated pools, transient sets %llu from %llu pools (%llu resets), samplers %llu hits / %llu created\n", static_cast<unsigned long long>(descriptors.layoutHits), static_cast<unsigned long long>(descriptors.layoutMisses), static_cast<unsigned long long>(descriptors.sets), static_cast<unsigned long long>(descriptors.pools), static_cast<unsigned long long>(descriptors.dedicatedPools), static_cast<unsigned long long>(descriptors.transientSets), static_cast<unsigned long long>(descriptors.transientPools), static_cast<unsigned long long>(descriptors.transientResets), static_cast<unsigned long long>(samplerHits), static_cast<unsigned long long>(samplerMisses));
+    AgcDriver::ProfilePrint_nid_no_patch("[descriptors] layouts %llu hits / %llu created, sets %llu from %llu pools and %llu dedicated pools, transient sets %llu in %llu allocate calls from %llu pools (%llu resets), samplers %llu hits / %llu created\n", static_cast<unsigned long long>(descriptors.layoutHits), static_cast<unsigned long long>(descriptors.layoutMisses), static_cast<unsigned long long>(descriptors.sets), static_cast<unsigned long long>(descriptors.pools), static_cast<unsigned long long>(descriptors.dedicatedPools), static_cast<unsigned long long>(descriptors.transientSets), static_cast<unsigned long long>(descriptors.transientCalls), static_cast<unsigned long long>(descriptors.transientPools), static_cast<unsigned long long>(descriptors.transientResets), static_cast<unsigned long long>(samplerHits), static_cast<unsigned long long>(samplerMisses));
 }
 
 template<typename TVisitor>
@@ -1663,7 +1674,7 @@ void VisitContentKey(const CompiledShader& shader, bool dataWords, bool movableB
     visit(static_cast<std::uint32_t>(program.PipelineVariantId()));
     visit(static_cast<std::uint32_t>(program.PipelineVariantId() >> 32u));
     visit(static_cast<std::uint32_t>(program.bindings.size()));
-    const auto packBits = [&](const std::vector<bool>& bits) {
+    const auto packBits = [&](const auto& bits) {
         visit(static_cast<std::uint32_t>(bits.size()));
         std::uint32_t word = 0;
         for (std::size_t i = 0; i < bits.size(); ++i) {
@@ -2458,16 +2469,52 @@ bool chargeShaderKey(ChurnCounts& profile, const ResourceCache::Key& key, std::s
 
 }
 
+namespace {
+
+// The Find and Touch counts of the [rescache] line, kept while it is printed (APS5_PROFILE_DRAW):
+// otherwise a locked increment of a shared counter on every lookup.
+bool CountCacheCalls() {
+    static const bool counted = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    return counted;
+}
+
+}
+
+std::uint64_t ResourceCache::hashKey(const Key& key) {
+    // FNV-1a steps in four independent lanes (their multiplies overlap), folded at the end with a
+    // mix that leaves the low bits, which index the map, depending on every lane.
+    constexpr std::uint64_t prime = 1099511628211ull;
+    std::uint64_t lanes[4] = {14695981039346656037ull, 0x9e3779b97f4a7c15ull, 0xc2b2ae3d27d4eb4full, 0x165667b19e3779f9ull};
+    const auto pair = [&](std::size_t at) { return key[at] | static_cast<std::uint64_t>(key[at + 1]) << 32u; };
+    std::size_t at = 0;
+    for (; at + 8 <= key.size(); at += 8) {
+        lanes[0] = (lanes[0] ^ pair(at)) * prime;
+        lanes[1] = (lanes[1] ^ pair(at + 2)) * prime;
+        lanes[2] = (lanes[2] ^ pair(at + 4)) * prime;
+        lanes[3] = (lanes[3] ^ pair(at + 6)) * prime;
+    }
+    for (; at < key.size(); ++at) lanes[at & 3u] = (lanes[at & 3u] ^ key[at]) * prime;
+    std::uint64_t hash = key.size();
+    for (const auto lane : lanes) hash = (hash ^ lane ^ (lane >> 29u)) * 0x9e3779b97f4a7c15ull;
+    return hash ^ (hash >> 32u);
+}
+
+ResourceCache::Entries::iterator* ResourceCache::lookup(std::uint64_t hash, const Key& key) {
+    auto* found = index.find(hash);
+    return found != nullptr && (*found)->key == key ? found : nullptr;
+}
+
 std::shared_ptr<ShaderResources> ResourceCache::Find(const Key& key) {
-    resourceCacheFinds.fetch_add(1, std::memory_order_relaxed);
+    if (CountCacheCalls()) resourceCacheFinds.fetch_add(1, std::memory_order_relaxed);
+    const auto hash = hashKey(key);
     std::lock_guard lock(mutex);
-    const auto found = index.find(key);
-    if (found == index.end()) {
+    auto* found = lookup(hash, key);
+    if (found == nullptr) {
         noteMiss(key);
         return nullptr;
     }
-    entries.splice(entries.begin(), entries, found->second);
-    return found->second->second;
+    entries.splice(entries.begin(), entries, *found);
+    return (*found)->resources;
 }
 
 void ResourceCache::noteMiss(const Key& key) {
@@ -2542,14 +2589,17 @@ void ResourceCache::noteMiss(const Key& key) {
 }
 
 void ResourceCache::Insert(const Key& key, std::shared_ptr<ShaderResources> resources, std::vector<std::shared_ptr<ShaderResources>>* evicted) {
+    const auto hash = hashKey(key);
     std::lock_guard lock(mutex);
-    if (const auto found = index.find(key); found != index.end()) {
-        if (evicted != nullptr) evicted->push_back(std::move(found->second->second));
-        entries.erase(found->second);
-        index.erase(found);
+    auto [slot, inserted] = index.try_emplace(hash);
+    if (!inserted) {
+        // The key's entry, or another key's sharing its hash: replaced either way.
+        if (evicted != nullptr) evicted->push_back(std::move((*slot)->resources));
+        entries.erase(*slot);
     }
-    entries.emplace_front(key, std::move(resources));
-    index.emplace(key, entries.begin());
+    entries.push_front({key, hash, std::move(resources)});
+    // The eviction below moves entries in the map: `slot` is not used past this.
+    *slot = entries.begin();
     // Entries pin their textures and storage images past the texture caches' budgets, so the bound
     // stays modest: APS5_RESOURCE_CACHE_ENTRIES (default 1024) covers several frames of distinct
     // dispatch and draw content.
@@ -2559,27 +2609,28 @@ void ResourceCache::Insert(const Key& key, std::shared_ptr<ShaderResources> reso
         return static_cast<std::size_t>(parsed != 0 ? parsed : 1024ull);
     }();
     while (entries.size() > capacity) {
-        if (evicted != nullptr) evicted->push_back(std::move(entries.back().second));
-        index.erase(entries.back().first);
+        if (evicted != nullptr) evicted->push_back(std::move(entries.back().resources));
+        index.erase(entries.back().hash);
         entries.pop_back();
     }
 }
 
 void ResourceCache::Remove(const Key& key, const ShaderResources* object) {
+    const auto hash = hashKey(key);
     std::lock_guard lock(mutex);
-    if (object != nullptr) {
-        const auto found = index.find(key);
-        if (found == index.end() || found->second->second.get() != object) return;
-    }
-    erase(key);
+    auto* found = lookup(hash, key);
+    if (found == nullptr || (object != nullptr && (*found)->resources.get() != object)) return;
+    entries.erase(*found);
+    index.erase(hash);
 }
 
 bool ResourceCache::Touch(const Key& key) {
-    resourceCacheTouches.fetch_add(1, std::memory_order_relaxed);
+    if (CountCacheCalls()) resourceCacheTouches.fetch_add(1, std::memory_order_relaxed);
+    const auto hash = hashKey(key);
     std::lock_guard lock(mutex);
-    const auto found = index.find(key);
-    if (found == index.end()) return false;
-    entries.splice(entries.begin(), entries, found->second);
+    auto* found = lookup(hash, key);
+    if (found == nullptr) return false;
+    entries.splice(entries.begin(), entries, *found);
     return true;
 }
 
@@ -2600,13 +2651,6 @@ void ResourceCache::Clear() {
 std::size_t ResourceCache::Size() const {
     std::lock_guard lock(mutex);
     return entries.size();
-}
-
-void ResourceCache::erase(const Key& key) {
-    const auto found = index.find(key);
-    if (found == index.end()) return;
-    entries.erase(found->second);
-    index.erase(found);
 }
 
 ResourceCache& SharedResourceCache() {
@@ -2655,6 +2699,8 @@ constexpr std::array<VkDescriptorPoolSize, 4> ChainPoolSizes{{{VK_DESCRIPTOR_TYP
 constexpr std::array<VkDescriptorPoolSize, 4> ChainPoolCreateSizes{{{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4096 + 2}, {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1024}, {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1024}, {VK_DESCRIPTOR_TYPE_SAMPLER, 512}}};
 // A transient pool: four chain pools' worth, so a frame's draw sets (a few thousand) fill few pools.
 constexpr std::uint32_t TransientPoolScale = 4;
+// Transient sets of one layout taken by one driver allocate call (DescriptorCache::waitingSets).
+constexpr std::uint32_t TransientBatch = 16;
 
 bool transientSetsEnabled() {
     static const bool disabled = std::getenv("APS5_NO_TRANSIENT_SETS") != nullptr;
@@ -2673,6 +2719,17 @@ bool DescriptorCache::fitsChainPool(std::span<const VkDescriptorPoolSize> sizes)
 void DescriptorCache::retireTransient(std::size_t index) {
     auto& entry = transientPools[index];
     entry.full = true;
+    // Its sets still waiting for a draw are no draw's: dropped, so the pool can be reset.
+    for (auto& [layout, waiting] : waitingSets) {
+        for (auto it = waiting.begin(); it != waiting.end();) {
+            if (it->pool != index) {
+                ++it;
+                continue;
+            }
+            if (entry.live != 0) --entry.live;
+            it = waiting.erase(it);
+        }
+    }
     if (entry.live != 0) return;
     // No set of it lives (every owner was kept until its batch completed): whole again.
     static_cast<void>(resetPool(context.device, entry.pool, 0));
@@ -2689,6 +2746,16 @@ void DescriptorCache::retireTransient(std::size_t index) {
 
 DescriptorCache::SetAllocation DescriptorCache::AllocateTransient(VkDescriptorSetLayout layout, std::span<const VkDescriptorPoolSize> sizes) {
     if (!transientSetsEnabled()) return Allocate(layout, sizes);
+    {
+        // A set an earlier call took ahead for this layout (it counts as live in its pool already).
+        std::lock_guard lock(mutex);
+        if (const auto found = waitingSets.find(layout); found != waitingSets.end() && !found->second.empty()) {
+            const auto waiting = found->second.back();
+            found->second.pop_back();
+            ++stats.transientSets;
+            return {waiting.set, transientPools[waiting.pool].pool, true};
+        }
+    }
     if (!fitsChainPool(sizes)) return {};
     // The set's needs by chain pool type (fitsChainPool found every type there).
     std::array<std::uint32_t, ChainPoolSizes.size()> needs{};
@@ -2699,9 +2766,14 @@ DescriptorCache::SetAllocation DescriptorCache::AllocateTransient(VkDescriptorSe
     }
     std::lock_guard lock(mutex);
     const auto allocate = context.Resolved(&DeviceFunctions::allocateDescriptorSets, "vkAllocateDescriptorSets");
+    std::array<VkDescriptorSetLayout, TransientBatch> batchLayouts;
+    batchLayouts.fill(layout);
+    std::array<VkDescriptorSet, TransientBatch> batchSets{};
     VkDescriptorSetAllocateInfo allocation{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
-    allocation.descriptorSetCount = 1;
-    allocation.pSetLayouts = &layout;
+    allocation.pSetLayouts = batchLayouts.data();
+    // Room for the batch's waiting sets before the driver hands them out: none can be lost after.
+    auto& waiting = waitingSets[layout];
+    waiting.reserve(waiting.size() + TransientBatch);
     // Two tries: the pool being filled, then (when it has no room) a reset or a new one, which
     // holds any set the chain check above admitted.
     for (int attempt = 0; attempt < 2; ++attempt) {
@@ -2729,20 +2801,27 @@ DescriptorCache::SetAllocation DescriptorCache::AllocateTransient(VkDescriptorSe
             }
         }
         auto& entry = transientPools[fillingTransient];
-        bool room = entry.sets < ChainPoolSets * TransientPoolScale;
-        for (std::size_t type = 0; type < needs.size(); ++type) room = room && entry.descriptors[type] + needs[type] <= ChainPoolSizes[type].descriptorCount * TransientPoolScale;
-        if (room) {
+        // As many sets as the pool still holds, up to a batch; the first is this call's.
+        std::uint32_t count = std::min<std::uint32_t>(TransientBatch, ChainPoolSets * TransientPoolScale - entry.sets);
+        for (std::size_t type = 0; type < needs.size(); ++type) {
+            if (needs[type] != 0) count = std::min(count, (ChainPoolSizes[type].descriptorCount * TransientPoolScale - entry.descriptors[type]) / needs[type]);
+        }
+        while (count != 0) {
             allocation.descriptorPool = entry.pool;
-            VkDescriptorSet set = VK_NULL_HANDLE;
-            const auto result = allocate(context.device, &allocation, &set);
+            allocation.descriptorSetCount = count;
+            const auto result = allocate(context.device, &allocation, batchSets.data());
             if (result == VK_SUCCESS) {
-                ++entry.live;
-                ++entry.sets;
-                for (std::size_t type = 0; type < needs.size(); ++type) entry.descriptors[type] += needs[type];
+                entry.live += count;
+                entry.sets += count;
+                for (std::size_t type = 0; type < needs.size(); ++type) entry.descriptors[type] += needs[type] * count;
                 ++stats.transientSets;
-                return {set, entry.pool, true};
+                ++stats.transientCalls;
+                for (std::uint32_t index = 1; index < count; ++index) waiting.push_back({batchSets[index], fillingTransient});
+                return {batchSets[0], entry.pool, true};
             }
             if (result != VK_ERROR_OUT_OF_POOL_MEMORY && result != VK_ERROR_FRAGMENTED_POOL) Check(result, "vkAllocateDescriptorSets");
+            // The driver holds less than the pool's sizes say: one set, else the pool is full.
+            count = count > 1 ? 1 : 0;
         }
         // No room: no longer filled, and reset once its last set is released.
         const auto full = fillingTransient;
@@ -3564,8 +3643,8 @@ std::size_t ShaderResources::DrawUploadLimit() {
     return limit;
 }
 
-std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved) const {
-    if (_set == VK_NULL_HANDLE || usesBda) return {};
+bool ShaderResources::PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved, DrawBindings& result) const {
+    if (_set == VK_NULL_HANDLE || usesBda) return false;
     auto& parts = bindingParts();
     if (parts.enabled) {
         parts.lap = std::chrono::steady_clock::now();
@@ -3578,7 +3657,6 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         }
     } report{parts};
     const auto uploadLimit = DrawUploadLimit();
-    auto result = std::make_shared<DrawBindings>();
     InlineList<std::size_t, 16> selected;
     // A copy the draw reads: a slice of the upload chunk when small enough, else a buffer of its own.
     const auto ownCopy = [&](std::uint64_t address, std::size_t bytes) {
@@ -3589,11 +3667,8 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         }
         return DrawBindings::Snapshot{address, std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT), 0, bytes};
     };
-    // At most one snapshot per allocation: reserved with the first one, not grown push by push.
-    const auto keep = [&](DrawBindings::Snapshot snapshot) {
-        if (result->snapshots.empty()) result->snapshots.reserve(allocations.size());
-        result->snapshots.push_back(std::move(snapshot));
-    };
+    // At most one snapshot per allocation, in `selected`'s order.
+    const auto keep = [&](DrawBindings::Snapshot snapshot) { result.snapshots.push_back(std::move(snapshot)); };
     for (std::size_t index = 0; index < allocations.size(); ++index) {
         const auto& item = allocations[index];
         const auto override = std::find_if(moved.begin(), moved.end(), [&](const MovedBuffer& entry) { return entry.allocation == index; });
@@ -3653,52 +3728,45 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         if (parts.enabled) parts.mark(BindingParts::Make);
     }
     if (parts.enabled) parts.mark(BindingParts::Snapshots);
-    if (selected.empty()) return {};
+    if (selected.empty()) return false;
     Require(context.descriptorCache != nullptr, "draw snapshots require a descriptor cache");
-    // The set's descriptor counts by type (a handful of types; no map per draw).
-    std::array<VkDescriptorPoolSize, 16> sizes{};
-    std::size_t sizeCount = 0;
-    for (const auto& binding : bindings) {
-        auto* const last = sizes.data() + sizeCount;
-        auto* found = std::find_if(sizes.data(), last, [&](const VkDescriptorPoolSize& entry) { return entry.type == binding.layout.descriptorType; });
-        if (found == last) {
-            Require(sizeCount < sizes.size(), "a draw set uses more descriptor types than expected");
-            *found = {binding.layout.descriptorType, 0};
-            ++sizeCount;
-        }
-        found->descriptorCount += binding.layout.descriptorCount;
-    }
-    result->cache = context.descriptorCache;
-    result->allocation = result->cache->AllocateTransient(_layout, std::span<const VkDescriptorPoolSize>(sizes.data(), sizeCount));
-    Require(result->allocation.set != VK_NULL_HANDLE, "draw snapshot descriptor allocation failed");
+    result.cache = context.descriptorCache;
+    result.allocation = result.cache->AllocateTransient(_layout, std::span<const VkDescriptorPoolSize>(drawSetSizes.data(), drawSetSizeCount));
+    Require(result.allocation.set != VK_NULL_HANDLE, "draw snapshot descriptor allocation failed");
     if (parts.enabled) {
         ++parts.sets;
         parts.mark(BindingParts::Allocate);
     }
-    auto buffers = descriptorBuffers;
-    auto writes = descriptorWrites;
-    std::vector<std::size_t> snapshotIndices(allocations.size(), selected.size());
+    // The template's writes with the copies' buffers in place of theirs: one call, no descriptor
+    // copies (the lists are the thread's, refilled).
+    struct BuffersTag {};
+    struct WritesTag {};
+    auto& buffers = ThreadScratch<std::vector<VkDescriptorBufferInfo>, BuffersTag>();
+    auto& writes = ThreadScratch<std::vector<VkWriteDescriptorSet>, WritesTag>();
+    buffers.assign(descriptorBuffers.begin(), descriptorBuffers.end());
+    writes.assign(descriptorWrites.begin(), descriptorWrites.end());
+    InlineList<std::size_t, 32> snapshotIndices;
+    snapshotIndices.assign(allocations.size(), selected.size());
     for (std::size_t index = 0; index < selected.size(); ++index) snapshotIndices[selected[index]] = index;
     for (std::size_t index = 0; index < bindings.size(); ++index) {
         const auto& binding = bindings[index];
         auto& write = writes[index];
-        write.dstSet = result->allocation.set;
+        write.dstSet = result.allocation.set;
         if (binding.allocations.empty()) continue;
         const auto offset = static_cast<std::size_t>(write.pBufferInfo - descriptorBuffers.data());
         write.pBufferInfo = buffers.data() + offset;
         for (std::size_t element = 0; element < binding.allocations.size(); ++element) {
             const auto snapshotIndex = snapshotIndices[binding.allocations[element]];
             if (snapshotIndex == selected.size()) continue;
-            const auto& snapshot = result->snapshots[snapshotIndex];
+            const auto& snapshot = result.snapshots[snapshotIndex];
             buffers[offset + element] = {snapshot.buffer->Handle(), snapshot.offset, snapshot.bytes};
         }
     }
     if (parts.enabled) parts.mark(BindingParts::Copy);
     context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets")(context.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
-    recorder.Keep(result);
-    for (const auto& snapshot : result->snapshots) recorder.KeepBytes(snapshot.buffer.get(), snapshot.buffer->Bytes().size());
+    for (const auto& snapshot : result.snapshots) recorder.KeepBytes(snapshot.buffer.get(), snapshot.buffer->Bytes().size());
     if (parts.enabled) parts.mark(BindingParts::Write);
-    return result;
+    return true;
 }
 
 void ShaderResources::Bind(VkCommandBuffer commands, VkPipelineBindPoint bindPoint, VkPipelineLayout layout) const {
@@ -3736,7 +3804,9 @@ void ShaderResources::MarkGpuWrites(Recorder& recorder) {
     // The ranges this use reads in place through their host imports (read-only and written elements
     // alike, and an address-based build's whole leased heaps), before the writes: a CPU store into
     // one of them (the copy HLE) must not land before the recorded work read it.
-    recorder.NotePendingReads(guestMemory.InPlaceReads(), guestMemory.HoldsLease() ? Recorder::ReadKind::AddressBased : Recorder::ReadKind::DispatchElement);
+    InlineList<std::pair<std::uint64_t, std::uint64_t>, 16> reads;
+    guestMemory.AppendInPlaceReads(reads);
+    recorder.NotePendingReads(std::span<const std::pair<std::uint64_t, std::uint64_t>>(reads.data(), reads.size()), guestMemory.HoldsLease() ? Recorder::ReadKind::AddressBased : Recorder::ReadKind::DispatchElement);
     copyWrittenDepthSurfaces();
     if (SkipWriteBack()) return;
     for (std::size_t index = 0; index < storageTextures.size(); ++index) {
@@ -3774,8 +3844,7 @@ void ShaderResources::WriteBackBuffers() {
 }
 
 bool ShaderResources::ReadsOverlap(std::uint64_t address, std::size_t bytes) const {
-    const auto reads = guestMemory.InPlaceReads();
-    return std::any_of(reads.begin(), reads.end(), [&](const auto& range) { return address < range.second && range.first < address + bytes; });
+    return guestMemory.InPlaceReadOverlaps(address, bytes);
 }
 
 std::vector<std::pair<VkImage, bool>> ShaderResources::StorageImages() const {

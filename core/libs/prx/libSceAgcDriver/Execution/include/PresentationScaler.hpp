@@ -17,6 +17,9 @@ public:
 
     void EnsureSourceImage(std::uint32_t width, std::uint32_t height);
     void RecordUpload(VkCommandBuffer commands, VkBuffer uploadBuffer);
+    // The source image takes `image`'s texels as they are (a copy between size-compatible formats):
+    // a resident display image whose bytes are already in the source's order.
+    void RecordCopyFrom(VkCommandBuffer commands, VkImage image, VkImageLayout layout);
     void RecordClear(VkCommandBuffer commands, const VkClearColorValue& color);
     void RecordImage(VkCommandBuffer commands, VkImage image);
     // Fills the source image from another image of the same extent (any blittable format, layout

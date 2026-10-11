@@ -7,10 +7,12 @@
 #include <cstddef>
 #include <cstdint>
 #include <initializer_list>
+#include <iterator>
 #include <memory>
 #include <optional>
 #include <span>
 #include <utility>
+#include <stdexcept>
 #include <string_view>
 #include <vector>
 
@@ -177,13 +179,79 @@ inline constexpr std::uint32_t InterpolationQuiet = 1u;
 inline constexpr std::uint32_t InterpolationFlush32 = 2u;
 inline constexpr std::uint32_t InterpolationFlush16 = 4u;
 
+// A stage's inputs a request holds, read as an optional: a value of its own, or one borrowed from
+// storage that outlives every use of the request (a draw's decoded vertex inputs while its stages
+// compile), so the request a draw builds for each stage copies none of its kilobyte. A copy always
+// owns its value: a request kept past the draw (a capture, a cache entry) never borrows.
+template<typename T>
+class StageInfo {
+public:
+    StageInfo() = default;
+    StageInfo(std::nullopt_t) {}
+    StageInfo(const T& value) : owned(value) {}
+    StageInfo(const std::optional<T>& value) : owned(value) {}
+    StageInfo(const StageInfo& other) : owned(other.copy()) {}
+    StageInfo& operator=(const StageInfo& other) {
+        if (this != &other) {
+            owned = other.copy();
+            borrowed = nullptr;
+        }
+        return *this;
+    }
+    StageInfo& operator=(const T& value) {
+        owned = value;
+        borrowed = nullptr;
+        return *this;
+    }
+    StageInfo& operator=(const std::optional<T>& value) {
+        owned = value;
+        borrowed = nullptr;
+        return *this;
+    }
+    StageInfo& operator=(std::nullopt_t) {
+        owned.reset();
+        borrowed = nullptr;
+        return *this;
+    }
+    template<typename... Args>
+    T& emplace(Args&&... args) {
+        borrowed = nullptr;
+        return owned.emplace(std::forward<Args>(args)...);
+    }
+    // Refers to `value` (none when null) until the next assignment.
+    void Borrow(const T* value) {
+        owned.reset();
+        borrowed = value;
+    }
+    bool has_value() const { return borrowed != nullptr || owned.has_value(); }
+    explicit operator bool() const { return has_value(); }
+    const T& operator*() const { return borrowed != nullptr ? *borrowed : *owned; }
+    const T* operator->() const { return &**this; }
+    // Writing takes a copy of a borrowed value first.
+    T& operator*() {
+        own();
+        return *owned;
+    }
+    T* operator->() { return &**this; }
+
+private:
+    std::optional<T> copy() const { return has_value() ? std::optional<T>(**this) : std::nullopt; }
+    void own() {
+        if (borrowed == nullptr) return;
+        owned = *borrowed;
+        borrowed = nullptr;
+    }
+    std::optional<T> owned;
+    const T* borrowed = nullptr;
+};
+
 struct GuestContext {
     std::uint32_t waveSize;
     std::uint32_t userDataBaseRegister;
     std::span<const std::uint32_t> userData;
     std::optional<ShaderComputeStageInfo> compute;
     std::optional<ShaderPixelStageInfo> pixel;
-    std::optional<ShaderVertexStageInfo> vertex;
+    StageInfo<ShaderVertexStageInfo> vertex;
     std::span<const MemoryRegion> memory;
     std::optional<ShaderFloatMode> floatMode;
 };
@@ -340,6 +408,94 @@ enum class DescriptorRole {
     ShaderData
 };
 
+// A binding's per-element flags, read as a std::vector<bool> is: inline up to 64 elements (a binding
+// rarely has more), a vector beyond. A result materialized from a capture fills several per binding,
+// for every draw stage the stage memo misses and every dispatch: inline, none of them allocates.
+class ElementFlags {
+public:
+    class const_iterator {
+    public:
+        using iterator_category = std::forward_iterator_tag;
+        using value_type = bool;
+        using difference_type = std::ptrdiff_t;
+        using pointer = void;
+        using reference = bool;
+        const_iterator() = default;
+        const_iterator(const ElementFlags* flags, std::size_t index) : flags(flags), index(index) {}
+        bool operator*() const { return (*flags)[index]; }
+        const_iterator& operator++() {
+            ++index;
+            return *this;
+        }
+        const_iterator operator++(int) {
+            auto previous = *this;
+            ++index;
+            return previous;
+        }
+        bool operator==(const const_iterator& other) const { return index == other.index; }
+        bool operator!=(const const_iterator& other) const { return index != other.index; }
+
+    private:
+        const ElementFlags* flags = nullptr;
+        std::size_t index = 0;
+    };
+
+    ElementFlags() = default;
+    ElementFlags(std::initializer_list<bool> flags) {
+        for (const bool flag : flags) push_back(flag);
+    }
+    std::size_t size() const { return count; }
+    bool empty() const { return count == 0; }
+    bool operator[](std::size_t index) const { return count <= InlineFlags ? ((bits >> index) & 1u) != 0 : spill[index]; }
+    bool at(std::size_t index) const {
+        if (index >= count) throw std::out_of_range("ElementFlags::at");
+        return (*this)[index];
+    }
+    void push_back(bool flag) {
+        if (count < InlineFlags) {
+            if (flag) bits |= std::uint64_t{1} << count;
+            ++count;
+            return;
+        }
+        if (count == InlineFlags) {
+            for (std::size_t index = 0; index < InlineFlags; ++index) spill.push_back(((bits >> index) & 1u) != 0);
+        }
+        spill.push_back(flag);
+        ++count;
+    }
+    void clear() {
+        bits = 0;
+        count = 0;
+        spill.clear();
+    }
+    void assign(std::size_t size, bool flag) {
+        clear();
+        for (std::size_t index = 0; index < size; ++index) push_back(flag);
+    }
+    const_iterator begin() const { return {this, 0}; }
+    const_iterator end() const { return {this, count}; }
+    bool operator==(const ElementFlags& other) const {
+        if (count != other.count) return false;
+        for (std::size_t index = 0; index < count; ++index) {
+            if ((*this)[index] != other[index]) return false;
+        }
+        return true;
+    }
+    bool operator==(const std::vector<bool>& other) const {
+        if (count != other.size()) return false;
+        for (std::size_t index = 0; index < count; ++index) {
+            if ((*this)[index] != other[index]) return false;
+        }
+        return true;
+    }
+
+private:
+    static constexpr std::size_t InlineFlags = 64;
+    std::uint64_t bits = 0;
+    std::size_t count = 0;
+    std::vector<bool> spill;
+};
+
 struct DescriptorBinding {
     DescriptorKind kind;
     DescriptorRole role;
@@ -349,25 +505,25 @@ struct DescriptorBinding {
     std::vector<std::uint32_t> guestDescriptor;
     bool readOnly = false;
     std::optional<DescriptorImageShape> imageShape;
-    std::vector<bool> samplerDepthCompare;
+    ElementFlags samplerDepthCompare;
     // Guest image elements the shader stores to (or updates atomically); the others are only read.
-    std::vector<bool> imageWritten;
-    std::vector<bool> imageDepthCompare;
-    std::vector<bool> imageAtomic;
-    std::vector<bool> imageAtomic64;
+    ElementFlags imageWritten;
+    ElementFlags imageDepthCompare;
+    ElementFlags imageAtomic;
+    ElementFlags imageAtomic64;
     // Guest buffer elements the shader updates atomically (one entry per element of a GuestBuffers
     // binding, empty otherwise). An atomic on a host-imported range is a serialized PCIe round trip
     // (~0.4-0.5 us each on NVIDIA), so a driver may keep these elements in device-local memory.
-    std::vector<bool> bufferAtomic;
+    ElementFlags bufferAtomic;
     // Guest buffer elements the shader may store to through this V# (any store or atomic in the
     // program, whatever its offset), one entry per element of a GuestBuffers binding, empty
     // otherwise. A false entry is proved: every access of that element is a load. A driver may then
     // skip the write-back and the pending-write note for the element; an element beyond the vector
     // (a producer that does not fill it) must be treated as written.
-    std::vector<bool> bufferWritten;
-    std::vector<bool> samplerUnnormalized;
+    ElementFlags bufferWritten;
+    ElementFlags samplerUnnormalized;
     std::vector<bool> samplerIntegerBorder;
-    std::vector<bool> imageUnnormalized;
+    ElementFlags imageUnnormalized;
     std::vector<std::uint32_t> imageSamplers;
     std::vector<bool> bufferRead;
 };
