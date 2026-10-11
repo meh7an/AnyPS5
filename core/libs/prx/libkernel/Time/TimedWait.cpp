@@ -8,6 +8,7 @@
 #include <windows.h>
 #else
 #include <cerrno>
+#include <thread>
 #include <time.h>
 #endif
 
@@ -320,6 +321,16 @@ void PollSleepUntil(std::uint64_t deadlineNanos) {
     if (!TimerWait(timer, deadlineNanos - now)) AlertableSleep(WholeMilliseconds(deadlineNanos - now));
 #else
     SleepUntil(deadlineNanos);
+#endif
+}
+
+void LockBackoff(std::uint32_t attempt) {
+#ifdef _WIN32
+    if (attempt < LOCK_SPINS) YieldProcessor();
+    else PollSleepUntil(NowNanos() + LOCK_WAKE_NANOS);
+#else
+    if (attempt < LOCK_SPINS) std::this_thread::yield();
+    else SleepNanos(LOCK_WAKE_NANOS);
 #endif
 }
 

@@ -39,6 +39,20 @@ bool AcquireUntil(std::uint64_t deadlineNanos, TTryLock tryLock, TTryLockFor try
     }
 }
 
+constexpr std::uint32_t LOCK_SPINS = 256;
+constexpr std::uint64_t LOCK_WAKE_NANOS = 100000ULL;
+
+// The wait between two tries of a contended untimed lock (AcquireAlertably): LOCK_SPINS pauses
+// for brief holds, then alertable timer waits of LOCK_WAKE_NANOS without SleepNanos' lead spin.
+void LockBackoff(std::uint32_t attempt);
+
+// An untimed lock that keeps the thread alertable while it waits: on Windows a blocking lock would
+// hold back the APCs a Unity GC suspends threads with. An unlock is seen within one wake interval.
+template <class TTryLock>
+void AcquireAlertably(TTryLock tryLock) {
+    for (std::uint32_t attempt = 0; !tryLock(); ++attempt) LockBackoff(attempt);
+}
+
 struct Waiter;
 
 class Condition {

@@ -47,7 +47,7 @@ int APS5_VABI scePthreadRwlockRdlock(PthreadRwlock* rwlock) {
     auto* lock = RequireRwlock(rwlock, __func__);
     if (OwnsWrite(lock)) return SCE_KERNEL_ERROR_EDEADLK;
 #ifdef _WIN32
-    while (!lock->_lock.try_lock_shared()) TimedWait::SleepNanos(1000000);
+    TimedWait::AcquireAlertably([&] { return lock->_lock.try_lock_shared(); });
 #else
     lock->_lock.lock_shared();
 #endif
@@ -76,7 +76,7 @@ int APS5_VABI scePthreadRwlockWrlock(PthreadRwlock* rwlock) {
     auto* lock = RequireRwlock(rwlock, __func__);
     if (OwnsWrite(lock)) return SCE_KERNEL_ERROR_EDEADLK;
 #ifdef _WIN32
-    while (!lock->_lock.try_lock()) TimedWait::SleepNanos(1000000);
+    TimedWait::AcquireAlertably([&] { return lock->_lock.try_lock(); });
 #else
     lock->_lock.lock();
 #endif
