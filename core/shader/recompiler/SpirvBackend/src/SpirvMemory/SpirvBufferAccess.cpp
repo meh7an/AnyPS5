@@ -4,6 +4,7 @@
 #include "SpirvBackend/SpirvMemory/SpirvTypes.hpp"
 #include "SpirvBackend/SpirvMemory/SpirvDescriptors.hpp"
 #include <spirv/unified1/spirv.hpp>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 #include <SpirvBackend/SpirvEmitterInstructions.hpp>
@@ -166,6 +167,38 @@ std::uint32_t EmitMemoryElementInBounds(SpirvEmitterState& state, const MemoryRe
     const auto inBounds = state.module.AllocateId();
     state.module.AddFunction(spv::OpULessThan, TypeBool(state), inBounds, last, access.length);
     return inBounds;
+}
+
+// Measuring aid only: APS5_UNCHECKED_BUFFER_READS=1 takes every buffer, scalar buffer and LDS read
+// as in bounds (no length or records check), writes keeping theirs. A read out of bounds then
+// returns whatever lies there, or faults.
+bool UncheckedBufferReads() {
+    static const bool unchecked = std::getenv("APS5_UNCHECKED_BUFFER_READS") != nullptr;
+    return unchecked;
+}
+
+std::uint32_t EmitMemoryElementReadable(SpirvEmitterState& state, const MemoryResourceAccess& access, std::uint32_t index) {
+    return UncheckedBufferReads() ? ConstantBool(state, true) : EmitMemoryElementInBounds(state, access, index);
+}
+
+// A read branched around its load on its bounds check, at every word of every buffer, scalar buffer
+// and LDS read: the 4K post pass of Sonic Origins' menu made a thousand such branches, and every
+// load sat alone in its block. The check now picks the loaded value or its zero after the load (an
+// OpSelect), and the load reads a clamped element, which never leaves the resource. On that menu
+// the GPU's frame went from 16.7 to 15.1 ms (the GPU-bound Sonic 1 page from 50 to 54 FPS); with no
+// checks at all (APS5_UNCHECKED_BUFFER_READS) it is 13.3 ms.
+bool BranchlessBufferReads() {
+    static const bool branchless = std::getenv("APS5_BRANCHED_BUFFER_READS") == nullptr;
+    return branchless;
+}
+
+std::uint32_t EmitMemoryElementClamped(SpirvEmitterState& state, const MemoryResourceAccess& access, std::uint32_t index) {
+    if (UncheckedBufferReads()) return index;
+    const auto u32 = TypeU32(state);
+    // A misaligned read loads the element after `index` as well.
+    const auto reach = ConstantU32(state, access.misalignment != 0u ? 2u : 1u);
+    const auto last = Select(state, u32, Binary(state, spv::OpUGreaterThanEqual, TypeBool(state), access.length, reach), Binary(state, spv::OpISub, u32, access.length, reach), ConstantU32(state, 0u));
+    return Select(state, u32, Binary(state, spv::OpULessThan, TypeBool(state), index, last), index, last);
 }
 
 std::uint32_t EmitMemoryElementPointer(SpirvEmitterState& state, const MemoryResourceAccess& access, std::uint32_t index) {

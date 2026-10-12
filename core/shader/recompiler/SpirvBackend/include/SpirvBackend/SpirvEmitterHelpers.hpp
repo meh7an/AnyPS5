@@ -108,6 +108,15 @@ std::uint32_t EmitLdsLockPointer(SpirvEmitterState& state);
 MemoryResourceAccess PrepareMemoryResourceAccess(SpirvEmitterState& state, const MemoryInfo& mem);
 std::uint32_t EmitMemoryElementIndex(SpirvEmitterState& state, const MemoryResourceAccess& access, std::uint32_t rawIndex);
 std::uint32_t EmitMemoryElementInBounds(SpirvEmitterState& state, const MemoryResourceAccess& access, std::uint32_t index);
+// EmitMemoryElementInBounds for a read; APS5_UNCHECKED_BUFFER_READS=1 (UncheckedBufferReads, a
+// measuring aid) takes every read as in bounds.
+bool UncheckedBufferReads();
+std::uint32_t EmitMemoryElementReadable(SpirvEmitterState& state, const MemoryResourceAccess& access, std::uint32_t index);
+// Whether a bounds-checked read loads unconditionally from a clamped element and selects its zero
+// (BranchlessBufferReads), rather than branching around the load; APS5_BRANCHED_BUFFER_READS=1
+// branches as before. EmitMemoryElementClamped is the element such a read loads instead of `index`.
+bool BranchlessBufferReads();
+std::uint32_t EmitMemoryElementClamped(SpirvEmitterState& state, const MemoryResourceAccess& access, std::uint32_t index);
 std::uint32_t EmitMemoryElementPointer(SpirvEmitterState& state, const MemoryResourceAccess& access, std::uint32_t index);
 std::uint32_t EmitStorageBufferElementPointer(SpirvEmitterState& state, const MemoryResourceAccess& access, std::uint32_t index, std::uint32_t pointerType);
 std::uint32_t EmitTBufferBitcastU32ToI32(SpirvEmitterState& state, std::uint32_t value);

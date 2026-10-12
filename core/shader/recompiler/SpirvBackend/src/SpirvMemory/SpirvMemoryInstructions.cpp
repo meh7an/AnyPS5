@@ -136,7 +136,12 @@ std::uint32_t LoadSubwordInBounds(SpirvValueEmitContext& ctx, const MemoryResour
 std::uint32_t LoadWordPrepared(SpirvValueEmitContext& ctx, const IrValue& inst, const MemoryInfo& mem, const MemoryResourceAccess& resource) {
     auto& state = ctx.state;
     const auto index = EmitMemoryElementIndex(state, resource, DwordIndex(ctx, inst, mem));
-    return EmitValueOrZeroIfCondition(state, EmitMemoryElementInBounds(state, resource, index), [&]() {
+    if (BranchlessBufferReads()) {
+        const auto inBounds = EmitMemoryElementReadable(state, resource, index);
+        const auto value = LoadWordInBounds(ctx, resource, EmitMemoryElementClamped(state, resource, index));
+        return Select(state, TypeU32(state), inBounds, value, ConstantU32(state, 0u));
+    }
+    return EmitValueOrZeroIfCondition(state, EmitMemoryElementReadable(state, resource, index), [&]() {
         return LoadWordInBounds(ctx, resource, index);
     });
 }
@@ -153,7 +158,12 @@ std::uint32_t LoadSubwordPrepared(SpirvValueEmitContext& ctx, const IrValue& ins
     const auto address = ByteAddress(ctx, inst, mem);
     const auto rawIndex = Binary(state, spv::OpShiftRightLogical, TypeU32(state), address, ConstantU32(state, 2u));
     const auto index = EmitMemoryElementIndex(state, resource, rawIndex);
-    return EmitValueOrZeroIfCondition(state, EmitMemoryElementInBounds(state, resource, index), [&]() {
+    if (BranchlessBufferReads()) {
+        const auto inBounds = EmitMemoryElementReadable(state, resource, index);
+        const auto value = LoadSubwordInBounds(ctx, resource, address, EmitMemoryElementClamped(state, resource, index), bits, signExtend);
+        return Select(state, TypeU32(state), inBounds, value, ConstantU32(state, 0u));
+    }
+    return EmitValueOrZeroIfCondition(state, EmitMemoryElementReadable(state, resource, index), [&]() {
         return LoadSubwordInBounds(ctx, resource, address, index, bits, signExtend);
     });
 }
@@ -296,7 +306,13 @@ std::uint32_t LoadWideShared(SpirvValueEmitContext& ctx, const IrValue& inst, co
             const auto address = component == 0u ? base : Binary(state, spv::OpIAdd, TypeU32(state), base, ConstantU32(state, component * 4u));
             const auto rawIndex = Binary(state, spv::OpShiftRightLogical, TypeU32(state), address, ConstantU32(state, 2u));
             const auto index = EmitMemoryElementIndex(state, resource, rawIndex);
-            values.at(component) = EmitValueOrZeroIfCondition(state, EmitMemoryElementInBounds(state, resource, index), [&]() {
+            if (BranchlessBufferReads()) {
+                const auto inBounds = EmitMemoryElementReadable(state, resource, index);
+                const auto value = LoadWordInBounds(ctx, resource, EmitMemoryElementClamped(state, resource, index));
+                values.at(component) = Select(state, TypeU32(state), inBounds, value, ConstantU32(state, 0u));
+                continue;
+            }
+            values.at(component) = EmitValueOrZeroIfCondition(state, EmitMemoryElementReadable(state, resource, index), [&]() {
                 return LoadWordInBounds(ctx, resource, index);
             });
         }
@@ -372,7 +388,13 @@ std::uint32_t LoadApertureDword(SpirvValueEmitContext& ctx, ResourceKind kind, s
     storage.kind = kind;
     const auto resource = PrepareMemoryResourceAccess(state, storage);
     const auto index = Binary(state, spv::OpShiftRightLogical, TypeU32(state), byteOffset, ConstantU32(state, 2u));
-    return EmitValueOrZeroIfCondition(state, EmitMemoryElementInBounds(state, resource, index), [&] {
+    if (BranchlessBufferReads()) {
+        const auto inBounds = EmitMemoryElementReadable(state, resource, index);
+        const auto safe = EmitMemoryElementClamped(state, resource, index);
+        const auto value = bits == 32u ? LoadWordInBounds(ctx, resource, safe) : LoadSubwordInBounds(ctx, resource, byteOffset, safe, bits, false);
+        return Select(state, TypeU32(state), inBounds, value, ConstantU32(state, 0u));
+    }
+    return EmitValueOrZeroIfCondition(state, EmitMemoryElementReadable(state, resource, index), [&] {
         return bits == 32u ? LoadWordInBounds(ctx, resource, index) : LoadSubwordInBounds(ctx, resource, byteOffset, index, bits, false);
     });
 }
