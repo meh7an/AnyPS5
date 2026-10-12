@@ -970,6 +970,8 @@ DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uin
         bool sighted = false;
         if (copy.generation != 0) copy.buffer = recorder->ReusableDrawSnapshot(address, bytes, use, &copy.derived, 0, &copy.rewritten, &sighted);
         if (copy.buffer != nullptr) {
+            // No read checks the range of a reused copy: the copy was proven unchanged, not mapped.
+            GuestMemory::CheckRange(reinterpret_cast<const void*>(address), bytes, alignment);
             copy.reused = true;
             return copy;
         }
@@ -1035,6 +1037,14 @@ const HostImport* InPlaceDrawInput(const Context& context, std::uint64_t address
 }
 
 namespace {
+
+// APS5_PRECHECK_DRAW_INPUTS=1: prepareDrawInputs checks every index and vertex range before it is
+// read, as before. GuestMemory::Read checks the range it copies, so the copies into the upload
+// chunk (most draw inputs) were checked twice.
+bool PreCheckDrawInputs() {
+    static const bool precheck = std::getenv("APS5_PRECHECK_DRAW_INPUTS") != nullptr;
+    return precheck;
+}
 
 // A draw's vertex buffer copies (one or two for most draws): four inline, more spill to the heap.
 using VertexBufferList = InlineList<std::shared_ptr<Buffer>, 4>;
@@ -1238,7 +1248,9 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
     const auto indexBytes = inputs.indexBytes;
     APS5_LOG_OUT_DEBUG("Index buffer bytes=%llu", static_cast<unsigned long long>(indexBytes));
     Require(indexBytes <= std::numeric_limits<std::size_t>::max(), "index buffer size overflow");
-    if (draw.indexed) GuestMemory::CheckRange(reinterpret_cast<const void*>(draw.indexAddress), static_cast<std::size_t>(indexBytes), draw.indexSize);
+    // The index range is checked where it is read (below): by the read into the upload chunk or a
+    // copy, by CopyDrawInput for a reused copy, before an import is read in place.
+    if (draw.indexed && PreCheckDrawInputs()) GuestMemory::CheckRange(reinterpret_cast<const void*>(draw.indexAddress), static_cast<std::size_t>(indexBytes), draw.indexSize);
     APS5_LOG_CHARS_OUT_DEBUG("Index buffer range OK");
     Require(!draw.indexed || !state.hasColorTarget || draw.indexAddress + indexBytes <= state.color.address || state.color.address + state.color.bytes <= draw.indexAddress, "index buffer aliases the render target");
     if (state.rectList) Require(draw.indexCount % 3 == 0, "incomplete rect-list primitive");
@@ -1421,8 +1433,10 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
     for (std::size_t range = 0; range < plan.copies.size(); ++range) {
         const auto [begin, end] = plan.copies[range];
         const auto bytes = static_cast<std::size_t>(end - begin);
-        GuestMemory::CheckRange(reinterpret_cast<const void*>(begin), bytes, 1);
+        // As the index range: checked by the read, by CopyDrawInput or before an in-place read.
+        if (PreCheckDrawInputs()) GuestMemory::CheckRange(reinterpret_cast<const void*>(begin), bytes, 1);
         if (const auto* import = InPlaceDrawInputs() ? InPlaceDrawInput(context, begin, bytes, plan.alignments[range]) : nullptr) {
+            GuestMemory::CheckRange(reinterpret_cast<const void*>(begin), bytes, 1);
             rangeHandles.push_back(import->buffer);
             rangeOffsets.push_back(begin - import->base);
             inputs.inPlaceReads.emplace_back(begin, end);
