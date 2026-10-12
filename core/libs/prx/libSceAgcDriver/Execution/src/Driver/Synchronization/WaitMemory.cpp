@@ -5,6 +5,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ThreadScratch.hpp"
 #include <cstdlib>
 #include <mutex>
 #include <set>
@@ -53,9 +54,10 @@ bool Driver::traceLateLabels() {
     return trace;
 }
 
+// Asked on every draw packet (landPendingWaits): a thread slot, as thread_local is emulated on MinGW.
 std::vector<Driver::PendingWait>& Driver::pendingWaits() {
-    static thread_local std::vector<PendingWait> waits;
-    return waits;
+    struct PendingWaitsTag {};
+    return ThreadScratch<std::vector<PendingWait>, PendingWaitsTag>();
 }
 
 void Driver::notePendingWait(std::span<const std::uint32_t> packet, std::uint32_t queue, std::uint64_t received) {
