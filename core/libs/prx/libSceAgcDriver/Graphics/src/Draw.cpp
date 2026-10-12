@@ -1609,8 +1609,10 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
     parts.start();
     APS5_LOG_CHARS_OUT_DEBUG("Creating ShaderResources");
     // Only recordable draws take part: a synchronous draw writes its resources back, which a shared
-    // object must never do. Push constants still come from this draw's stages.
-    resolved.cacheable = recordable && cacheableStages(shaders);
+    // object must never do. Push constants still come from this draw's stages. A draw its preparing
+    // thread keyed (PrecomputeDraw) had its stages found cacheable there.
+    const bool keyedAhead = precomputed != nullptr && precomputed->keyed && !verifyPrecomputedDraws();
+    resolved.cacheable = recordable && (keyedAhead || cacheableStages(shaders));
     const bool trimKey = drawKeyTrimmed();
     if (resolved.cacheable) {
         // Built in the thread's buffer: a template hit keys its lookup without allocating. A key the
