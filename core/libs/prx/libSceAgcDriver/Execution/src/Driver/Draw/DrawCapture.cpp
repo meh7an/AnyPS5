@@ -164,33 +164,51 @@ void appendSpecializationWords(const ShaderRecompiler::RecompileRequest& request
     }
 }
 
-// A stage's memo key: the user data size, each user word's bits the source reads other than as a
-// copy, each inline V#'s base zero-ness, the request's specialization words; hashed with the
-// source and the push offset.
-std::uint64_t stageMemoKey(const ShaderRecompiler::UserDataKey& key, const void* source, std::uint32_t pushOffset, const ShaderRecompiler::RecompileRequest& request, std::span<const std::uint32_t> userData, std::vector<std::uint32_t>& words) {
-    words.clear();
-    words.reserve(key.keepBits.size() + key.bufferBases.size() + 1u);
-    words.push_back(static_cast<std::uint32_t>(userData.size()));
-    const auto word = [&](std::size_t k) { return k < userData.size() ? userData[k] : 0u; };
-    for (std::size_t k = 0; k < key.keepBits.size(); ++k) words.push_back(word(k) & key.keepBits[k]);
-    for (const auto& [low, high] : key.bufferBases) words.push_back(word(low) == 0u && (word(high) & 0xffffu) == 0u ? 1u : 0u);
-    appendSpecializationWords(request, words);
-    std::uint64_t hash = 0xcbf29ce484222325ull;
-    const auto mix = [&](std::uint64_t value) {
-        hash ^= value;
-        hash *= 0x100000001b3ull;
-    };
-    mix(reinterpret_cast<std::uintptr_t>(source));
-    mix(pushOffset);
-    for (const auto value : words) mix(value);
-    // MurmurHash3's finalizer: the memo's table indexes by the low bits, which FNV's last multiply
-    // leaves depending on the inputs' low bits alone.
+// The hash of a stage's memo key: two chains of multiplies over 64-bit pairs of its words, joined
+// with the source and the push offset. One chain over single words (FNV) made every multiply wait
+// for the one before, the larger part of the key's cost at every stage of every draw.
+std::uint64_t hashStageMemoKey(const void* source, std::uint32_t pushOffset, std::span<const std::uint32_t> words) {
+    constexpr std::uint64_t Multiplier = 0x9e3779b97f4a7c15ull;
+    std::uint64_t first = 0xcbf29ce484222325ull ^ reinterpret_cast<std::uintptr_t>(source);
+    std::uint64_t second = 0x84222325cbf29ce4ull ^ pushOffset ^ (static_cast<std::uint64_t>(words.size()) << 32u);
+    const auto pair = [&](std::size_t i) { return words[i] | static_cast<std::uint64_t>(words[i + 1]) << 32u; };
+    std::size_t i = 0;
+    for (; i + 4 <= words.size(); i += 4) {
+        first = (first ^ pair(i)) * Multiplier;
+        second = (second ^ pair(i + 2)) * Multiplier;
+    }
+    for (; i < words.size(); ++i) first = (first ^ words[i]) * Multiplier;
+    auto hash = first ^ (second >> 32u | second << 32u);
+    // MurmurHash3's finalizer: the memo's table indexes by the low bits, which the multiplies leave
+    // depending on the inputs' low bits alone.
     hash ^= hash >> 33u;
     hash *= 0xff51afd7ed558ccdull;
     hash ^= hash >> 33u;
     hash *= 0xc4ceb9fe1a85ec53ull;
     hash ^= hash >> 33u;
     return hash;
+}
+
+// A stage's memo key: the user data size, each user word's bits the source reads other than as a
+// copy, each inline V#'s base zero-ness, the request's specialization words; hashed with the
+// source and the push offset. The first three are written in place (the list keeps its storage from
+// stage to stage), not pushed word by word.
+std::uint64_t stageMemoKey(const ShaderRecompiler::UserDataKey& key, const void* source, std::uint32_t pushOffset, const ShaderRecompiler::RecompileRequest& request, std::span<const std::uint32_t> userData, std::vector<std::uint32_t>& words) {
+    const auto keep = key.keepBits.size();
+    const auto bases = key.bufferBases.size();
+    words.resize(1u + keep + bases);
+    auto* const out = words.data();
+    out[0] = static_cast<std::uint32_t>(userData.size());
+    const auto present = std::min(keep, userData.size());
+    for (std::size_t k = 0; k < present; ++k) out[1u + k] = userData[k] & key.keepBits[k];
+    std::fill(out + 1u + present, out + 1u + keep, 0u);
+    const auto word = [&](std::size_t k) { return k < userData.size() ? userData[k] : 0u; };
+    for (std::size_t b = 0; b < bases; ++b) {
+        const auto [low, high] = key.bufferBases[b];
+        out[1u + keep + b] = word(low) == 0u && (word(high) & 0xffffu) == 0u ? 1u : 0u;
+    }
+    appendSpecializationWords(request, words);
+    return hashStageMemoKey(source, pushOffset, words);
 }
 
 // A thread's memo keys by source (ShaderRecompiler::UserDataKeyFor; a source entry lives as long as
