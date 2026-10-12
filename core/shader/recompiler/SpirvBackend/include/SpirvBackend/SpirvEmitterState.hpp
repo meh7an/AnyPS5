@@ -90,6 +90,8 @@ struct SpirvEmitterState {
     bool splitSubgroup = false;
     bool narrowSubgroupClock = false;
     bool float64DenormPreserve = false;
+    // SpirvTarget::robustBufferAccess2.
+    bool robustBufferAccess2 = false;
     std::unordered_set<const IrValue*> sharedLaneValues;
     std::uint32_t laneHalf = 0;
     // The target's SPIR-V version and what the device accepts, for capabilities an emitter adds

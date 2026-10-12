@@ -296,6 +296,9 @@ struct SpirvTarget {
     bool narrowSubgroupClock = false;
     bool fixedPushSlots = false;
     bool float64DenormPreserve = false;
+    // The device reads zeros past a bound buffer's range (VK_EXT_robustness2's
+    // robustBufferAccess2): a guest buffer read then needs no bound-range check of its own.
+    bool robustBufferAccess2 = false;
 };
 
 struct BindingLayout {

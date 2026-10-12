@@ -189,6 +189,15 @@ std::uint32_t readBuffer(SpirvValueEmitContext& context, const IrValue& instruct
         }
         return EmitAndConstant(state, value, bits == 32u ? 0xffffffffu : (1u << bits) - 1u);
     };
+    if (BranchlessBufferReads() && state.robustBufferAccess2 && !UncheckedBufferReads()) {
+        // Past the bound range the device reads zeros (robustBufferAccess2): an aligned read loads
+        // with no check or clamp of its own. A misaligned one still checks its second word, as a
+        // read reaching past the range is zero whole.
+        const auto boolean = TypeBool(state);
+        const auto value = read(index, next);
+        const auto whole = Binary(state, spv::OpLogicalOr, boolean, Unary(state, spv::OpLogicalNot, boolean, unaligned), EmitMemoryElementInBounds(state, access, next));
+        return Select(state, TypeU32(state), whole, value, ConstantU32(state, 0u));
+    }
     if (BranchlessBufferReads()) {
         // EmitMemoryElementClamped, with the misalignment known only at specialization.
         const auto u32 = TypeU32(state);

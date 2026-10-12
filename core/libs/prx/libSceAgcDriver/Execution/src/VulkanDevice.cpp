@@ -263,6 +263,9 @@ struct VulkanDevice::State {
     bool shaderClock = false;
     bool narrowSubgroupClock = false;
     bool float64DenormPreserve = false;
+    // VK_EXT_robustness2's robustBufferAccess2 enabled: reads past a bound buffer's range are zero
+    // (SpirvTarget::robustBufferAccess2).
+    bool robustBufferAccess2 = false;
     // VK_EXT_descriptor_indexing with non-uniform image array indexing (bindless image tables in
     // graphics stages, and compute workgroups wider than a wave).
     bool descriptorIndexing = false;
@@ -1356,9 +1359,17 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
         VkPhysicalDeviceFeatures2 queried{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &robustness2};
         state->InstanceFunction<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(selected, &queried);
     }
-    if (robustness2.nullDescriptor == VK_TRUE) {
+    // Zeros past a bound buffer's range let the recompiler drop its own range check from every
+    // guest buffer read (SpirvTarget::robustBufferAccess2). APS5_NO_ROBUST_BUFFER_ACCESS2=1 leaves
+    // the feature off and the checks in the shaders, as before.
+    static const bool robustReadsWanted = std::getenv("APS5_NO_ROBUST_BUFFER_ACCESS2") == nullptr;
+    const bool robustReads = robustReadsWanted && robustness2.robustBufferAccess2 == VK_TRUE && enabled.robustBufferAccess == VK_TRUE;
+    state->robustBufferAccess2 = robustReads;
+    if (robustness2.nullDescriptor == VK_TRUE || robustReads) {
+        const bool nullDescriptor = robustness2.nullDescriptor == VK_TRUE;
         robustness2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT};
-        robustness2.nullDescriptor = VK_TRUE;
+        robustness2.nullDescriptor = nullDescriptor ? VK_TRUE : VK_FALSE;
+        robustness2.robustBufferAccess2 = robustReads ? VK_TRUE : VK_FALSE;
         robustness2.pNext = bdaFeatures.pNext;
         bdaFeatures.pNext = &robustness2;
         deviceExtensions.push_back(VK_EXT_ROBUSTNESS_2_EXTENSION_NAME);
@@ -2804,6 +2815,7 @@ ShaderRecompiler::SpirvTarget VulkanDevice::buildTarget() const {
     target.nonConstantImageOffsets = state->maintenance8;
     target.narrowSubgroupClock = state->narrowSubgroupClock;
     target.float64DenormPreserve = state->float64DenormPreserve;
+    target.robustBufferAccess2 = state->robustBufferAccess2;
     target.fixedPushSlots = state->graphicsPipelineLibrary;
     target.srgbDecodeFormats = state->srgbDecodeFormats;
     if (state->meshShader) {

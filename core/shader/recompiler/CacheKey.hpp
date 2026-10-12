@@ -299,6 +299,7 @@ private:
         append(key, value.srgbDecodeFormats);
         append(key, value.narrowSubgroupClock);
         append(key, value.float64DenormPreserve);
+        append(key, value.robustBufferAccess2);
     }
 };
 
