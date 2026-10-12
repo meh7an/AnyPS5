@@ -2,10 +2,13 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_UNITSHADOW_HPP
 
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
+#include <algorithm>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <iterator>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <span>
@@ -102,6 +105,32 @@ std::size_t PublishShadow(std::uint64_t address, std::size_t bytes, PublishScope
 // hook-free readers and a build's stage A.
 bool AnyShadowedOverlaps(std::uint64_t address, std::size_t bytes);
 bool AnyShadowedOverlaps(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges);
+
+// A run of guest memory a registry snapshot holds nothing over, and the serial of that snapshot:
+// the run stays clear of the registry while its serial holds (the flush hook's clear runs,
+// Recorder.cpp).
+struct ClearRun {
+    std::uint64_t serial = 0;
+    std::uint64_t begin = 0;
+    std::uint64_t end = 0;
+};
+
+// Whether [address, end) overlaps none of `ranges` (sorted and merged); `run` then receives the run
+// between the ranges around it (its serial is the caller's to set).
+inline bool ClearAround(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, std::uint64_t address, std::uint64_t end, ClearRun& run) {
+    const auto it = std::upper_bound(ranges.begin(), ranges.end(), address, [](std::uint64_t value, const std::pair<std::uint64_t, std::uint64_t>& range) { return value < range.second; });
+    if (it != ranges.end() && it->first < end) return false;
+    run.begin = it == ranges.begin() ? 0 : std::prev(it)->second;
+    run.end = it == ranges.end() ? std::numeric_limits<std::uint64_t>::max() : it->first;
+    return true;
+}
+
+// Whether no live unit lies over [address, end) by the calling thread's snapshot, the answer
+// AnyShadowedOverlaps gives without its mutex; `run` then receives the run around it that none lies
+// over and the LiveUnitsSerial of the snapshot. No GpuMutex.
+bool LiveUnitsClear(std::uint64_t address, std::uint64_t end, ClearRun& run);
+// Moves whenever the live units change: a snapshot taken under one serial holds while it does.
+std::uint64_t LiveUnitsSerial();
 
 // The sources of a storage upload's surface-relative runs: [begin, end) pieces of them, each read
 // from one buffer (a slab while the unit is fresh, else the import) at `offset` (byte x of the run

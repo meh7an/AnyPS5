@@ -548,11 +548,16 @@ bool BatchFences() {
 // under this mutex takes the GPU mutex (no lock-order cycle).
 AgcDriver::Mutex labelTableMutex;
 Recorder* labelTableOwner = nullptr;
-// The ranges of the calling worker's queued labels (NoteQueuedLabel, cleared by
-// ForgetQueuedLabels): the flush hook, on the same thread, has them recorded before an access that
-// overlaps one, through the function the driver installed.
+// The ranges of the calling worker's queued labels (NoteQueuedLabel, cleared by ForgetQueuedLabels):
+// the flush hook, on the same thread, has them recorded before an access that overlaps one, through
+// the function the driver installed. The hook looks at every access whether there are any: a thread
+// slot of their own says so (QueuedLabelsOnThread), so that look reads no memory of the list, and
+// the list is a ThreadScratch rather than a fiber-local value (FlsGetValue at every access cost the
+// worker more than the hook's own checks did).
 struct QueuedLabelRangesTag {};
-auto& QueuedLabelRanges() { return HostThreadLocal<std::vector<std::pair<std::uint64_t, std::uint64_t>>, QueuedLabelRangesTag>(); }
+auto& QueuedLabelRanges() { return ThreadScratch<std::vector<std::pair<std::uint64_t, std::uint64_t>>, QueuedLabelRangesTag>(); }
+struct QueuedLabelsOnThreadTag {};
+using QueuedLabelsOnThread = HostThreadSlot<bool, QueuedLabelsOnThreadTag>;
 std::atomic<void (*)()> queuedLabelRecorder{nullptr};
 // The dwords (with their stamps) this thread noted since its last CloseLabelGroup (see Recorder::CloseLabelGroup).
 struct LabelGroupDwordsTag {};
@@ -631,9 +636,10 @@ bool QueuedLabelOverlaps(std::uint64_t address, std::size_t bytes) {
     }
     return false;
 }
-// Flush hook statistics: calls, calls whose snapshot check overlapped (the GpuMutex was taken),
-// targeted syncs and the batches they left in flight.
-std::atomic<std::uint64_t> hookCalls{0}, hookLocks{0}, targetedSyncs{0}, batchesLeftInFlight{0};
+// Flush hook statistics: calls, calls clear of every registry (clearAccess) and of them those a kept
+// run answered, calls whose snapshot check overlapped (the GpuMutex was taken), targeted syncs and
+// the batches they left in flight.
+std::atomic<std::uint64_t> hookCalls{0}, hookClear{0}, hookClearKept{0}, hookLocks{0}, targetedSyncs{0}, batchesLeftInFlight{0};
 // Snapshot maintenance (under the GpuMutex): notes whose range the snapshot already covered (no
 // rebuild), rebuilds, and the time the rebuilds took (APS5_PROFILE_DRAW), so their cost is visible.
 std::uint64_t snapshotCovered = 0, snapshotRebuilds = 0;
@@ -672,7 +678,7 @@ struct SnapshotCopy {
     std::shared_ptr<const WriteRanges> ranges;
 };
 
-const std::shared_ptr<const WriteRanges>& ThreadSnapshot() {
+const SnapshotCopy& ThreadSnapshotCopy() {
     struct SnapshotCopyTag {};
     auto& copy = ThreadScratch<SnapshotCopy, SnapshotCopyTag>();
     const auto generation = publishGeneration.load(std::memory_order_acquire);
@@ -680,7 +686,11 @@ const std::shared_ptr<const WriteRanges>& ThreadSnapshot() {
         copy.ranges = pendingWrites.load(std::memory_order_acquire);
         copy.generation = generation;
     }
-    return copy.ranges;
+    return copy;
+}
+
+const std::shared_ptr<const WriteRanges>& ThreadSnapshot() {
+    return ThreadSnapshotCopy().ranges;
 }
 
 bool SnapshotOverlaps(const WriteRanges* snapshot, std::uint64_t address, std::size_t bytes) {
@@ -1071,26 +1081,98 @@ void TraceRecordedStoreAccess(std::uint64_t address, std::size_t bytes, bool sto
     std::fprintf(stderr, "%s\n", line.c_str());
 }
 
-// GuestMemory flush hook: a CPU access to memory that recorded GPU work will write waits for that
-// work first; then storage image results pending for the range are stored. The recorder is only
-// dereferenced under the GpuMutex (it is destroyed with its device under that lock).
-void FlushForAccess(std::uint64_t address, std::size_t bytes) {
-    if (DrawProfiled()) hookCalls.fetch_add(1, std::memory_order_relaxed);
-    // A label this worker queued but has not recorded writes the range: in queue order the label
-    // precedes this access, so the group is recorded first (it then notes the range as a pending
-    // write of the open batch, and the check below syncs on it like any recorded store). Not from
-    // inside a completion action (a write-back store made while a batch is reaped): the record
-    // would reap nested in the reap in progress, landing later batches' write-backs before the
-    // rest of this one's, and this queue's queued label follows every batch of its own in flight
-    // anyway, so the write-back landing first is the order the hardware gives.
-    if (!QueuedLabelRanges().empty() && QueuedLabelOverlaps(address, bytes)) {
-        if (completionDepth != 0 && HookCompletionGuard()) {
-            queuedLabelHookInCompletion.fetch_add(1, std::memory_order_relaxed);
-        } else if (auto* record = queuedLabelRecorder.load(std::memory_order_acquire); record != nullptr) {
-            queuedLabelHookRecords.fetch_add(1, std::memory_order_relaxed);
-            record();
-        }
+// APS5_NO_HOOK_CLEAR_RUNS=1: the flush hook makes all of its checks at every access, as before
+// (clearAccess).
+bool HookClearRuns() {
+    static const bool enabled = std::getenv("APS5_NO_HOOK_CLEAR_RUNS") == nullptr;
+    return enabled;
+}
+
+// APS5_VERIFY_REGISTRY_SNAPSHOTS=1 also searches the three snapshots again for every access a kept
+// clear run answered.
+bool VerifyClearRuns() {
+    static const bool verify = std::getenv("APS5_VERIFY_REGISTRY_SNAPSHOTS") != nullptr;
+    return verify;
+}
+
+// The calling thread's runs of guest memory found clear of the three registries the flush hook
+// consults (the pending writes, the pending images, the live units), at most four, with the serials
+// of the snapshots that found them: every run holds while all three serials do. Cache lines of its
+// own: the heap placed it beside other threads' objects, and the hook's first look into it missed.
+struct alignas(64) ClearRuns {
+    std::uint64_t writes = ~std::uint64_t{0};
+    std::uint64_t images = ~std::uint64_t{0};
+    std::uint64_t units = ~std::uint64_t{0};
+    std::array<std::pair<std::uint64_t, std::uint64_t>, 4> runs{};
+    std::size_t count = 0;
+    std::size_t next = 0;
+};
+
+// Whether no pending write lies over [address, end) by the calling thread's snapshot copy (the
+// answer SnapshotOverlaps gives); `run` then receives the run around it and the publish generation
+// of the copy.
+bool writesClear(std::uint64_t address, std::uint64_t end, ClearRun& run) {
+    const auto& copy = ThreadSnapshotCopy();
+    run.serial = copy.generation;
+    if (copy.ranges == nullptr) {
+        run.begin = 0;
+        run.end = std::numeric_limits<std::uint64_t>::max();
+        return true;
     }
+    return ClearAround(*copy.ranges, address, end, run);
+}
+
+// Whether an access to [address, end) needs nothing more of the flush hook: no pending write, no
+// pending image and no live unit lies over it by the calling thread's snapshots, which are the
+// answers the hook's own checks give. The run around such an access is kept (ClearRuns), and a
+// later access inside a kept run is answered from the three serials while they hold, without a
+// search. The worker's vertex-table reads and the draw thread's index and vertex reads, thousands a
+// frame each, fall into a few such runs; every one of them searched all three snapshots and set up
+// the hook's whole frame. `kept` receives whether a kept run answered.
+bool clearAccess(std::uint64_t address, std::uint64_t end, bool& kept) {
+    struct ClearRunsTag {};
+    auto& runs = ThreadScratch<ClearRuns, ClearRunsTag>();
+    kept = false;
+    for (std::size_t i = 0; i < runs.count; ++i) {
+        if (address < runs.runs[i].first || end > runs.runs[i].second) continue;
+        if (runs.writes == publishGeneration.load(std::memory_order_acquire) && runs.images == StorageTexture::PendingSerial() && runs.units == LiveUnitsSerial()) {
+            if (VerifyClearRuns()) {
+                ClearRun written, image, unit;
+                const bool noWrites = writesClear(address, end, written);
+                const bool noImages = StorageTexture::PendingClear(address, end, image);
+                const bool noUnits = LiveUnitsClear(address, end, unit);
+                const bool clear = noWrites && noImages && noUnits;
+                // Only snapshots the serials say are the run's: ones that moved since may differ.
+                if (!clear && written.serial == runs.writes && image.serial == runs.images && unit.serial == runs.units) {
+                    std::fprintf(stderr, "[recorder] APS5_VERIFY_REGISTRY_SNAPSHOTS: the kept clear run 0x%llx..0x%llx answered an access 0x%llx..0x%llx a snapshot has something over\n", static_cast<unsigned long long>(runs.runs[i].first), static_cast<unsigned long long>(runs.runs[i].second), static_cast<unsigned long long>(address), static_cast<unsigned long long>(end));
+                    std::fflush(stderr);
+                    std::abort();
+                }
+            }
+            kept = true;
+            return true;
+        }
+        break;
+    }
+    ClearRun written, image, unit;
+    if (!writesClear(address, end, written) || !StorageTexture::PendingClear(address, end, image) || !LiveUnitsClear(address, end, unit)) return false;
+    if (runs.writes != written.serial || runs.images != image.serial || runs.units != unit.serial) {
+        runs.writes = written.serial;
+        runs.images = image.serial;
+        runs.units = unit.serial;
+        runs.count = 0;
+        runs.next = 0;
+    }
+    runs.runs[runs.next] = {std::max({written.begin, image.begin, unit.begin}), std::min({written.end, image.end, unit.end})};
+    runs.next = (runs.next + 1) % runs.runs.size();
+    runs.count = std::min(runs.count + 1, runs.runs.size());
+    return true;
+}
+
+// The flush hook past its queued-label check and its clear runs (FlushForAccess): out of line, so
+// a clear access does not set up the frame of this part (the access classification and the sync
+// attributions).
+[[gnu::noinline]] void flushForPendingAccess(std::uint64_t address, std::size_t bytes) {
     if (!HookSnapshotEnabled() || SnapshotOverlaps(address, bytes)) {
         if (DrawProfiled()) hookLocks.fetch_add(1, std::memory_order_relaxed);
         GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Hook);
@@ -1143,6 +1225,41 @@ void FlushForAccess(std::uint64_t address, std::size_t bytes) {
             else recorder->SyncThrough(address, bytes, true);
         }
     }
+}
+
+// GuestMemory flush hook: a CPU access to memory that recorded GPU work will write waits for that
+// work first; then storage image results pending for the range are stored. The recorder is only
+// dereferenced under the GpuMutex (it is destroyed with its device under that lock).
+void FlushForAccess(std::uint64_t address, std::size_t bytes) {
+    if (DrawProfiled()) hookCalls.fetch_add(1, std::memory_order_relaxed);
+    // A label this worker queued but has not recorded writes the range: in queue order the label
+    // precedes this access, so the group is recorded first (it then notes the range as a pending
+    // write of the open batch, and the check below syncs on it like any recorded store). Not from
+    // inside a completion action (a write-back store made while a batch is reaped): the record
+    // would reap nested in the reap in progress, landing later batches' write-backs before the
+    // rest of this one's, and this queue's queued label follows every batch of its own in flight
+    // anyway, so the write-back landing first is the order the hardware gives.
+    if (QueuedLabelsOnThread::Get() && QueuedLabelOverlaps(address, bytes)) {
+        if (completionDepth != 0 && HookCompletionGuard()) {
+            queuedLabelHookInCompletion.fetch_add(1, std::memory_order_relaxed);
+        } else if (auto* record = queuedLabelRecorder.load(std::memory_order_acquire); record != nullptr) {
+            queuedLabelHookRecords.fetch_add(1, std::memory_order_relaxed);
+            record();
+        }
+    }
+    // Under the debug switches below every access takes the whole path, as they say.
+    if (HookClearRuns() && HookSnapshotEnabled() && SnapshotCopyEnabled() && !HookFlushCpuBlocks()) {
+        const auto end = bytes > std::numeric_limits<std::uint64_t>::max() - address ? std::numeric_limits<std::uint64_t>::max() : address + bytes;
+        bool kept = false;
+        if (bytes == 0 || clearAccess(address, end, kept)) {
+            if (DrawProfiled()) {
+                hookClear.fetch_add(1, std::memory_order_relaxed);
+                if (kept) hookClearKept.fetch_add(1, std::memory_order_relaxed);
+            }
+            return;
+        }
+    }
+    flushForPendingAccess(address, bytes);
 }
 
 }
@@ -1364,6 +1481,7 @@ void Recorder::NoteQueuedLabel(std::uint64_t address, std::span<const std::byte>
     // The range before the table: the hook covers the group whether or not a table exists to
     // enter it in (no owner: the callback records it outright, by a CPU store when need be).
     QueuedLabelRanges().emplace_back(address, address + bytes.size());
+    QueuedLabelsOnThread::Set(true);
     queuedLabelsNoted.fetch_add(1, std::memory_order_relaxed);
     std::lock_guard tableLock(labelTableMutex);
     if (labelTableOwner == nullptr) return;
@@ -1379,9 +1497,10 @@ void Recorder::NoteQueuedLabel(std::uint64_t address, std::span<const std::byte>
 }
 
 void Recorder::ForgetQueuedLabels() {
-    if (QueuedLabelRanges().empty()) return;
+    if (!QueuedLabelsOnThread::Get()) return;
     auto ranges = std::move(QueuedLabelRanges());
     QueuedLabelRanges().clear();
+    QueuedLabelsOnThread::Set(false);
     std::lock_guard tableLock(labelTableMutex);
     if (labelTableOwner == nullptr) return;
     auto& recorded = labelTableOwner->labels;
@@ -3939,7 +4058,7 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
                 if (now - lastReport > std::chrono::seconds(10)) {
                     lastReport = now;
                     const auto& h = holdCounters;
-                    AgcDriver::ProfilePrint_nid_no_patch("[recorder] %llu syncs waited %.1f s for the GPU in total (sources, count/wait: idle %llu/%.1fs, pending write %llu/%.1fs, recorded store %llu/%.1fs, address-based %llu/%.1fs, other %llu/%.1fs); hook %llu calls, %llu locked; %llu targeted syncs left %llu batches in flight; snapshot %llu rebuilds %.0f ms, %llu notes covered; %llu unlocked timeline waits %.1f s; %llu submissions, %zu label entries, %llu completion labels pending; fence waits by thread (count/wait):%s; top sync sites (source@caller syncs/batches/wait):%s; under holds (cumulative): %llu completions ran %.0f ms (kept objects released %.0f ms), pending-write syncs from completions: %llu skipped, %llu waited %.0f ms; %llu reaps (%llu with work) retired %llu batches in %.0f ms; hook waits unlocked %llu / %.0f ms GPU (pending write %llu / %.0f ms, recorded store %llu / %.0f ms) + %.0f ms relock (%llu found the recorder torn down), locked %llu; deferred releases: on the release thread %llu batches (%llu objects) in %.0f ms, inline %llu batches (%llu objects) in %.0f ms (%llu batches over the queue bound of %zu), queue max %llu batches, %llu pending\n",static_cast<unsigned long long>(waits), waitedMs / 1000, static_cast<unsigned long long>(syncCounts[0]), syncWaitedMs[0] / 1000, static_cast<unsigned long long>(syncCounts[1]), syncWaitedMs[1] / 1000, static_cast<unsigned long long>(syncCounts[2]), syncWaitedMs[2] / 1000, static_cast<unsigned long long>(syncCounts[3]), syncWaitedMs[3] / 1000, static_cast<unsigned long long>(syncCounts[4]), syncWaitedMs[4] / 1000, static_cast<unsigned long long>(hookCalls.load()), static_cast<unsigned long long>(hookLocks.load()), static_cast<unsigned long long>(targetedSyncs.load()), static_cast<unsigned long long>(batchesLeftInFlight.load()), static_cast<unsigned long long>(snapshotRebuilds), snapshotRebuildMs, static_cast<unsigned long long>(snapshotCovered), static_cast<unsigned long long>(unlockedWaits.load()), unlockedWaitedUs.load() / 1e6, static_cast<unsigned long long>(recorder.submissions), recorder.PendingLabels(), static_cast<unsigned long long>(completionLabels.load()), ThreadSyncReport().c_str(), SyncSiteReport().c_str(), static_cast<unsigned long long>(h.completions), h.completionMs, h.keptReleaseMs, static_cast<unsigned long long>(h.completionSyncsSkipped), static_cast<unsigned long long>(h.completionSyncsWaited), h.completionSyncWaitMs, static_cast<unsigned long long>(h.reaps), static_cast<unsigned long long>(h.reapsWithWork), static_cast<unsigned long long>(h.reapBatches), h.reapMs, static_cast<unsigned long long>(h.hookUnlockedWaits), h.hookUnlockedWaitMs, static_cast<unsigned long long>(h.hookUnlockedWaitsBySource[1]), h.hookUnlockedWaitMsBySource[1], static_cast<unsigned long long>(h.hookUnlockedWaitsBySource[2]), h.hookUnlockedWaitMsBySource[2], h.hookRelockMs, static_cast<unsigned long long>(h.hookUnlockedTornDown), static_cast<unsigned long long>(h.hookLockedWaits), static_cast<unsigned long long>(threadReleases.load()), static_cast<unsigned long long>(threadObjects.load()), threadReleaseUs.load() / 1000.0, static_cast<unsigned long long>(inlineReleases.load()), static_cast<unsigned long long>(inlineObjects.load()), inlineReleaseUs.load() / 1000.0, static_cast<unsigned long long>(inlineOverBound.load()), ReleaseQueueBound(), static_cast<unsigned long long>(releaseQueueMax.load()), static_cast<unsigned long long>(deferredPending.load()));
+                    AgcDriver::ProfilePrint_nid_no_patch("[recorder] %llu syncs waited %.1f s for the GPU in total (sources, count/wait: idle %llu/%.1fs, pending write %llu/%.1fs, recorded store %llu/%.1fs, address-based %llu/%.1fs, other %llu/%.1fs); hook %llu calls (%llu clear, %llu of them by a kept run), %llu locked; %llu targeted syncs left %llu batches in flight; snapshot %llu rebuilds %.0f ms, %llu notes covered; %llu unlocked timeline waits %.1f s; %llu submissions, %zu label entries, %llu completion labels pending; fence waits by thread (count/wait):%s; top sync sites (source@caller syncs/batches/wait):%s; under holds (cumulative): %llu completions ran %.0f ms (kept objects released %.0f ms), pending-write syncs from completions: %llu skipped, %llu waited %.0f ms; %llu reaps (%llu with work) retired %llu batches in %.0f ms; hook waits unlocked %llu / %.0f ms GPU (pending write %llu / %.0f ms, recorded store %llu / %.0f ms) + %.0f ms relock (%llu found the recorder torn down), locked %llu; deferred releases: on the release thread %llu batches (%llu objects) in %.0f ms, inline %llu batches (%llu objects) in %.0f ms (%llu batches over the queue bound of %zu), queue max %llu batches, %llu pending\n",static_cast<unsigned long long>(waits), waitedMs / 1000, static_cast<unsigned long long>(syncCounts[0]), syncWaitedMs[0] / 1000, static_cast<unsigned long long>(syncCounts[1]), syncWaitedMs[1] / 1000, static_cast<unsigned long long>(syncCounts[2]), syncWaitedMs[2] / 1000, static_cast<unsigned long long>(syncCounts[3]), syncWaitedMs[3] / 1000, static_cast<unsigned long long>(syncCounts[4]), syncWaitedMs[4] / 1000, static_cast<unsigned long long>(hookCalls.load()), static_cast<unsigned long long>(hookClear.load()), static_cast<unsigned long long>(hookClearKept.load()), static_cast<unsigned long long>(hookLocks.load()), static_cast<unsigned long long>(targetedSyncs.load()), static_cast<unsigned long long>(batchesLeftInFlight.load()), static_cast<unsigned long long>(snapshotRebuilds), snapshotRebuildMs, static_cast<unsigned long long>(snapshotCovered), static_cast<unsigned long long>(unlockedWaits.load()), unlockedWaitedUs.load() / 1e6, static_cast<unsigned long long>(recorder.submissions), recorder.PendingLabels(), static_cast<unsigned long long>(completionLabels.load()), ThreadSyncReport().c_str(), SyncSiteReport().c_str(), static_cast<unsigned long long>(h.completions), h.completionMs, h.keptReleaseMs, static_cast<unsigned long long>(h.completionSyncsSkipped), static_cast<unsigned long long>(h.completionSyncsWaited), h.completionSyncWaitMs, static_cast<unsigned long long>(h.reaps), static_cast<unsigned long long>(h.reapsWithWork), static_cast<unsigned long long>(h.reapBatches), h.reapMs, static_cast<unsigned long long>(h.hookUnlockedWaits), h.hookUnlockedWaitMs, static_cast<unsigned long long>(h.hookUnlockedWaitsBySource[1]), h.hookUnlockedWaitMsBySource[1], static_cast<unsigned long long>(h.hookUnlockedWaitsBySource[2]), h.hookUnlockedWaitMsBySource[2], h.hookRelockMs, static_cast<unsigned long long>(h.hookUnlockedTornDown), static_cast<unsigned long long>(h.hookLockedWaits), static_cast<unsigned long long>(threadReleases.load()), static_cast<unsigned long long>(threadObjects.load()), threadReleaseUs.load() / 1000.0, static_cast<unsigned long long>(inlineReleases.load()), static_cast<unsigned long long>(inlineObjects.load()), inlineReleaseUs.load() / 1000.0, static_cast<unsigned long long>(inlineOverBound.load()), ReleaseQueueBound(), static_cast<unsigned long long>(releaseQueueMax.load()), static_cast<unsigned long long>(deferredPending.load()));
                     AgcDriver::ProfilePrint_nid_no_patch("[recorder] completion label stores: %llu run, %llu skipped (no CPU write-back overlapped them); %llu counted pending at a write-back; %llu write-backs over a tracked label; %llu write-back completions pending\n", static_cast<unsigned long long>(completionStoresRun.load()), static_cast<unsigned long long>(completionStoresSkipped.load()), static_cast<unsigned long long>(completionLabelsCountedLate.load()), static_cast<unsigned long long>(writeBacksOverLabels.load()), static_cast<unsigned long long>(writeBackCompletions.load()));
                     AgcDriver::ProfilePrint_nid_no_patch("[recorder] submits %llu, vkQueueSubmit mean %.1f us, max %.1f us\n", static_cast<unsigned long long>(submitCount), submitCount != 0 ? submitUs / static_cast<double>(submitCount) : 0.0, submitMaxUs);
                     const auto reads = Recorder::ReadCounts();

@@ -224,6 +224,10 @@ public:
     // as it was, and one that finds it unchanged since an earlier read knows the registry is what
     // it was then.
     static std::uint64_t PendingSerial();
+    // Whether no pending image lies over [address, end) by the calling thread's snapshot of the
+    // registry, the answer that keeps a flush from listing any image; `run` then receives the run
+    // around it that none lies over and the PendingSerial of the snapshot.
+    static bool PendingClear(std::uint64_t address, std::uint64_t end, ClearRun& run);
     // One registry scan for several ranges (the fast Revalidate): each query's `overlaps` receives
     // whether an image other than `except` has results pending, or is being stored right now, over
     // [begin, end), and `found` the image FindPending would return for the range (null: none);

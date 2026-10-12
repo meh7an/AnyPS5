@@ -65,7 +65,7 @@ bool TraceEnabled() {
     return enabled;
 }
 
-struct Statistics {
+struct alignas(64) Statistics {
     std::atomic<std::uint64_t> retiled{0}, retiledBytes{0}, refused{0}, refusedBytes{0}, seeds{0}, seedBytes{0};
     std::atomic<std::uint64_t> detiledShadow{0}, detiledShadowBytes{0}, detiledImport{0}, detiledImportBytes{0}, tailPublishes{0};
     std::array<std::atomic<std::uint64_t>, ReasonCount> published{}, publishedBytes{};
@@ -84,8 +84,10 @@ Statistics& Stats() {
 }
 
 // Bumped when a shadow's live units change (Recount) and when one leaves the registry: while it
-// holds still, the live units are those a snapshot saw (shadowsMayOverlap).
-std::atomic<std::uint64_t> liveSerial{0};
+// holds still, the live units are those a snapshot saw (shadowsMayOverlap). The flush hook reads it
+// at every access (LiveUnitsSerial): a cache line of its own, apart from the statistics counters
+// (Statistics is aligned as well), which the draws move.
+alignas(64) std::atomic<std::uint64_t> liveSerial{0};
 
 struct UnitShadow {
     Context context;
@@ -697,6 +699,7 @@ struct LiveSnapshot {
     std::uint64_t serial = ~std::uint64_t{0};
     std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
 };
+struct LiveSnapshotTag {};
 
 // Whether a shadow with live units overlaps [address, end): its units' scan, under the mutex.
 bool liveUnitsOverlap(const Shadows& registry, std::uint64_t address, std::uint64_t end) {
@@ -716,8 +719,7 @@ bool liveUnitsOverlap(const Shadows& registry, std::uint64_t address, std::uint6
 // it has). False is final; true leaves the answer to the unit scan under the mutex.
 bool shadowsMayOverlap(std::uint64_t address, std::uint64_t end) {
     if (!LiveSnapshots()) return true;
-    struct SnapshotTag {};
-    auto& snapshot = ThreadScratch<LiveSnapshot, SnapshotTag>();
+    auto& snapshot = ThreadScratch<LiveSnapshot, LiveSnapshotTag>();
     if (snapshot.serial != liveSerial.load(std::memory_order_acquire)) {
         auto& registry = Registry();
         std::lock_guard lock(registry.mutex);
@@ -769,6 +771,23 @@ bool AnyShadowedOverlaps(std::span<const std::pair<std::uint64_t, std::uint64_t>
         if (end > begin && AnyShadowedOverlaps(begin, static_cast<std::size_t>(end - begin))) return true;
     }
     return false;
+}
+
+bool LiveUnitsClear(std::uint64_t address, std::uint64_t end, ClearRun& run) {
+    if (!UnitShadowEnabled() || end <= address) {
+        run.serial = liveSerial.load(std::memory_order_acquire);
+        run.begin = end <= address ? address : 0;
+        run.end = end <= address ? address : std::numeric_limits<std::uint64_t>::max();
+        return true;
+    }
+    const bool may = shadowsMayOverlap(address, end);
+    const auto& snapshot = ThreadScratch<LiveSnapshot, LiveSnapshotTag>();
+    run.serial = snapshot.serial;
+    return !may && ClearAround(snapshot.ranges, address, end, run);
+}
+
+std::uint64_t LiveUnitsSerial() {
+    return liveSerial.load(std::memory_order_acquire);
 }
 
 std::uint64_t SlabBoundary(const HostImport& import, std::uint64_t address) {

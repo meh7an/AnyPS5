@@ -1042,6 +1042,7 @@ struct PendingSnapshot {
     std::uint64_t serial = ~std::uint64_t{0};
     std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
 };
+struct PendingSnapshotTag {};
 
 // Whether a pending image may overlap [address, address + bytes), answered from the calling thread's
 // snapshot without the registry's mutex while pendingSerial has not moved (a copy is taken under the
@@ -1050,8 +1051,7 @@ struct PendingSnapshot {
 // buffers') used to take the mutex, though almost none of them overlap anything.
 bool pendingMayOverlap(std::uint64_t address, std::size_t bytes) {
     if (!PendingSnapshots() || bytes == 0) return bytes != 0;
-    struct SnapshotTag {};
-    auto& snapshot = ThreadScratch<PendingSnapshot, SnapshotTag>();
+    auto& snapshot = ThreadScratch<PendingSnapshot, PendingSnapshotTag>();
     if (snapshot.serial != pendingSerial.load(std::memory_order_acquire)) {
         auto& pending = Pending();
         std::lock_guard lock(pending.mutex);
@@ -3110,6 +3110,17 @@ bool StorageTexture::AnyPendingOverlaps(std::span<const std::pair<std::uint64_t,
 
 std::uint64_t StorageTexture::PendingSerial() {
     return pendingSerial.load(std::memory_order_acquire);
+}
+
+bool StorageTexture::PendingClear(std::uint64_t address, std::uint64_t end, ClearRun& run) {
+    if (end <= address) {
+        run = {pendingSerial.load(std::memory_order_acquire), address, address};
+        return true;
+    }
+    const bool may = pendingMayOverlap(address, static_cast<std::size_t>(end - address));
+    const auto& snapshot = ThreadScratch<PendingSnapshot, PendingSnapshotTag>();
+    run.serial = snapshot.serial;
+    return !may && ClearAround(snapshot.ranges, address, end, run);
 }
 
 void StorageTexture::NoteProved() const {
