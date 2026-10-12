@@ -2565,7 +2565,8 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     APS5_LOG_CHARS_OUT_DEBUG("Creating Pipeline");
     // The state is copied only when a mask must change.
     auto masked = maskedState(state, inputs.fragmentOutputs);
-    if (std::any_of(targets.begin(), targets.end(), [](const TargetBinding& binding) { return binding.proxied; })) recipeOut = nullptr;
+    const bool proxied = std::any_of(targets.begin(), targets.end(), [](const TargetBinding& binding) { return binding.proxied; });
+    if (proxied) recipeOut = nullptr;
     for (std::size_t index = 0; index < targets.size(); ++index) {
         if (!targets[index].proxied) continue;
         if (!masked.has_value()) masked = state;
@@ -2573,7 +2574,15 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         masked->blends.at(state.colors[index].exportIndex).colorWriteMask &= VK_COLOR_COMPONENT_R_BIT;
     }
     const State& pipelineState = masked.has_value() ? *masked : state;
-    auto pipeline = CachedPipeline(context, pipelineState, inputs.vertexInput, *resources, shaders, lean ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+    // The key's prefix the worker made for this masked state (the outputs and the layout this
+    // record used are the precomputed ones), unless proxies changed the state since.
+    const auto* keyPrefix = !proxied && precomputed != nullptr && precomputed->pipelineKeyed ? &precomputed->pipelineKeyPrefix : nullptr;
+    if (keyPrefix != nullptr && verifyPrecomputedDraws()) {
+        std::vector<std::byte> prefix;
+        PipelineKeyPrefix(prefix, context, pipelineState, inputs.vertexInput, shaders);
+        if (prefix != *keyPrefix) reportPrecomputedMismatch("pipeline key");
+    }
+    auto pipeline = CachedPipeline(context, pipelineState, inputs.vertexInput, *resources, shaders, lean ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, keyPrefix);
     // Resident targets' views are stable while their storage image lives, so the framebuffer is
     // reused with the pipeline; a per-draw RenderTarget gets a framebuffer of its own.
     TargetList owners;
@@ -2896,6 +2905,15 @@ void PrecomputeDraw(const Context& context, const State& state, const Pm4::DrawP
         try {
             out.vertexInput = BuildVertexInputLayout(context, shaders.front().program->vertexAttributes);
             out.layout = true;
+        } catch (const std::exception&) {
+        }
+    }
+    // The pipeline key for the state the record masks with these outputs and this layout.
+    if (out.outputs && out.layout) {
+        try {
+            const auto masked = maskedState(state, out.fragmentOutputs);
+            PipelineKeyPrefix(out.pipelineKeyPrefix, context, masked.has_value() ? *masked : state, out.vertexInput, shaders);
+            out.pipelineKeyed = !out.pipelineKeyPrefix.empty();
         } catch (const std::exception&) {
         }
     }

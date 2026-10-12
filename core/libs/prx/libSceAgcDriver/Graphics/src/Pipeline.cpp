@@ -672,8 +672,9 @@ namespace {
 // a value is a copy, not a vector insert. Finish sets the key's size.
 class KeyWriter {
 public:
-    explicit KeyWriter(std::vector<std::byte>& key) : key(key) {
-        if (key.size() < 1024) key.resize(1024);
+    // Writes after the first `at` bytes of `key`, which the caller filled already (a key prefix).
+    explicit KeyWriter(std::vector<std::byte>& key, std::size_t at = 0) : key(key), size(at) {
+        if (key.size() < size + 1024) key.resize(size + 1024);
     }
 
     template<typename TValue>
@@ -696,24 +697,21 @@ void append(KeyWriter& key, const TValue& value) {
     key.Append(value);
 }
 
-// Everything the Pipeline objects are built from, into `key` (CachedPipeline passes its thread's
-// buffer), or nothing when a stage's result has no variant id (the recompiler could not identify
-// it, so nothing else may share its pipeline). The rect-list control and evaluation stages are
-// generated from the vertex and fragment results, which the key already names, so they carry no
-// id of their own.
-void pipelineKey(std::vector<std::byte>& key, const Context& context, const State& state, const VertexInputLayout& input, const ShaderResources& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout) {
+// A pipeline's key is everything the Pipeline objects are built from (pipelineKey, into the buffer
+// CachedPipeline passes), or nothing when a stage's result has no variant id (the recompiler could
+// not identify it, so nothing else may share its pipeline). The rect-list control and evaluation
+// stages are generated from the vertex and fragment results, which the key already names, so they
+// carry no id of their own.
+// The key's parts the stages, the vertex input and the state decide (PipelineKeyPrefix can make
+// them ahead), or false, with nothing to keep, when a stage's result has no variant id.
+bool writeKeyPrefix(KeyWriter& writer, const Context& context, const State& state, const VertexInputLayout& input, std::span<const CompiledShader> shaders) {
     using Stage = ShaderRecompiler::ShaderStage;
-    KeyWriter writer(key);
     append(writer, context.device);
-    append(writer, attachmentLayout);
     append(writer, shaders.size());
     for (const auto& shader : shaders) {
         Require(shader.program != nullptr, "missing compiled shader");
         const bool generated = (state.rectList && (shader.stage == Stage::TessellationControl || shader.stage == Stage::TessellationEvaluation)) || shader.stage == Stage::Geometry;
-        if (!generated && shader.program->PipelineVariantId() == 0) {
-            key.clear();
-            return;
-        }
+        if (!generated && shader.program->PipelineVariantId() == 0) return false;
         append(writer, shader.stage);
         append(writer, generated ? std::uint64_t{0} : shader.program->PipelineVariantId());
         // Where the stage's push constants sit in the block (AssemblePushConstants).
@@ -733,8 +731,6 @@ void pipelineKey(std::vector<std::byte>& key, const Context& context, const Stat
         append(writer, attribute.format);
         append(writer, attribute.offset);
     }
-    append(writer, resources.LayoutKey().size());
-    for (const auto word : resources.LayoutKey()) append(writer, word);
     append(writer, state.hasColorTarget);
     append(writer, state.rectList);
     append(writer, state.topology);
@@ -787,6 +783,23 @@ void pipelineKey(std::vector<std::byte>& key, const Context& context, const Stat
         append(writer, tessellation.partitioning);
         append(writer, tessellation.outputTopology);
     }
+    return true;
+}
+
+// The rest of the key, the record's: the attachment layout and the descriptor set layout.
+void writeKeySuffix(KeyWriter& writer, const ShaderResources& resources, VkImageLayout attachmentLayout) {
+    append(writer, attachmentLayout);
+    append(writer, resources.LayoutKey().size());
+    for (const auto word : resources.LayoutKey()) append(writer, word);
+}
+
+void pipelineKey(std::vector<std::byte>& key, const Context& context, const State& state, const VertexInputLayout& input, const ShaderResources& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout) {
+    KeyWriter writer(key);
+    if (!writeKeyPrefix(writer, context, state, input, shaders)) {
+        key.clear();
+        return;
+    }
+    writeKeySuffix(writer, resources, attachmentLayout);
     writer.Finish();
 }
 
@@ -878,15 +891,32 @@ void reportPipelines(PipelineStore& store) {
 
 }
 
-std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, const ShaderResources& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout) {
+void PipelineKeyPrefix(std::vector<std::byte>& prefix, const Context& context, const State& state, const VertexInputLayout& vertexInput, std::span<const CompiledShader> shaders) {
+    KeyWriter writer(prefix);
+    if (!writeKeyPrefix(writer, context, state, vertexInput, shaders)) {
+        prefix.clear();
+        return;
+    }
+    writer.Finish();
+}
+
+std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, const ShaderResources& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout, const std::vector<std::byte>* keyPrefix) {
     static const bool disabled = std::getenv("APS5_NO_PIPELINE_CACHE") != nullptr;
     if (disabled) return std::make_shared<Pipeline>(context, state, vertexInput, resources, shaders, attachmentLayout);
     auto& store = Pipelines();
     // The key and its hash need no lock. The key is built in the calling thread's buffer: a fresh
-    // kilobyte for every draw was an allocation.
+    // kilobyte for every draw was an allocation. A prefix made ahead is copied, and only the
+    // record's part is written after it.
     struct KeyTag {};
     auto& key = ThreadScratch<std::vector<std::byte>, KeyTag>();
-    pipelineKey(key, context, state, vertexInput, resources, shaders, attachmentLayout);
+    if (keyPrefix != nullptr && !keyPrefix->empty()) {
+        key.assign(keyPrefix->begin(), keyPrefix->end());
+        KeyWriter writer(key, keyPrefix->size());
+        writeKeySuffix(writer, resources, attachmentLayout);
+        writer.Finish();
+    } else {
+        pipelineKey(key, context, state, vertexInput, resources, shaders, attachmentLayout);
+    }
     struct LastTag {};
     auto& last = ThreadScratch<LastPipeline, LastTag>();
     if (!key.empty() && last.uses < 64 && last.device == context.device && last.key == key) {

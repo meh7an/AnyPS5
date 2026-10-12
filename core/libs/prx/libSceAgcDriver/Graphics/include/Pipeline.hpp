@@ -3,7 +3,9 @@
 
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineLibrary.hpp"
+#include <cstddef>
 #include <set>
+#include <vector>
 
 namespace AgcDriver::Graphics {
 
@@ -101,7 +103,12 @@ private:
 // A configuration whose stage has no variant id gets a private pipeline. Entries are LRU-bounded and
 // only evicted once no recorded draw holds them. Debug aid: APS5_NO_PIPELINE_CACHE=1 builds one per
 // draw as before.
-std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, const ShaderResources& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+// `keyPrefix`, when not empty, is PipelineKeyPrefix's for this state, vertex input and these stages.
+std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, const ShaderResources& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, const std::vector<std::byte>* keyPrefix = nullptr);
+// CachedPipeline's key but for the record's part (the attachment layout and the descriptor set
+// layout), which a draw's preparing thread makes ahead (Graphics::PrecomputeDraw): empty when a
+// stage's result has no variant id, as the key would be.
+void PipelineKeyPrefix(std::vector<std::byte>& prefix, const Context& context, const State& state, const VertexInputLayout& vertexInput, std::span<const CompiledShader> shaders);
 // Destroys the cached pipelines of a device; to be called before the device goes away. Without it,
 // entries of a gone device are recognised by their buffer pool (made and reset with the device, so
 // it tells device instances apart when the loader reuses a VkDevice handle) and forgotten unused.

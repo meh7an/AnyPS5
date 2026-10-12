@@ -106,12 +106,19 @@ struct DrawPrecomputed {
     bool keyed = false;
     Graphics::ResourceCache::Key resourceKey;
     std::uint64_t resourceHash = 0;
+    // CachedPipeline's key but for the record's part (Graphics::PipelineKeyPrefix), for the state
+    // the fragment outputs mask, with the layout above: a record whose targets need proxies changes
+    // the state and makes the whole key.
+    bool pipelineKeyed = false;
+    std::vector<std::byte> pipelineKeyPrefix;
 
     void Clear() {
         outputs = false;
         layout = false;
         keyed = false;
         resourceKey.clear();
+        pipelineKeyed = false;
+        pipelineKeyPrefix.clear();
     }
 };
 
