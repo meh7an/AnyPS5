@@ -345,7 +345,12 @@ std::optional<DrawVerdict> Driver::prepareDraw(PreparedDraw& prepared, QueueStat
 
     static const bool lockedPrepare = std::getenv("APS5_LOCKED_DRAW_PREPARE") != nullptr;
     prepared.queue = submission.queue;
-    prepared.deviceGeneration = device.Generation();
+    // The record keeps the device of the draw it carried last (PreparedDraw::Clear leaves it), loaded
+    // again only once the generation moved: a load takes the atomic shared_ptr's lock, and a reference
+    // per draw moved the device's count between this thread and the draw thread.
+    const auto generation = device.Generation();
+    const bool kept = prepared.device != nullptr && prepared.deviceGeneration == generation;
+    prepared.deviceGeneration = generation;
     auto& localDevice = prepared.device;
     if (lockedPrepare) {
 
@@ -358,7 +363,7 @@ std::optional<DrawVerdict> Driver::prepareDraw(PreparedDraw& prepared, QueueStat
 
         recordLabelsForPacket(localDevice.get(), submission.queue);
         phaseTiming.Phase(DrawRowLabels);
-    } else if ((localDevice = device.Load()) == nullptr) {
+    } else if (!kept && (localDevice = device.Load()) == nullptr) {
         GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
         std::lock_guard createLock(GuestMemory::GpuMutex());
         if (device == nullptr) device = std::make_shared<VulkanDevice>();

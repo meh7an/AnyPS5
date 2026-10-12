@@ -39,7 +39,8 @@ struct PreparedDraw {
     std::vector<std::uint32_t> pushOffsets;
     std::vector<std::size_t> resultIndex;
 
-    // What recordPrepared reads.
+    // What recordPrepared reads. The device stays across draws (Clear leaves it): prepareDraw loads
+    // it again only once the generation moved.
     std::shared_ptr<VulkanDevice> device;
     // The driver's device generation (DevicePointer::Generation) read before `device` was: the
     // record looks for a replacement only once it moved.
@@ -84,7 +85,8 @@ struct PreparedDraw {
     bool writesMemory = true;
 
     // Empties the record, keeping every list's capacity (the inner ones of decodeReads and
-    // matchedRegions too).
+    // matchedRegions too) and the device with its generation. A kept device is never the last
+    // reference, whose release needs the GPU mutex: the driver holds its device and every replaced one.
     void Clear() {
         writesMemory = true;
         memory.clear();
@@ -97,8 +99,6 @@ struct PreparedDraw {
         recompiled.clear();
         pushOffsets.clear();
         resultIndex.clear();
-        device.reset();
-        deviceGeneration = 0;
         collectEpoch = 0;
         decode.reset();
         stages.clear();
