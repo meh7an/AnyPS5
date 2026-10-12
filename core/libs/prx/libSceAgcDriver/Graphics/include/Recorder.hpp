@@ -611,6 +611,9 @@ private:
         std::vector<std::shared_ptr<void>> kept;
         std::size_t keptBytes = 0;
         std::unordered_set<const void*> keptOwners;
+        // The last two owners KeepBytes counted (a draw's upload chunk and its resources come in
+        // turn): the batch keeps them alive, so they are found here without the set.
+        std::array<const void*, 2> recentOwners{};
         std::vector<std::function<void()>> completions;
         std::vector<std::pair<std::uint64_t, std::uint64_t>> writes;
         std::vector<std::uint64_t> writeNotes;

@@ -41,6 +41,9 @@ struct PreparedDraw {
 
     // What recordPrepared reads.
     std::shared_ptr<VulkanDevice> device;
+    // The driver's device generation (DevicePointer::Generation) read before `device` was: the
+    // record looks for a replacement only once it moved.
+    std::uint64_t deviceGeneration = 0;
     std::uint32_t queue = 0;
     // The preparing worker's collect epoch, which a draw thread records the draw in.
     std::uint64_t collectEpoch = 0;
@@ -76,10 +79,14 @@ struct PreparedDraw {
     std::vector<Write> writes;
 
     bool busy = false;
+    // Whether the stages may write guest memory (Driver's writesGuestMemory, which the front asks
+    // before a hand-off): a record that cannot notes no draw writers. Unknown counts as writing.
+    bool writesMemory = true;
 
     // Empties the record, keeping every list's capacity (the inner ones of decodeReads and
     // matchedRegions too).
     void Clear() {
+        writesMemory = true;
         memory.clear();
         linked.clear();
         vertexInfos.clear();
@@ -91,6 +98,7 @@ struct PreparedDraw {
         pushOffsets.clear();
         resultIndex.clear();
         device.reset();
+        deviceGeneration = 0;
         collectEpoch = 0;
         decode.reset();
         stages.clear();

@@ -18,9 +18,13 @@ public:
     VulkanDevice* operator->() const;
     explicit operator bool() const;
     bool operator==(std::nullptr_t) const;
+    // Moves with every store: whether the device changed is asked by comparing it instead of
+    // loading the device (a load takes the atomic shared_ptr's lock, which every thread shares).
+    std::uint64_t Generation() const { return generation.load(std::memory_order_acquire); }
 
 private:
     std::atomic<std::shared_ptr<VulkanDevice>> pointer;
+    std::atomic<std::uint64_t> generation{0};
 };
 
 // Packets use the device shared (lock_shared, once per packet); a device replacement (lock) waits for

@@ -316,6 +316,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             recordLabelsForPacket(slot.device.get(), submission.queue);
         }
         const bool writes = writesGuestMemory(slot.stages);
+        slot.writesMemory = writes;
         slot.collectEpoch = GuestMemory::ThreadCollectEpoch();
         preparing.handed = back->Push();
         if (!preparing.handed) recordPrepared(slot, gpuLock, timing, phaseTiming);
@@ -344,6 +345,7 @@ std::optional<DrawVerdict> Driver::prepareDraw(PreparedDraw& prepared, QueueStat
 
     static const bool lockedPrepare = std::getenv("APS5_LOCKED_DRAW_PREPARE") != nullptr;
     prepared.queue = submission.queue;
+    prepared.deviceGeneration = device.Generation();
     auto& localDevice = prepared.device;
     if (lockedPrepare) {
 
@@ -704,7 +706,7 @@ void Driver::recordPrepared(PreparedDraw& prepared, std::unique_lock<GuestMemory
         timing.Mark("gpu_mutex_wait");
         phaseTiming.Phase(DrawRowLockWait);
 
-        if (auto current = device.Load(); current != nullptr && current != prepared.device) {
+        if (auto current = device.Generation() != prepared.deviceGeneration ? device.Load() : nullptr; current != nullptr && current != prepared.device) {
             static std::atomic<std::uint64_t> replaced{0};
             std::fprintf(stderr, "[draw] device replaced during unlocked preparation (%llu)\n", static_cast<unsigned long long>(++replaced));
             prepared.device = std::move(current);
@@ -715,7 +717,7 @@ void Driver::recordPrepared(PreparedDraw& prepared, std::unique_lock<GuestMemory
         recordLabelsForPacket(prepared.device.get(), prepared.queue);
         phaseTiming.Phase(DrawRowLabels);
     }
-    noteDrawWriters(prepared.stages, prepared.queue);
+    if (prepared.writesMemory) noteDrawWriters(prepared.stages, prepared.queue);
     phaseTiming.Phase(DrawRowVectors);
     const auto& graphics = prepared.decode->state;
     if (prepared.recipe != nullptr) {

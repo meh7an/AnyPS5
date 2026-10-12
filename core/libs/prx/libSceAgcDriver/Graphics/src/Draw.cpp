@@ -1171,6 +1171,43 @@ bool sameVertexInput(const VertexInputLayout& a, const VertexInputLayout& b) {
     return a.bindings.size() == b.bindings.size() && a.attributes.size() == b.attributes.size() && std::memcmp(a.bindings.data(), b.bindings.data(), a.bindings.size() * sizeof(VkVertexInputBindingDescription)) == 0 && std::memcmp(a.attributes.data(), b.attributes.data(), a.attributes.size() * sizeof(VkVertexInputAttributeDescription)) == 0;
 }
 
+// prepareDrawInputs' vertex planning lists, leased together (ThreadScratchLease swaps and clears).
+struct VertexPlanScratch {
+    std::vector<VertexFetch> fetches;
+    std::vector<std::size_t> fetchValid;
+    std::vector<std::size_t> fetchOf;
+    std::vector<std::shared_ptr<Buffer>> zeroed;
+    std::vector<bool> isSolo;
+    std::vector<VertexFetch> plannedFetches;
+    std::vector<std::size_t> plannedOf;
+    std::vector<VkBuffer> rangeHandles;
+    std::vector<VkDeviceSize> rangeOffsets;
+
+    void swap(VertexPlanScratch& other) noexcept {
+        fetches.swap(other.fetches);
+        fetchValid.swap(other.fetchValid);
+        fetchOf.swap(other.fetchOf);
+        zeroed.swap(other.zeroed);
+        isSolo.swap(other.isSolo);
+        plannedFetches.swap(other.plannedFetches);
+        plannedOf.swap(other.plannedOf);
+        rangeHandles.swap(other.rangeHandles);
+        rangeOffsets.swap(other.rangeOffsets);
+    }
+
+    void clear() noexcept {
+        fetches.clear();
+        fetchValid.clear();
+        fetchOf.clear();
+        zeroed.clear();
+        isSolo.clear();
+        plannedFetches.clear();
+        plannedOf.clear();
+        rangeHandles.clear();
+        rangeOffsets.clear();
+    }
+};
+
 DrawInputs prepareDrawInputs(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawOutcome& outcome, DrawTimer& timer, const DrawRecipe* recipe, const DrawPrecomputed* precomputed = nullptr) {
     DrawInputs inputs;
     APS5_LOG_OUT_DEBUG("Draw indices=%u instances=%u indexSize=%u flags=%u indexAddress=0x%llx", draw.indexCount, draw.instanceCount, draw.indexSize, draw.flags, static_cast<unsigned long long>(draw.indexAddress));
@@ -1331,19 +1368,14 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         Require(draw.firstVertex <= std::numeric_limits<std::uint32_t>::max() - inputs.maxIndex, "indexed draw vertex range overflow");
         inputs.maxIndex += draw.firstVertex;
     }
-    // The planning vectors below are the thread's, reused draw after draw (ThreadScratchLease).
-    struct FetchesTag {};
-    struct FetchValidTag {};
-    struct FetchOfTag {};
-    struct ZeroedTag {};
-    ThreadScratchLease<std::vector<VertexFetch>, FetchesTag> fetchesLease;
-    ThreadScratchLease<std::vector<std::size_t>, FetchValidTag> fetchValidLease;
-    ThreadScratchLease<std::vector<std::size_t>, FetchOfTag> fetchOfLease;
-    ThreadScratchLease<std::vector<std::shared_ptr<Buffer>>, ZeroedTag> zeroedLease;
-    auto& fetches = fetchesLease.value;
-    auto& fetchValid = fetchValidLease.value;
-    auto& fetchOf = fetchOfLease.value;
-    auto& zeroed = zeroedLease.value;
+    // The planning vectors below are the thread's, reused draw after draw: one lease for all of
+    // them (ThreadScratchLease), as a lease each was nine slot lookups per draw.
+    struct VertexPlanTag {};
+    ThreadScratchLease<VertexPlanScratch, VertexPlanTag> planLease;
+    auto& fetches = planLease.value.fetches;
+    auto& fetchValid = planLease.value.fetchValid;
+    auto& fetchOf = planLease.value.fetchOf;
+    auto& zeroed = planLease.value.zeroed;
     fetches.reserve(attributes.size());
     fetchValid.reserve(attributes.size());
     fetchOf.assign(attributes.size(), 0);
@@ -1366,15 +1398,9 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         fetchValid.push_back(args == nullptr && stride != 0 ? static_cast<std::size_t>(std::min(recordBytes, static_cast<std::uint64_t>(bytes))) : bytes);
     }
     const auto soloFetches = SoloZeroPaddedFetchIndices(fetches, fetchValid);
-    struct SoloTag {};
-    struct PlannedFetchesTag {};
-    struct PlannedOfTag {};
-    ThreadScratchLease<std::vector<bool>, SoloTag> isSoloLease;
-    ThreadScratchLease<std::vector<VertexFetch>, PlannedFetchesTag> plannedFetchesLease;
-    ThreadScratchLease<std::vector<std::size_t>, PlannedOfTag> plannedOfLease;
-    auto& isSolo = isSoloLease.value;
-    auto& plannedFetches = plannedFetchesLease.value;
-    auto& plannedOf = plannedOfLease.value;
+    auto& isSolo = planLease.value.isSolo;
+    auto& plannedFetches = planLease.value.plannedFetches;
+    auto& plannedOf = planLease.value.plannedOf;
     isSolo.assign(fetches.size(), false);
     for (const auto f : soloFetches) isSolo[f] = true;
     plannedFetches.reserve(fetches.size());
@@ -1388,12 +1414,8 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
     parts.mark(VertexParts::Fetches);
     // Each copy range's buffer and where the range starts in it: an import read in place, a slice
     // of the upload chunk, or a copy of its own.
-    struct RangeHandlesTag {};
-    struct RangeOffsetsTag {};
-    ThreadScratchLease<std::vector<VkBuffer>, RangeHandlesTag> rangeHandlesLease;
-    ThreadScratchLease<std::vector<VkDeviceSize>, RangeOffsetsTag> rangeOffsetsLease;
-    auto& rangeHandles = rangeHandlesLease.value;
-    auto& rangeOffsets = rangeOffsetsLease.value;
+    auto& rangeHandles = planLease.value.rangeHandles;
+    auto& rangeOffsets = planLease.value.rangeOffsets;
     rangeHandles.reserve(plan.copies.size());
     rangeOffsets.reserve(plan.copies.size());
     for (std::size_t range = 0; range < plan.copies.size(); ++range) {
