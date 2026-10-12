@@ -83,9 +83,8 @@ Statistics& Stats() {
     return statistics;
 }
 
-// Bumped when a shadow gains its first live unit or loses its last (Recount) and when one leaves the
-// registry: while it holds still, the shadows with live units are those a snapshot saw
-// (shadowsMayOverlap).
+// Bumped when a shadow's live units change (Recount) and when one leaves the registry: while it
+// holds still, the live units are those a snapshot saw (shadowsMayOverlap).
 std::atomic<std::uint64_t> liveSerial{0};
 
 struct UnitShadow {
@@ -111,6 +110,10 @@ struct UnitShadow {
     // serves it again while the import lives.
     std::vector<std::uint8_t> dropped;
     std::uint32_t liveUnits = 0;
+    // The live units' import ranges, adjacent ones merged (Recount), and the list Recount builds
+    // the next ones in (both keep their storage).
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> liveRanges;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> recounted;
 
     const std::shared_ptr<ShadowSlab>* BufferSlabOf(std::uint64_t unit) const {
         for (const auto& slab : bufferSlabs) {
@@ -138,10 +141,18 @@ struct UnitShadow {
     }
     void Recount() {
         std::uint32_t live = 0;
-        for (std::uint64_t unit = 0; unit < Units(); ++unit) live += Live(unit) ? 1u : 0u;
-        const bool flipped = (live == 0) != (liveUnits == 0);
+        recounted.clear();
+        for (std::uint64_t unit = 0; unit < Units(); ++unit) {
+            if (!Live(unit)) continue;
+            ++live;
+            const auto [begin, end] = UnitRange(unit);
+            if (!recounted.empty() && recounted.back().second == begin) recounted.back().second = end;
+            else recounted.emplace_back(begin, end);
+        }
         liveUnits = live;
-        if (flipped) liveSerial.fetch_add(1, std::memory_order_release);
+        if (recounted == liveRanges) return;
+        liveRanges.swap(recounted);
+        liveSerial.fetch_add(1, std::memory_order_release);
     }
 };
 
@@ -671,8 +682,17 @@ bool VerifyLiveSnapshots() {
     return verify;
 }
 
-// A thread's copy of the import ranges of the shadows with live units, merged and sorted, and the
-// liveSerial it was copied under.
+// APS5_IMPORT_LIVE_SNAPSHOTS=1: a snapshot holds the whole import range of every shadow with a live
+// unit, as before, rather than the live units' ranges. A shadowed import is often the heap the
+// draws read their vertices from as well: the import's range sent almost every draw-input read to
+// the unit scan under the mutex, which found no live unit there.
+bool ImportLiveSnapshots() {
+    static const bool whole = std::getenv("APS5_IMPORT_LIVE_SNAPSHOTS") != nullptr;
+    return whole;
+}
+
+// A thread's copy of the live units' ranges (UnitShadow::liveRanges) of every shadow, merged and
+// sorted, and the liveSerial it was copied under.
 struct LiveSnapshot {
     std::uint64_t serial = ~std::uint64_t{0};
     std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
@@ -691,9 +711,9 @@ bool liveUnitsOverlap(const Shadows& registry, std::uint64_t address, std::uint6
     });
 }
 
-// Whether a shadow with live units may overlap [address, end), answered from the calling thread's
-// snapshot without the registry's mutex while liveSerial has not moved (a copy is taken under the
-// mutex when it has). False is final; true leaves the answer to the unit scan under the mutex.
+// Whether a live unit may overlap [address, end), answered from the calling thread's snapshot
+// without the registry's mutex while liveSerial has not moved (a copy is taken under the mutex when
+// it has). False is final; true leaves the answer to the unit scan under the mutex.
 bool shadowsMayOverlap(std::uint64_t address, std::uint64_t end) {
     if (!LiveSnapshots()) return true;
     struct SnapshotTag {};
@@ -701,13 +721,20 @@ bool shadowsMayOverlap(std::uint64_t address, std::uint64_t end) {
     if (snapshot.serial != liveSerial.load(std::memory_order_acquire)) {
         auto& registry = Registry();
         std::lock_guard lock(registry.mutex);
-        snapshot.ranges.clear();
-        // byBase is ordered by import base, so the ranges come sorted by their begin.
+        auto& ranges = snapshot.ranges;
+        ranges.clear();
         for (const auto& [base, shadow] : registry.byBase) {
             if (shadow->liveUnits == 0) continue;
-            if (!snapshot.ranges.empty() && shadow->importBase <= snapshot.ranges.back().second) snapshot.ranges.back().second = std::max(snapshot.ranges.back().second, shadow->ImportEnd());
-            else snapshot.ranges.emplace_back(shadow->importBase, shadow->ImportEnd());
+            if (ImportLiveSnapshots()) ranges.emplace_back(shadow->importBase, shadow->ImportEnd());
+            else ranges.insert(ranges.end(), shadow->liveRanges.begin(), shadow->liveRanges.end());
         }
+        std::sort(ranges.begin(), ranges.end());
+        std::size_t merged = 0;
+        for (const auto& [begin, finish] : ranges) {
+            if (merged != 0 && begin <= ranges[merged - 1].second) ranges[merged - 1].second = std::max(ranges[merged - 1].second, finish);
+            else ranges[merged++] = {begin, finish};
+        }
+        ranges.resize(merged);
         snapshot.serial = liveSerial.load(std::memory_order_relaxed);
     }
     const auto it = std::upper_bound(snapshot.ranges.begin(), snapshot.ranges.end(), address, [](std::uint64_t value, const std::pair<std::uint64_t, std::uint64_t>& range) { return value < range.second; });
@@ -717,7 +744,7 @@ bool shadowsMayOverlap(std::uint64_t address, std::uint64_t end) {
         std::lock_guard lock(registry.mutex);
         // Only a registry the serial says is the snapshot's: one that moved since may differ.
         if (liveSerial.load(std::memory_order_relaxed) == snapshot.serial && liveUnitsOverlap(registry, address, end)) {
-            std::fprintf(stderr, "[shadow] APS5_VERIFY_REGISTRY_SNAPSHOTS: the live snapshot misses a shadow over 0x%llx..0x%llx\n", static_cast<unsigned long long>(address), static_cast<unsigned long long>(end));
+            std::fprintf(stderr, "[shadow] APS5_VERIFY_REGISTRY_SNAPSHOTS: the live snapshot misses a live unit over 0x%llx..0x%llx\n", static_cast<unsigned long long>(address), static_cast<unsigned long long>(end));
             std::fflush(stderr);
             std::abort();
         }
