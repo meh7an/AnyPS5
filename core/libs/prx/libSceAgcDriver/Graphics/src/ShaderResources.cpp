@@ -1141,7 +1141,18 @@ void ShaderResources::build(std::span<const CompiledShader> shaders, const Color
 
 namespace {
 
-VkDescriptorSetLayout CreateSetLayout(const Context& context, std::span<const VkDescriptorSetLayoutBinding> bindings, bool updateAfterBind) {
+// APS5_NO_PUSHED_DRAW_SETS=1: a draw build allocates its set, and a draw that reads copies takes
+// a set of its own (DescriptorCache::AllocateTransient), as before draws pushed their descriptors.
+bool PushedDrawSets() {
+    static const bool enabled = std::getenv("APS5_NO_PUSHED_DRAW_SETS") == nullptr;
+    return enabled;
+}
+
+// The least maxPushDescriptors of a device with VK_KHR_push_descriptor.
+constexpr std::uint64_t GuaranteedPushDescriptors = 32;
+
+VkDescriptorSetLayout CreateSetLayout(const Context& context, std::span<const VkDescriptorSetLayoutBinding> bindings, bool updateAfterBind, bool pushed = false) {
+    Require(!(updateAfterBind && pushed), "a push descriptor layout cannot update after bind");
     std::vector<VkDescriptorBindingFlags> flags;
     for (const auto& binding : bindings) flags.push_back(updateAfterBind && binding.descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER ? VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT : 0);
     VkDescriptorSetLayoutBindingFlagsCreateInfo bindingFlags{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO};
@@ -1149,7 +1160,7 @@ VkDescriptorSetLayout CreateSetLayout(const Context& context, std::span<const Vk
     bindingFlags.pBindingFlags = flags.data();
     VkDescriptorSetLayoutCreateInfo info{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
     info.pNext = updateAfterBind ? &bindingFlags : nullptr;
-    info.flags = updateAfterBind ? VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT : 0;
+    info.flags = updateAfterBind ? VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT : pushed ? VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR : 0;
     info.bindingCount = static_cast<std::uint32_t>(bindings.size());
     info.pBindings = bindings.data();
     VkDescriptorSetLayout layout = VK_NULL_HANDLE;
@@ -1407,19 +1418,28 @@ void ShaderResources::buildPrepare(std::span<const CompiledShader> shaders, cons
         if (drawBuild && !usesBda && std::all_of(allocations.begin(), allocations.end(), [&](const Allocation& allocation) { return !allocation.guest || allocation.pushByte >= 0 || (allocation.dataAllocation >= 0 && allocation.dataByte < allocations[static_cast<std::size_t>(allocation.dataAllocation)].size); })) guestMemory.AllowAdjustedRegions();
         guestMemory.UploadPrepare(usesBda);
         timing.uploadMs = phase(BuildPhase::Upload);
+        // A draw build pushes its writes at every use (Bind, BindDraw) instead of binding a set: a
+        // draw that reads copies had a set of its own allocated, written and bound, about 6% of the
+        // draw thread's samples on S2. Not for an address-based build (its tables and fault check),
+        // nor for a set a push layout cannot hold (update-after-bind counts, more descriptors than
+        // every device takes).
+        std::uint64_t descriptorTotal = 0;
+        for (const auto& binding : bindings) descriptorTotal += binding.layout.descriptorCount;
+        pushed = drawBuild && context.pushDescriptors && PushedDrawSets() && !usesBda && !usesFaultBuffer && !updateAfterBind && !bindings.empty() && descriptorTotal <= GuaranteedPushDescriptors;
         std::vector<VkDescriptorSetLayoutBinding> description;
         for (const auto& binding : bindings) {
             description.push_back(binding.layout);
             layoutKey.insert(layoutKey.end(), {binding.layout.binding, static_cast<std::uint32_t>(binding.layout.descriptorType), binding.layout.descriptorCount, binding.layout.stageFlags});
         }
         if (updateAfterBind) layoutKey.push_back(VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT);
+        if (pushed) layoutKey.push_back(VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR);
         static const bool noLayoutCache = std::getenv("APS5_NO_LAYOUT_CACHE") != nullptr;
         static const bool noPoolCache = std::getenv("APS5_NO_POOL_CACHE") != nullptr;
         if (context.descriptorCache != nullptr && !noLayoutCache) {
-            _layout = context.descriptorCache->Layout(layoutKey, description, updateAfterBind);
+            _layout = context.descriptorCache->Layout(layoutKey, description, updateAfterBind, pushed);
         } else {
             ValidateDescriptorLayout(context, description, updateAfterBind);
-            _layout = CreateSetLayout(context, description, updateAfterBind);
+            _layout = CreateSetLayout(context, description, updateAfterBind, pushed);
             ownsLayout = true;
         }
         // A draw's own set (PrepareDrawBindings) holds what the layout holds, by type.
@@ -1433,7 +1453,7 @@ void ShaderResources::buildPrepare(std::span<const CompiledShader> shaders, cons
             }
             found->descriptorCount += binding.layout.descriptorCount;
         }
-        if (!bindings.empty()) {
+        if (!bindings.empty() && !pushed) {
             // The set is sized from the plan: every image element becomes exactly one descriptor
             // when stage B looks it up.
             std::vector<VkDescriptorPoolSize> sizes;
@@ -1493,9 +1513,9 @@ void ShaderResources::buildComplete() {
         if (usesBda) bda = std::make_unique<BdaResources>(context, guestMemory);
         else if (usesFaultBuffer) bda = std::make_unique<BdaResources>(context);
         phase(BuildPhase::Bda);
-        if (_set != VK_NULL_HANDLE) {
+        if (_set != VK_NULL_HANDLE || pushed) {
             // One update call for the whole set: the info arrays are sized up front so every write's
-            // pointer into them stays valid until the call.
+            // pointer into them stays valid until the call (a pushed object's, for its lifetime).
             std::size_t bufferCount = 0;
             std::size_t imageCount = 0;
             for (const auto& binding : bindings) {
@@ -1551,7 +1571,7 @@ void ShaderResources::buildComplete() {
                 }
                 writes.push_back(write);
             }
-            context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets")(context.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
+            if (_set != VK_NULL_HANDLE) context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets")(context.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
         }
         for (const auto& allocation : allocations) {
             if (allocation.adjustment == 0) continue;
@@ -2740,7 +2760,7 @@ DescriptorCache::~DescriptorCache() {
     for (const auto& [key, layout] : layouts) destroyLayout(context.device, layout, nullptr);
 }
 
-VkDescriptorSetLayout DescriptorCache::Layout(std::span<const std::uint32_t> key, std::span<const VkDescriptorSetLayoutBinding> bindings, bool updateAfterBind) {
+VkDescriptorSetLayout DescriptorCache::Layout(std::span<const std::uint32_t> key, std::span<const VkDescriptorSetLayoutBinding> bindings, bool updateAfterBind, bool pushed) {
     std::lock_guard lock(mutex);
     std::vector<std::uint32_t> keyCopy(key.begin(), key.end());
     if (const auto found = layouts.find(keyCopy); found != layouts.end()) {
@@ -2749,7 +2769,7 @@ VkDescriptorSetLayout DescriptorCache::Layout(std::span<const std::uint32_t> key
     }
     ValidateDescriptorLayout(context, bindings, updateAfterBind);
     ++stats.layoutMisses;
-    const auto layout = CreateSetLayout(context, bindings, updateAfterBind);
+    const auto layout = CreateSetLayout(context, bindings, updateAfterBind, pushed);
     layouts.emplace(std::move(keyCopy), layout);
     return layout;
 }
@@ -3600,7 +3620,7 @@ ShaderResources::DrawBindings::~DrawBindings() {
 bool ShaderResources::MovedReadOnlyBuffers(std::span<const CompiledShader> shaders, Recorder& recorder, std::vector<MovedBuffer>& moved) const {
     // At most one entry per allocation: reserved with the first one, not grown push by push.
     moved.clear();
-    if (_set == VK_NULL_HANDLE || usesBda) return true;
+    if ((_set == VK_NULL_HANDLE && !pushed) || usesBda) return true;
     for (const auto& shader : shaders) {
         if (shader.program == nullptr) return false;
         for (const auto& binding : shader.program->bindings) {
@@ -3716,8 +3736,22 @@ std::size_t ShaderResources::DrawUploadLimit() {
     return limit;
 }
 
+namespace {
+
+// A draw's own writes (PrepareDrawBindings), the thread's lists refilled draw after draw: those of a
+// pushed object's draw wait here for BindDraw, with the bindings they were made for.
+struct DrawWrites {
+    std::vector<VkDescriptorBufferInfo> buffers;
+    std::vector<VkWriteDescriptorSet> writes;
+    const ShaderResources::DrawBindings* owner = nullptr;
+};
+
+struct DrawWritesTag {};
+
+}
+
 bool ShaderResources::PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved, DrawBindings& result) const {
-    if (_set == VK_NULL_HANDLE || usesBda) return false;
+    if ((_set == VK_NULL_HANDLE && !pushed) || usesBda) return false;
     auto& parts = bindingParts();
     if (parts.enabled) {
         parts.lap = std::chrono::steady_clock::now();
@@ -3802,20 +3836,21 @@ bool ShaderResources::PrepareDrawBindings(Recorder& recorder, std::span<const Mo
     }
     if (parts.enabled) parts.mark(BindingParts::Snapshots);
     if (selected.empty()) return false;
-    Require(context.descriptorCache != nullptr, "draw snapshots require a descriptor cache");
-    result.cache = context.descriptorCache;
-    result.allocation = result.cache->AllocateTransient(_layout, std::span<const VkDescriptorPoolSize>(drawSetSizes.data(), drawSetSizeCount));
-    Require(result.allocation.set != VK_NULL_HANDLE, "draw snapshot descriptor allocation failed");
+    if (!pushed) {
+        Require(context.descriptorCache != nullptr, "draw snapshots require a descriptor cache");
+        result.cache = context.descriptorCache;
+        result.allocation = result.cache->AllocateTransient(_layout, std::span<const VkDescriptorPoolSize>(drawSetSizes.data(), drawSetSizeCount));
+        Require(result.allocation.set != VK_NULL_HANDLE, "draw snapshot descriptor allocation failed");
+    }
     if (parts.enabled) {
         ++parts.sets;
         parts.mark(BindingParts::Allocate);
     }
     // The template's writes with the copies' buffers in place of theirs: one call, no descriptor
     // copies (the lists are the thread's, refilled).
-    struct BuffersTag {};
-    struct WritesTag {};
-    auto& buffers = ThreadScratch<std::vector<VkDescriptorBufferInfo>, BuffersTag>();
-    auto& writes = ThreadScratch<std::vector<VkWriteDescriptorSet>, WritesTag>();
+    auto& drawn = ThreadScratch<DrawWrites, DrawWritesTag>();
+    auto& buffers = drawn.buffers;
+    auto& writes = drawn.writes;
     buffers.assign(descriptorBuffers.begin(), descriptorBuffers.end());
     writes.assign(descriptorWrites.begin(), descriptorWrites.end());
     InlineList<std::size_t, 32> snapshotIndices;
@@ -3836,13 +3871,34 @@ bool ShaderResources::PrepareDrawBindings(Recorder& recorder, std::span<const Mo
         }
     }
     if (parts.enabled) parts.mark(BindingParts::Copy);
-    context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets")(context.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
+    // A pushed object's writes are recorded with the draw (BindDraw), after its pass has begun.
+    if (pushed) {
+        drawn.owner = &result;
+        result.pushed = true;
+    } else {
+        context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets")(context.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
+    }
     for (const auto& snapshot : result.snapshots) recorder.KeepBytes(snapshot.buffer.get(), snapshot.buffer->Bytes().size());
     if (parts.enabled) parts.mark(BindingParts::Write);
     return true;
 }
 
+void ShaderResources::BindDraw(VkCommandBuffer commands, VkPipelineBindPoint bindPoint, VkPipelineLayout layout, const DrawBindings& bindings) const {
+    if (bindings.pushed) {
+        const auto& drawn = ThreadScratch<DrawWrites, DrawWritesTag>();
+        Require(drawn.owner == &bindings, "a draw's pushed writes were refilled before the draw bound them");
+        context.Resolved(&DeviceFunctions::cmdPushDescriptorSet, "vkCmdPushDescriptorSetKHR")(commands, bindPoint, layout, 0, static_cast<std::uint32_t>(drawn.writes.size()), drawn.writes.data());
+        return;
+    }
+    const auto set = bindings.allocation.set;
+    context.Resolved(&DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, bindPoint, layout, 0, 1, &set, 0, nullptr);
+}
+
 void ShaderResources::Bind(VkCommandBuffer commands, VkPipelineBindPoint bindPoint, VkPipelineLayout layout) const {
+    if (pushed) {
+        context.Resolved(&DeviceFunctions::cmdPushDescriptorSet, "vkCmdPushDescriptorSetKHR")(commands, bindPoint, layout, 0, static_cast<std::uint32_t>(descriptorWrites.size()), descriptorWrites.data());
+        return;
+    }
     if (_set == VK_NULL_HANDLE) return;
     context.Resolved(&DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, bindPoint, layout, 0, 1, &_set, 0, nullptr);
 }

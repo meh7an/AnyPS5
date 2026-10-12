@@ -48,6 +48,8 @@ struct DeviceFunctions {
     PFN_vkCmdFillBuffer cmdFillBuffer = nullptr;
     PFN_vkCmdBindPipeline cmdBindPipeline = nullptr;
     PFN_vkCmdBindDescriptorSets cmdBindDescriptorSets = nullptr;
+    // Only with Context::pushDescriptors.
+    PFN_vkCmdPushDescriptorSetKHR cmdPushDescriptorSet = nullptr;
     PFN_vkCmdPushConstants cmdPushConstants = nullptr;
     PFN_vkCmdDispatch cmdDispatch = nullptr;
     PFN_vkCmdDispatchIndirect cmdDispatchIndirect = nullptr;
@@ -167,7 +169,8 @@ struct Context {
     // image (a depth surface and its R32 / R16 storage image, DepthSurface's Transfer).
     bool depthColorCopies = false;
     // VK_KHR_push_descriptor: DepthSurface's transfer passes push their two views instead of
-    // keeping a set alive for the recorded batch.
+    // keeping a set alive for the recorded batch, and a draw pushes its descriptors (see
+    // ShaderResources::BindDraw).
     bool pushDescriptors = false;
     bool pipelineExecutableInfo = false;
     bool graphicsPipelineLibrary = false;

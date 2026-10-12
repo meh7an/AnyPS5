@@ -71,8 +71,8 @@ public:
     DescriptorCache& operator=(const DescriptorCache&) = delete;
 
     // The layout for `key` (binding, type, count, stage flags per binding, as ShaderResources builds
-    // it from `bindings`), created on first use.
-    VkDescriptorSetLayout Layout(std::span<const std::uint32_t> key, std::span<const VkDescriptorSetLayoutBinding> bindings, bool updateAfterBind = false);
+    // it from `bindings`), created on first use; `pushed` makes it a push descriptor layout.
+    VkDescriptorSetLayout Layout(std::span<const std::uint32_t> key, std::span<const VkDescriptorSetLayoutBinding> bindings, bool updateAfterBind = false, bool pushed = false);
     struct SetAllocation {
         VkDescriptorSet set = VK_NULL_HANDLE;
         VkDescriptorPool pool = VK_NULL_HANDLE;
@@ -178,6 +178,8 @@ public:
         };
         DescriptorCache* cache = nullptr;
         DescriptorCache::SetAllocation allocation;
+        // A pushed object's draw (see BindDraw) takes no set: its writes wait in the thread's lists.
+        bool pushed = false;
         // A handful per draw (about five on S3K, more than eight often enough that spilling to the
         // heap was 0.6% of the worker): inline, no allocation of their own.
         InlineList<Snapshot, 16> snapshots;
@@ -194,8 +196,11 @@ public:
     // A draw that reads copies (snapshots, moved buffers) gets a set of its own: `bindings` (empty,
     // owned by an object the caller already kept in the recorder's open batch, so that the set and
     // the copies live until the batch completed) receives it. False when the object's set serves the
-    // draw as it is.
+    // draw as it is. A pushed object makes the draw's writes instead, for BindDraw.
     bool PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved, DrawBindings& bindings) const;
+    // Binds the draw's own set, or pushes the writes PrepareDrawBindings made for `bindings` last on
+    // this thread (no other draw's may come between).
+    void BindDraw(VkCommandBuffer commands, VkPipelineBindPoint bindPoint, VkPipelineLayout layout, const DrawBindings& bindings) const;
     // The largest draw snapshot (and moved data buffer) PrepareDrawBindings copies into the
     // recorder's upload chunk on every draw instead of keeping a buffer of its own (see
     // Recorder::DrawUpload); APS5_DRAW_UPLOAD_MAX, default 4096, 0 keeps every copy in its own buffer.
@@ -493,6 +498,9 @@ private:
     VkDescriptorSetLayout _layout = VK_NULL_HANDLE;
     // Whether the layout is this object's own (no cache) and destroyed with it.
     bool ownsLayout = false;
+    // A draw build's layout is a push descriptor layout (VK_KHR_push_descriptor) and every use
+    // pushes the writes instead of binding a set, of which there is none (see buildPrepare).
+    bool pushed = false;
     VkDescriptorSet _set = VK_NULL_HANDLE;
     VkDescriptorPool pool = VK_NULL_HANDLE;
     // The cache pool the set was allocated from, freed back to it on release.

@@ -1692,6 +1692,10 @@ struct MockVulkan {
     std::uint32_t boundSets = 0;
     std::uint32_t boundFirst = 0;
     VkPipelineBindPoint boundPoint = VK_PIPELINE_BIND_POINT_MAX_ENUM;
+    // vkCmdPushDescriptorSetKHR: the calls, and the writes of the last one.
+    std::uint32_t pushes = 0;
+    VkPipelineBindPoint pushedPoint = VK_PIPELINE_BIND_POINT_MAX_ENUM;
+    std::vector<MockDescriptorWrite> pushedWrites;
     std::map<VkPipelineLayout, VkDeviceSize> pipelineLayoutPushConstantSize;
     std::uint32_t pipelineCreateCount = 0;
     std::vector<std::array<std::uint32_t, 3>> pipelineSpecializations;
@@ -1829,6 +1833,18 @@ VKAPI_ATTR void VKAPI_CALL mockCmdBindDescriptorSets(VkCommandBuffer, VkPipeline
     mock.boundSets = count;
 }
 
+VKAPI_ATTR void VKAPI_CALL mockCmdPushDescriptorSet(VkCommandBuffer, VkPipelineBindPoint point, VkPipelineLayout layout, std::uint32_t set, std::uint32_t count, const VkWriteDescriptorSet* writes) {
+    Require(layout != VK_NULL_HANDLE && set == 0, "descriptors were pushed without a pipeline layout or outside set zero");
+    mock.pushedPoint = point;
+    ++mock.pushes;
+    mock.pushedWrites.clear();
+    for (std::uint32_t i = 0; i < count; ++i) {
+        MockDescriptorWrite write{writes[i].dstBinding, writes[i].dstArrayElement, writes[i].descriptorCount, writes[i].descriptorType, {}};
+        if (writes[i].pBufferInfo != nullptr) write.buffers.assign(writes[i].pBufferInfo, writes[i].pBufferInfo + writes[i].descriptorCount);
+        mock.pushedWrites.push_back(write);
+    }
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL mockGetMemoryHostPointerProperties(VkDevice, VkExternalMemoryHandleTypeFlagBits type, const void* pointer, VkMemoryHostPointerPropertiesEXT* properties) {
     Require(type == VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT && pointer != nullptr, "invalid host pointer import query");
     properties->memoryTypeBits = 1;
@@ -1959,6 +1975,7 @@ PFN_vkVoidFunction VKAPI_CALL mockProc(VkDevice, const char* name) {
         {"vkFreeDescriptorSets", reinterpret_cast<PFN_vkVoidFunction>(mockFreeDescriptorSets)},
         {"vkUpdateDescriptorSets", reinterpret_cast<PFN_vkVoidFunction>(mockUpdateDescriptorSets)},
         {"vkCmdBindDescriptorSets", reinterpret_cast<PFN_vkVoidFunction>(mockCmdBindDescriptorSets)},
+        {"vkCmdPushDescriptorSetKHR", reinterpret_cast<PFN_vkVoidFunction>(mockCmdPushDescriptorSet)},
         {"vkCreatePipelineLayout", reinterpret_cast<PFN_vkVoidFunction>(mockCreatePipelineLayout)},
         {"vkDestroyPipelineLayout", reinterpret_cast<PFN_vkVoidFunction>(mockDestroyPipelineLayout)},
         {"vkCreateShaderModule", reinterpret_cast<PFN_vkVoidFunction>(mockCreateShaderModule)},
@@ -2160,6 +2177,56 @@ void descriptorSnapshotTests() {
         }
         Require(mock.live == 0, "snapshot descriptor resources leaked Vulkan objects");
     }
+}
+
+// With push descriptors a draw build's layout pushes and no set is made: Bind pushes the build's
+// writes, and a draw that reads copies pushes them with the copies in place (BindDraw), without a
+// set or a descriptor update of its own.
+void pushedDescriptorTests() {
+    using AgcDriver::Graphics::DescriptorCache;
+    using AgcDriver::Graphics::Recorder;
+    using AgcDriver::Graphics::ShaderResources;
+    mock = MockVulkan{};
+    auto context = mockContext();
+    context.pushDescriptors = true;
+    const auto commands = reinterpret_cast<VkCommandBuffer>(std::uintptr_t{1});
+    {
+        DescriptorCache cache(context);
+        context.descriptorCache = &cache;
+        std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+        Recorder recorder(context);
+        ShaderRecompiler::RecompileResult vertex, fragment;
+        auto binding = makeBinding(Role::GuestBuffers, 0, 2, join(vsharp(guestFirst.data(), 16), vsharp(guestSecond.data(), 32)));
+        binding.bufferWritten = {false, false};
+        vertex.bindings.push_back(binding);
+        fragment.bindings.push_back(makeBinding(Role::GuestBuffers, 4, 1, vsharp(guestThird.data(), 8)));
+        const auto state = AgcDriver::Graphics::DecodeState(makeState());
+        ShaderResources resources(context, vertex, fragment, state.color, 0, 0);
+        Require((mock.layoutFlags & VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR) != 0 && resources.LayoutKey().back() == VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR, "a draw build with push descriptors has no push layout");
+        Require(mock.writes.empty() && mock.poolSizes.empty(), "a pushed build made or wrote a set");
+        const auto layout = makeHandle<VkPipelineLayout>();
+        resources.Bind(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, layout);
+        Require(mock.pushes == 1 && mock.boundSets == 0 && mock.pushedPoint == VK_PIPELINE_BIND_POINT_GRAPHICS && mock.pushedWrites.size() == 2, "Bind did not push the build's writes");
+        const auto original = mock.pushedWrites.front().buffers;
+        const auto originalThird = mock.pushedWrites.back().buffers;
+        Require(mock.pushedWrites.front().binding == 0 && original.size() == 2 && mock.pushedWrites.back().binding == 4, "the build's writes were pushed out of order");
+        const std::vector<std::uint32_t> words(6, 0x12340000u);
+        const std::vector<ShaderResources::MovedBuffer> moved{{0, 0, 24, words}};
+        const auto bindings = std::make_shared<ShaderResources::DrawBindings>();
+        recorder.Keep(bindings);
+        Require(resources.PrepareDrawBindings(recorder, moved, *bindings) && bindings->pushed && bindings->allocation.set == VK_NULL_HANDLE && bindings->snapshots.size() == 1, "a pushed draw took a set of its own");
+        Require(mock.writes.empty() && mock.pushes == 1, "a pushed draw's writes went out before the draw bound them");
+        resources.BindDraw(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, *bindings);
+        Require(mock.pushes == 2 && mock.pushedWrites.size() == 2, "BindDraw did not push the draw's writes");
+        const auto& copied = mock.pushedWrites.front().buffers;
+        const auto& snapshot = bindings->snapshots.front();
+        Require(copied[0].buffer == snapshot.buffer->Handle() && copied[0].offset == snapshot.offset && copied[0].range == 24 && sameBytes(bufferBytes(copied[0].buffer).subspan(static_cast<std::size_t>(copied[0].offset)), words.data(), 24), "the pushed copy is not the draw's snapshot");
+        Require(copied[1].buffer == original[1].buffer && copied[1].offset == original[1].offset && copied[1].range == original[1].range, "a pushed draw changed an element without a copy");
+        const auto& third = mock.pushedWrites.back().buffers;
+        Require(third[0].buffer == originalThird[0].buffer && third[0].range == originalThird[0].range, "a pushed draw changed a binding without copies");
+        recorder.Sync();
+    }
+    Require(mock.live == 0, "pushed descriptor resources leaked Vulkan objects");
 }
 
 void resourceTests() {
@@ -4244,6 +4311,7 @@ int main() {
         pushConstantTests();
         resourceTests();
         descriptorSnapshotTests();
+        pushedDescriptorTests();
         descriptorCacheTests();
         unitGenerationTests();
         keptArenaTests();
