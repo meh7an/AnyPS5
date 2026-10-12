@@ -1037,12 +1037,29 @@ bool VerifyPendingSnapshots() {
 }
 
 // A thread's copy of the registry's ranges (PendingList::Ranges) and the pendingSerial it was copied
-// under: while the serial is still that, the registry holds the same images.
+// under: while the serial is still that, the registry holds the same images. `flushing` holds the
+// ranges of the images a FlushPending is storing right now (Pending().flushing, whose changes move
+// the serial as well), which only AnyPendingOverlaps counts.
 struct PendingSnapshot {
     std::uint64_t serial = ~std::uint64_t{0};
     std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> flushing;
 };
 struct PendingSnapshotTag {};
+
+// The calling thread's snapshot, copied again under the registry's mutex once pendingSerial moved.
+const PendingSnapshot& currentPendingSnapshot() {
+    auto& snapshot = ThreadScratch<PendingSnapshot, PendingSnapshotTag>();
+    if (snapshot.serial != pendingSerial.load(std::memory_order_acquire)) {
+        auto& pending = Pending();
+        std::lock_guard lock(pending.mutex);
+        snapshot.ranges = pending.textures.Ranges();
+        snapshot.flushing.clear();
+        for (const auto* texture : pending.flushing) snapshot.flushing.emplace_back(texture->Descriptor().baseAddress, texture->Descriptor().baseAddress + texture->GuestBytes());
+        snapshot.serial = pendingSerial.load(std::memory_order_relaxed);
+    }
+    return snapshot;
+}
 
 // Whether a pending image may overlap [address, address + bytes), answered from the calling thread's
 // snapshot without the registry's mutex while pendingSerial has not moved (a copy is taken under the
@@ -1051,13 +1068,7 @@ struct PendingSnapshotTag {};
 // buffers') used to take the mutex, though almost none of them overlap anything.
 bool pendingMayOverlap(std::uint64_t address, std::size_t bytes) {
     if (!PendingSnapshots() || bytes == 0) return bytes != 0;
-    auto& snapshot = ThreadScratch<PendingSnapshot, PendingSnapshotTag>();
-    if (snapshot.serial != pendingSerial.load(std::memory_order_acquire)) {
-        auto& pending = Pending();
-        std::lock_guard lock(pending.mutex);
-        snapshot.ranges = pending.textures.Ranges();
-        snapshot.serial = pendingSerial.load(std::memory_order_relaxed);
-    }
+    const auto& snapshot = currentPendingSnapshot();
     const auto end = bytes > std::numeric_limits<std::uint64_t>::max() - address ? std::numeric_limits<std::uint64_t>::max() : address + bytes;
     const auto it = std::upper_bound(snapshot.ranges.begin(), snapshot.ranges.end(), address, [](std::uint64_t value, const std::pair<std::uint64_t, std::uint64_t>& range) { return value < range.second; });
     const bool may = it != snapshot.ranges.end() && it->first < end;
@@ -1072,6 +1083,21 @@ bool pendingMayOverlap(std::uint64_t address, std::size_t bytes) {
         }
     }
     return may;
+}
+
+// Whether an image pending or being stored may overlap any of `ranges`, from the calling thread's
+// snapshot as pendingMayOverlap answers: false is final.
+bool anyPendingMayOverlap(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) {
+    const auto& snapshot = currentPendingSnapshot();
+    for (const auto& [begin, end] : ranges) {
+        if (end <= begin) continue;
+        const auto it = std::upper_bound(snapshot.ranges.begin(), snapshot.ranges.end(), begin, [](std::uint64_t value, const std::pair<std::uint64_t, std::uint64_t>& range) { return value < range.second; });
+        if (it != snapshot.ranges.end() && it->first < end) return true;
+        for (const auto& [from, to] : snapshot.flushing) {
+            if (begin < to && from < end) return true;
+        }
+    }
+    return false;
 }
 
 // The texel layout a clear value is built from (FillClearColor): channels in memory order with
@@ -3091,21 +3117,34 @@ bool PendingStorageOverlaps(std::uint64_t address, std::size_t bytes, const Stor
 
 bool StorageTexture::AnyPendingOverlaps(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) {
     if (ranges.empty()) return false;
-    auto& pending = Pending();
-    std::lock_guard lock(pending.mutex);
     const auto overlapsAny = [&](const StorageTexture* texture) {
         for (const auto& [begin, end] : ranges) {
             if (end > begin && texture->overlaps(begin, static_cast<std::size_t>(end - begin))) return true;
         }
         return false;
     };
-    for (const auto* texture : pending.textures) {
-        if (overlapsAny(texture)) return true;
+    // Under the registry's mutex.
+    const auto scan = [&](PendingWrites& pending) {
+        return std::any_of(pending.textures.begin(), pending.textures.end(), overlapsAny) || std::any_of(pending.flushing.begin(), pending.flushing.end(), overlapsAny);
+    };
+    auto& pending = Pending();
+    // The calling thread's snapshot answers first (anyPendingMayOverlap): no image over any of the
+    // ranges is final without the mutex, which every memoized draw stage took here to learn that
+    // its runs had no image over them.
+    if (PendingSnapshots() && !anyPendingMayOverlap(ranges)) {
+        if (VerifyPendingSnapshots()) {
+            std::lock_guard lock(pending.mutex);
+            // Only a registry the serial says is the snapshot's: one that moved since may differ.
+            if (pendingSerial.load(std::memory_order_relaxed) == ThreadScratch<PendingSnapshot, PendingSnapshotTag>().serial && scan(pending)) {
+                std::fprintf(stderr, "[texture] APS5_VERIFY_REGISTRY_SNAPSHOTS: the pending snapshot misses an image over one of %zu ranges from 0x%llx\n", ranges.size(), static_cast<unsigned long long>(ranges.front().first));
+                std::fflush(stderr);
+                std::abort();
+            }
+        }
+        return false;
     }
-    for (const auto* texture : pending.flushing) {
-        if (overlapsAny(texture)) return true;
-    }
-    return false;
+    std::lock_guard lock(pending.mutex);
+    return scan(pending);
 }
 
 std::uint64_t StorageTexture::PendingSerial() {
