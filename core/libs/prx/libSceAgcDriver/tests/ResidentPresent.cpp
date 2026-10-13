@@ -1,6 +1,7 @@
 #include "ResidentPresent.hpp"
 #include "prx/libSceAgcDriver/Execution/include/DisplayBuffer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/DisplayFormat.hpp"
+#include "prx/libSceAgcDriver/Execution/include/PresentationScaler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ColorTargetLayout.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GpuColorTransfer.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
@@ -156,10 +157,99 @@ void conversionTest(const Context& context, std::uint64_t pixelFormat, VkFormat 
     Require(std::equal(expected.begin(), expected.end(), fromImage.Bytes().begin()), "the resident image presents other pixels than guest memory: " + name);
 }
 
+// A shrinking present blit goes through 2x halvings first (PresentationHalvings): a 1-texel checker
+// shrunk to under a quarter comes out a flat grey, where one linear blit keeps texels of a single
+// colour wherever its taps land on them.
+void fittedBlitTest(const Context& context) {
+    using AgcDriver::PresentationHalvings;
+    Require(PresentationHalvings(3840, 2160, 1100, 619) == 1 && PresentationHalvings(3840, 2160, 1920, 1080) == 1 && PresentationHalvings(3840, 2160, 640, 360) == 2, "a 4K image takes the wrong number of halvings");
+    Require(PresentationHalvings(3840, 2160, 1921, 1081) == 0 && PresentationHalvings(1920, 1080, 2560, 1440) == 0 && PresentationHalvings(256, 128, 60, 30) == 2, "an image is halved below its fitted rectangle, or not halved above it");
+    constexpr std::uint32_t width = 256;
+    constexpr std::uint32_t height = 128;
+    constexpr std::uint32_t outWidth = 60;
+    constexpr std::uint32_t outHeight = 30;
+    AgcDriver::PresentationScaler scaler(context, VK_FORMAT_B8G8R8A8_UNORM, VK_FORMAT_B8G8R8A8_UNORM);
+    scaler.EnsureSourceImage(width, height);
+    Buffer upload(context, static_cast<std::size_t>(width) * height * 4, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+    for (std::uint32_t y = 0; y < height; ++y) {
+        for (std::uint32_t x = 0; x < width; ++x) {
+            const auto value = static_cast<std::byte>((x + y) % 2 == 0 ? 0xff : 0x00);
+            auto* texel = upload.Bytes().data() + (static_cast<std::size_t>(y) * width + x) * 4;
+            texel[0] = texel[1] = texel[2] = value;
+            texel[3] = std::byte{0xff};
+        }
+    }
+    VkImageCreateInfo imageInfo{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    imageInfo.imageType = VK_IMAGE_TYPE_2D;
+    imageInfo.format = VK_FORMAT_B8G8R8A8_UNORM;
+    imageInfo.extent = {outWidth, outHeight, 1};
+    imageInfo.mipLevels = 1;
+    imageInfo.arrayLayers = 1;
+    imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+    imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+    imageInfo.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    VkImage image = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    Check(context.Function<PFN_vkCreateImage>("vkCreateImage")(context.device, &imageInfo, nullptr, &image), "vkCreateImage fitted blit test");
+    struct Release {
+        const Context& context;
+        VkImage& image;
+        VkDeviceMemory& memory;
+        ~Release() {
+            if (image) context.Function<PFN_vkDestroyImage>("vkDestroyImage")(context.device, image, nullptr);
+            if (memory) context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, memory, nullptr);
+        }
+    } release{context, image, memory};
+    VkMemoryRequirements requirements{};
+    context.Function<PFN_vkGetImageMemoryRequirements>("vkGetImageMemoryRequirements")(context.device, image, &requirements);
+    VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    allocation.allocationSize = requirements.size;
+    allocation.memoryTypeIndex = memoryType(context, requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    Check(context.Function<PFN_vkAllocateMemory>("vkAllocateMemory")(context.device, &allocation, nullptr, &memory), "vkAllocateMemory fitted blit test");
+    Check(context.Function<PFN_vkBindImageMemory>("vkBindImageMemory")(context.device, image, memory, 0), "vkBindImageMemory fitted blit test");
+    Buffer readback(context, static_cast<std::size_t>(outWidth) * outHeight * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    const auto barrier = context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier");
+    {
+        CommandBatch batch(context);
+        const auto commands = batch.Handle();
+        scaler.RecordUpload(commands, upload.Handle());
+        VkImageMemoryBarrier toDestination{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        toDestination.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        toDestination.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        toDestination.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        toDestination.srcQueueFamilyIndex = toDestination.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        toDestination.image = image;
+        toDestination.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        barrier(commands, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &toDestination);
+        scaler.RecordBlit(commands, image, outWidth, outHeight);
+        auto toSource = toDestination;
+        toSource.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        toSource.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        toSource.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        toSource.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        barrier(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &toSource);
+        VkBufferImageCopy region{};
+        region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        region.imageExtent = {outWidth, outHeight, 1};
+        context.Function<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer")(commands, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback.Handle(), 1, &region);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+        batch.SubmitAndWait();
+    }
+    const auto* texels = readback.Bytes().data();
+    for (std::size_t i = 0; i < static_cast<std::size_t>(outWidth) * outHeight; ++i) {
+        for (std::size_t channel = 0; channel < 3; ++channel) {
+            const auto value = std::to_integer<int>(texels[i * 4 + channel]);
+            Require(value >= 112 && value <= 144, "a shrunk 1-texel checker is not flat grey at texel " + std::to_string(i) + ": " + std::to_string(value));
+        }
+    }
+}
+
 }
 
 void RunResidentPresentTests(const Context& context) {
     decisionTests();
+    fittedBlitTest(context);
     conversionTest(context, Bgra8 | TenBit, VK_FORMAT_A2B10G10R10_UNORM_PACK32);
     conversionTest(context, Rgba8 | TenBit, VK_FORMAT_A2B10G10R10_UNORM_PACK32);
     conversionTest(context, Bgra8 | TenBit, VK_FORMAT_A2R10G10B10_UNORM_PACK32);

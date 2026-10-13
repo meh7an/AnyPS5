@@ -2558,6 +2558,8 @@ bool VulkanDevice::present(std::uint32_t width, std::uint32_t height, bool opaqu
     auto pipelineBarrier = state->DeviceFunction<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier");
     pipelineBarrier(commands, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
     Graphics::Recorder::CountBarriers(CommandClass::PresentBlit);
+    // Whether the blit went through the scaler's halving chain, a shared object like its source image.
+    bool chained = false;
     if (clearOnly) {
         APS5_LOG_OUT_DEBUG("Recording swapchain clear opaque=%u image=%p", static_cast<unsigned>(opaque), reinterpret_cast<void*>(barrier.image));
         VkClearColorValue clear{};
@@ -2615,7 +2617,7 @@ bool VulkanDevice::present(std::uint32_t width, std::uint32_t height, bool opaqu
         letterboxBarrier.subresourceRange = barrier.subresourceRange;
         pipelineBarrier(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &letterboxBarrier);
         Graphics::Recorder::CountBarriers(CommandClass::PresentBlit);
-        if (direct) PresentationScaler::RecordBlitFrom(graphicsContext(), commands, resident->Image(), VK_IMAGE_LAYOUT_GENERAL, width, height, residentFilter, barrier.image, state->extent.width, state->extent.height);
+        if (direct) chained = state->scaler->RecordFittedBlit(commands, resident->Image(), VK_IMAGE_LAYOUT_GENERAL, width, height, residentFilter, barrier.image, state->extent.width, state->extent.height);
         else state->scaler->RecordBlit(commands, barrier.image, state->extent.width, state->extent.height);
         if (dumpFrame && direct) {
             const auto scale = DumpScale();
@@ -2676,7 +2678,7 @@ bool VulkanDevice::present(std::uint32_t width, std::uint32_t height, bool opaqu
         slot.kept = resident;
         slot.imageIndex = index;
         slot.inFlight = true;
-        slot.shared = shared;
+        slot.shared = shared || chained;
         // Only a submitted readback is written after the fence (a failed submit tears the device down).
         slot.dumpRecorded = dumpFrame;
         slot.dumpIndex = state->nextDumpIndex;
