@@ -278,6 +278,7 @@ static const struct iovec* NativeIovecs(const KernelIovec* iov) {
 }
 #endif
 
+static constexpr int GUEST_EPERM = 1;
 static constexpr int GUEST_ENOENT = 2;
 static constexpr int GUEST_EIO = 5;
 static constexpr int GUEST_EBADF = 9;
@@ -425,6 +426,7 @@ int APS5_VABI chmod_nid_postfix(const char* path, int mode) {
 
 int APS5_VABI close_nid_postfix(int d) {
     if (d >= GuestSockets::FirstDescriptor) return GuestSockets::Close(d);
+    if (IsStandardDescriptor_nid_no_patch(d)) return PosixFailure(GUEST_EPERM);
     File::ForgetRandomDevice(d);
 #ifdef _WIN32
     File::ForgetDirectoryDescriptor(d);

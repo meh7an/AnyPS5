@@ -27,6 +27,12 @@ std::int64_t NativePositioned_nid_no_patch(int descriptor, void* buf, std::size_
 }
 
 bool DescriptorIsOpen_nid_no_patch(int descriptor);
+// Titles close descriptor 0 as an unset handle. Closing the standard descriptors is refused, so
+// their numbers are never handed to a title's files, where such a close would shut another
+// thread's file.
+inline bool IsStandardDescriptor_nid_no_patch(int descriptor) {
+    return descriptor >= 0 && descriptor <= 2;
+}
 #ifdef _WIN32
 // Held across every use of a descriptor's file offset and across its close. A positioned transfer
 // moves the shared offset and then restores it, so a read, write, seek or close of the same
