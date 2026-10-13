@@ -3772,6 +3772,30 @@ bool SnapshotMemoEnabled() {
     return enabled;
 }
 
+// The small copies a thread's recent draws uploaded (PrepareDrawBindings): a draw reading the same
+// bytes again within the same batch binds the earlier slice, which that batch keeps (a later one
+// may reuse the chunk). A material's constants repeat so over runs of draws. APS5_NO_UPLOAD_REUSE=1
+// copies every one.
+struct UploadMemo {
+    static constexpr std::size_t MaxBytes = 1024;
+    struct Entry {
+        std::uint64_t address = 0;
+        std::size_t bytes = 0;
+        std::uint64_t batch = 0;
+        ShaderResources::DrawBindings::Snapshot snapshot{};
+        std::array<std::byte, MaxBytes> words{};
+    };
+    std::array<Entry, 8> entries{};
+    std::size_t next = 0;
+};
+
+struct UploadMemoTag {};
+
+bool UploadReuseEnabled() {
+    static const bool enabled = std::getenv("APS5_NO_UPLOAD_REUSE") == nullptr;
+    return enabled;
+}
+
 }
 
 bool ShaderResources::PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved, DrawBindings& result) const {
@@ -3834,10 +3858,27 @@ bool ShaderResources::PrepareDrawBindings(Recorder& recorder, std::span<const Mo
         const auto bytes = static_cast<std::size_t>(GuestBufferMemory::ViewBytes(size, item.adjustment));
         if (parts.enabled) parts.noteSize(bytes);
         if (bytes <= uploadLimit) {
-            // Copied on every draw: no collect, no lookup, nothing kept between draws.
-            auto snapshot = ownCopy(begin, bytes);
-            std::memcpy(snapshot.Bytes().data(), reinterpret_cast<const void*>(begin), bytes);
-            keep(std::move(snapshot));
+            // Copied on every draw: no collect, no lookup, nothing kept between draws; the same bytes
+            // again within the batch take the earlier copy (UploadMemo).
+            const bool memoized = UploadReuseEnabled() && bytes <= UploadMemo::MaxBytes;
+            auto& memo = ThreadScratch<UploadMemo, UploadMemoTag>();
+            const auto batch = recorder.Submissions();
+            const auto earlier = memoized ? std::find_if(memo.entries.begin(), memo.entries.end(), [&](const UploadMemo::Entry& entry) { return entry.snapshot.buffer != nullptr && entry.address == begin && entry.bytes == bytes && entry.batch == batch && std::memcmp(entry.words.data(), reinterpret_cast<const void*>(begin), bytes) == 0; }) : memo.entries.end();
+            if (earlier != memo.entries.end()) {
+                keep(earlier->snapshot);
+            } else {
+                auto snapshot = ownCopy(begin, bytes);
+                std::memcpy(snapshot.Bytes().data(), reinterpret_cast<const void*>(begin), bytes);
+                if (memoized) {
+                    auto& entry = memo.entries[memo.next++ % memo.entries.size()];
+                    entry.address = begin;
+                    entry.bytes = bytes;
+                    entry.batch = batch;
+                    entry.snapshot = snapshot;
+                    std::memcpy(entry.words.data(), reinterpret_cast<const void*>(begin), bytes);
+                }
+                keep(std::move(snapshot));
+            }
         } else {
             const auto registryGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
             const auto epoch = SnapshotMemoEnabled() ? GuestMemory::CollectEpoch() : 0;
