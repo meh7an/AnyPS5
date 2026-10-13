@@ -188,6 +188,13 @@ bool BlockTrackingEnabled() {
     return !disabled;
 }
 
+// APS5_NO_UNMOVED_REFRESH_SKIP=1: every refresh proof runs (StorageTexture::refreshProved), also
+// when nothing it reads moved since the image's last one.
+bool UnmovedRefreshSkip() {
+    static const bool enabled = std::getenv("APS5_NO_UNMOVED_REFRESH_SKIP") == nullptr;
+    return enabled;
+}
+
 struct PhaseTimer {
     std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
     double lap() {
@@ -1916,14 +1923,21 @@ bool StorageTexture::otherPendingOverlaps() const {
 bool StorageTexture::refreshProved() {
     if (refreshProof.generation == 0) return false;
     if (generation != refreshProof.generation || uploadedKeys != refreshProof.keys || !GuestMemory::GpuMutex().HeldByThisThread()) return false;
+    const auto keyCount = descriptor.dccAddress != 0 ? static_cast<std::size_t>(guestBytes / 256) : 0;
+    if (descriptor.dccAddress != 0 && (keyCount == 0 || keyProof.generation != refreshProof.keyGeneration || keyProof.keys != uploadedKeys)) return false;
+    // Nothing the proof reads moved since the last one: the same collect epoch (its collects are
+    // memoized, so a repeat finds no CPU store either; 0 without the memo), no write stamped anywhere
+    // since, and no pending image registered or retired. Most draws of a pass meet their targets so.
+    const auto epoch = GuestMemory::CollectEpoch();
+    const auto tracker = UnmovedRefreshSkip() ? GuestMemory::TrackerGeneration() : 0;
+    if (UnmovedRefreshSkip() && epoch != 0 && refreshProof.epoch == epoch && refreshProof.tracker == tracker && refreshProof.pendingSerial == PendingSerial()) return true;
+    refreshProof.epoch = 0;
     const auto bytes = static_cast<std::size_t>(guestBytes);
     std::array<GuestMemory::UnchangedQuery, 2> queries{};
     std::size_t used = 0;
     if (GuestMemory::CollectWrites(descriptor.baseAddress, bytes) == 0) return false;
     queries[used++] = {descriptor.baseAddress, bytes, generation};
     if (descriptor.dccAddress != 0) {
-        const auto keyCount = static_cast<std::size_t>(guestBytes / 256);
-        if (keyCount == 0 || keyProof.generation != refreshProof.keyGeneration || keyProof.keys != uploadedKeys) return false;
         if (GuestMemory::CollectWrites(descriptor.dccAddress, keyCount) == 0) return false;
         queries[used++] = {descriptor.dccAddress, keyCount, keyProof.generation};
     }
@@ -1932,6 +1946,11 @@ bool StorageTexture::refreshProved() {
     if (serial != refreshProof.pendingSerial) {
         if (otherPendingOverlaps()) return false;
         refreshProof.pendingSerial = serial;
+    }
+    // Kept for the skip only when the collects above stamped nothing (the generation held).
+    if (UnmovedRefreshSkip() && GuestMemory::TrackerGeneration() == tracker) {
+        refreshProof.epoch = epoch;
+        refreshProof.tracker = tracker;
     }
     return true;
 }

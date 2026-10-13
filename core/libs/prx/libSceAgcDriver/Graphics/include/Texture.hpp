@@ -528,6 +528,10 @@ private:
         std::uint64_t pendingSerial = 0;
         std::uint64_t keyGeneration = 0;
         DccKeys keys = DccKeys::Uncompressed;
+        // The collect epoch and tracker generation the last proof (refreshProved) held through: a
+        // later one with neither moved, nor the pending serial, reads the same and is skipped.
+        std::uint64_t epoch = 0;
+        std::uint64_t tracker = 0;
     };
     RefreshProof refreshProof;
     struct ForeignKeyProof {
