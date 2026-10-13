@@ -841,6 +841,9 @@ struct PipelineStore {
     std::uint64_t evicted = 0;
     // Draws served by their thread's last pipeline (LastPipeline), without the lock.
     std::atomic<std::uint64_t> lastHits{0};
+    // ClearCachedPipelines calls so far: a thread's last pipeline from before one is not served (a
+    // holder outside the store keeps it alive past the clear).
+    std::atomic<std::uint64_t> clears{0};
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
 };
 
@@ -854,6 +857,7 @@ struct LastPipeline {
     std::weak_ptr<BufferPool> pool;
     VkDevice device = VK_NULL_HANDLE;
     std::uint32_t uses = 0;
+    std::uint64_t clears = 0;
 };
 
 // Never destroyed: the pipelines belong to a device that may already be gone when statics die, and
@@ -919,7 +923,7 @@ std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& st
     }
     struct LastTag {};
     auto& last = ThreadScratch<LastPipeline, LastTag>();
-    if (!key.empty() && last.uses < 64 && last.device == context.device && last.key == key) {
+    if (!key.empty() && last.uses < 64 && last.device == context.device && last.clears == store.clears.load(std::memory_order_acquire) && last.key == key) {
         // The pool by its control block: the live pool shares the remembered one's only while it
         // is that pool.
         if (auto pipeline = last.pipeline.lock(); pipeline != nullptr && (context.bufferPool == nullptr || (!last.pool.owner_before(context.bufferPool) && !context.bufferPool.owner_before(last.pool)))) {
@@ -928,12 +932,14 @@ std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& st
             return pipeline;
         }
     }
+    // Under the store's lock, as the clears it counts are made.
     const auto remember = [&](const std::shared_ptr<Pipeline>& pipeline) {
         last.key = key;
         last.pipeline = pipeline;
         last.pool = context.bufferPool;
         last.device = context.device;
         last.uses = 0;
+        last.clears = store.clears.load(std::memory_order_relaxed);
     };
     const auto hash = key.empty() ? 0 : hashKey(key);
     std::lock_guard lock(store.mutex);
@@ -985,6 +991,7 @@ std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& st
 void ClearCachedPipelines(VkDevice device) {
     auto& store = Pipelines();
     std::lock_guard lock(store.mutex);
+    store.clears.fetch_add(1, std::memory_order_release);
     for (auto it = store.entries.begin(); it != store.entries.end();) {
         if (it->device != device) {
             ++it;
