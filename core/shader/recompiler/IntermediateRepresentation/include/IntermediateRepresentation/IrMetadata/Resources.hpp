@@ -24,7 +24,10 @@ struct BufferResource {
     bool formatted = false;
     bool descriptorFormatted = false;
     std::uint32_t formattedReadMask = 0;
+    // Read by a scalar load, and accessed by a per-lane instruction. A scalar load uses only a V#'s
+    // base, stride and size, so a buffer with no per-lane access ignores the rest.
     bool scalar = false;
+    bool vector = false;
     std::uint8_t typedAlignment = 1;
 
     bool operator==(const BufferResource& other) const = default;

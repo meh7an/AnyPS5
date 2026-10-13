@@ -1057,7 +1057,9 @@ private:
             resource.typedAlignment = std::max(resource.typedAlignment, static_cast<std::uint8_t>(std::min(format.byteSize, 4u)));
         }
         if (memory.formatted && !memory.typed && !write) resource.formattedReadMask |= (1u << std::min(memory.dataDwords, 4u)) - 1u;
-        resource.scalar = resource.scalar || op == IrOpcode::ReadConstBuffer || memory.kind == ResourceKind::ScalarBuffer;
+        const bool scalar = op == IrOpcode::ReadConstBuffer || memory.kind == ResourceKind::ScalarBuffer;
+        resource.scalar = resource.scalar || scalar;
+        resource.vector = resource.vector || !scalar;
     }
 
     std::uint32_t AddImage(std::uint32_t source, const MemoryInfo& memory, IrOpcode op, std::uint32_t pc) {

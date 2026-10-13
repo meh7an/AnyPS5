@@ -184,6 +184,7 @@ CompiledVariant sampleVariant() {
     buffer.read = true;
     buffer.atomic = true;
     buffer.scalar = true;
+    buffer.vector = true;
     buffer.descriptorFormatted = true;
     buffer.formattedReadMask = 5u;
     buffer.typedAlignment = 2u;

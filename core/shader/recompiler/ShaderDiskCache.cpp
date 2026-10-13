@@ -468,6 +468,7 @@ void encodeInfo(Writer& writer, const CompiledShaderInfo& compiled) {
         out.Value(buffer.descriptorFormatted);
         out.Value(buffer.formattedReadMask);
         out.Value(buffer.scalar);
+        out.Value(buffer.vector);
         out.Value(buffer.typedAlignment);
     });
     writer.List(info.images, [](Writer& out, const ImageResource& image) {
@@ -563,7 +564,7 @@ void decodeInfo(Reader& reader, CompiledShaderInfo& compiled) {
     auto& info = compiled.info;
     reader.Value(info.scratchDwords);
     reader.Value(info.sharedMemoryBytes);
-    reader.List(info.buffers, 27, [](Reader& in, BufferResource& buffer) {
+    reader.List(info.buffers, 28, [](Reader& in, BufferResource& buffer) {
         in.Value(buffer.source);
         in.Value(buffer.firstUsePc);
         in.Value(buffer.maxByteExtent);
@@ -575,6 +576,7 @@ void decodeInfo(Reader& reader, CompiledShaderInfo& compiled) {
         in.Value(buffer.descriptorFormatted);
         in.Value(buffer.formattedReadMask);
         in.Value(buffer.scalar);
+        in.Value(buffer.vector);
         in.Value(buffer.typedAlignment);
     });
     reader.List(info.images, 75, [](Reader& in, ImageResource& image) {
