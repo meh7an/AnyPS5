@@ -902,10 +902,19 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
             if (handle != nullptr) stageHandles.Remember(decode.serial, i, pushOffset, localDevice, handle);
         }
     }
-    const auto capture = [&] {
+    // APS5_DUMP_SHADERS: a stage whose capture or materialization fails at draw time is saved as well.
+    const auto dumpOnFailure = [&](auto step) {
+        try {
+            return step();
+        } catch (...) {
+            if (std::getenv("APS5_DUMP_SHADERS") != nullptr) static_cast<void>(dumpRequest(program.binary.codeAddress, request));
+            throw;
+        }
+    };
+    const auto capture = dumpOnFailure([&] {
         const SampledReadScope sampling(evidenceReads);
         return shaderMemory.Capture(*invocation);
-    }();
+    });
     part(StageTimes::Capture);
 
     // This stage's own reads: the draw cache's and the memo's.
@@ -945,7 +954,7 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
     timing.Mark("capture_resources");
     if (subPhases) lap = std::chrono::steady_clock::now();
     bool memoHit = false;
-    auto compiled = invocation->Materialize(*capture, &memoHit);
+    auto compiled = dumpOnFailure([&] { return invocation->Materialize(*capture, &memoHit); });
     timing.Mark("materialize");
     if (subPhases) {
         part(memoHit ? StageTimes::RecompileHit : StageTimes::RecompileMiss);
