@@ -3787,6 +3787,10 @@ struct UploadMemo {
     };
     std::array<Entry, 8> entries{};
     std::size_t next = 0;
+    // Addresses copied recently: only one copied again is kept, as a draw's own constants (a new
+    // address every draw) would otherwise push a material's out at every draw.
+    std::array<std::uint64_t, 8> seen{};
+    std::size_t nextSeen = 0;
 };
 
 struct UploadMemoTag {};
@@ -3869,7 +3873,9 @@ bool ShaderResources::PrepareDrawBindings(Recorder& recorder, std::span<const Mo
             } else {
                 auto snapshot = ownCopy(begin, bytes);
                 std::memcpy(snapshot.Bytes().data(), reinterpret_cast<const void*>(begin), bytes);
-                if (memoized) {
+                const bool repeated = memoized && std::find(memo.seen.begin(), memo.seen.end(), begin) != memo.seen.end();
+                if (memoized && !repeated) memo.seen[memo.nextSeen++ % memo.seen.size()] = begin;
+                if (repeated) {
                     auto& entry = memo.entries[memo.next++ % memo.entries.size()];
                     entry.address = begin;
                     entry.bytes = bytes;
