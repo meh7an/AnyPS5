@@ -74,8 +74,9 @@ public:
     // current), entered as this draw's reads: Regions() includes them and a later read of one takes
     // the word instead of reading guest memory again. They are not recent (TakeRecentRegions keeps
     // naming the reads of the stage that made them), and words inside an initial region are skipped
-    // (a read there takes the initial bytes).
-    void Seed(std::span<const std::pair<std::uint64_t, std::vector<std::uint32_t>>> regions);
+    // (a read there takes the initial bytes). `offset` moves every region (a stage memo entry served
+    // at another base).
+    void Seed(std::span<const std::pair<std::uint64_t, std::vector<std::uint32_t>>> regions, std::uint64_t offset = 0);
     // One seeded word at `address` replaced (Seed's rules): a memo word the guest changed where the
     // stage memo let it (its memory copies).
     void SeedWord(std::uint64_t address, std::uint32_t word);

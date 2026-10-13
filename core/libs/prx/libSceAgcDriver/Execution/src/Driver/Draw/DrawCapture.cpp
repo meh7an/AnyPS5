@@ -844,11 +844,17 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
             memoResult = std::move(served);
             if (!VerifyStageMemo()) {
                 countStageMemo(counters.hits);
-                // The words the result was made over where this stage read them: the entry's at the
-                // moved base, with the guest's copied words. Owned with the capture for the draw cache,
-                // and this stage's reads when the base moved.
+                // This stage's reads, where it read them (the entry's words at the moved base), with
+                // the copied words the guest changed over the entry's: later stages of the draw read
+                // the guest's.
+                shaderMemory.Seed(entry->regions, moved);
+                for (const auto& copy : entry->copies) {
+                    const auto word = stageMemoCopiedWord(copy, live);
+                    if (word != copy.base) shaderMemory.SeedWord(copy.address + moved, word);
+                }
+                // The same words owned with the capture, for the draw cache.
                 std::shared_ptr<std::vector<std::pair<std::uint64_t, std::vector<std::uint32_t>>>> placed;
-                if (moved != 0 || (wantRegions && !live.empty())) {
+                if (wantRegions && (moved != 0 || !live.empty())) {
                     placed = std::make_shared<std::vector<std::pair<std::uint64_t, std::vector<std::uint32_t>>>>(entry->regions);
                     std::uint32_t first = 0;
                     auto next = live.begin();
@@ -856,17 +862,6 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
                         address += moved;
                         for (; next != live.end() && next->first < first + words.size(); ++next) words[next->first - first] = next->second;
                         first += static_cast<std::uint32_t>(words.size());
-                    }
-                }
-                if (moved != 0) {
-                    shaderMemory.Seed(*placed);
-                } else {
-                    shaderMemory.Seed(entry->regions);
-                    // The copied words the guest changed, over the entry's: later stages of the draw
-                    // read the guest's.
-                    for (const auto& copy : entry->copies) {
-                        const auto word = stageMemoCopiedWord(copy, live);
-                        if (word != copy.base) shaderMemory.SeedWord(copy.address, word);
                     }
                 }
                 if (wantRegions) {

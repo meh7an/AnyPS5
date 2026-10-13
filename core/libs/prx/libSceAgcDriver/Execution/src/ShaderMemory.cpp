@@ -335,7 +335,7 @@ void ShaderMemory::Regions(std::vector<ShaderRecompiler::MemoryRegion>& result) 
     for (; next != initial.end(); ++next) result.push_back({next->first, next->second});
 }
 
-void ShaderMemory::Seed(std::span<const std::pair<std::uint64_t, std::vector<std::uint32_t>>> regions) {
+void ShaderMemory::Seed(std::span<const std::pair<std::uint64_t, std::vector<std::uint32_t>>> regions, std::uint64_t offset) {
     const auto inInitial = [&](std::uint64_t address) {
         const auto next = std::upper_bound(initial.begin(), initial.end(), address, [](std::uint64_t value, const auto& entry) { return value < entry.first; });
         return next != initial.begin() && address - std::prev(next)->first < std::prev(next)->second.size();
@@ -344,7 +344,7 @@ void ShaderMemory::Seed(std::span<const std::pair<std::uint64_t, std::vector<std
         Page* current = nullptr;
         std::uint64_t currentBase = 0;
         for (std::size_t i = 0; i < words.size(); ++i) {
-            const auto at = address + i * sizeof(std::uint32_t);
+            const auto at = address + offset + i * sizeof(std::uint32_t);
             if (!initial.empty() && inInitial(at)) continue;
             const auto base = at & ~static_cast<std::uint64_t>(PageBytes - 1);
             if (current == nullptr || base != currentBase) {
