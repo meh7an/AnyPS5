@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <cstddef>
 #include <limits>
@@ -118,6 +119,7 @@ static int NativeFchmod(int descriptor, int mode) {
     return path ? NativeChmod(*path, mode) : -1;
 }
 static int NativeFtruncate(int descriptor, std::int64_t length) {
+    const std::lock_guard lock(DescriptorOffsetLock_nid_no_patch(descriptor));
     return static_cast<int>(::_chsize_s(descriptor, length));
 }
 static int SetTimes(HANDLE handle, const KernelTimeval* times) {
@@ -157,11 +159,26 @@ static int NativeFutimes(int descriptor, const KernelTimeval* times) {
 static int NativeFlock(int descriptor, int operation) {
     return File::Flock(descriptor, operation);
 }
+extern "C" _invalid_parameter_handler _set_thread_local_invalid_parameter_handler(_invalid_parameter_handler);
+static void IgnoreDescriptorParameter(const wchar_t*, const wchar_t*, const wchar_t*, unsigned int, std::uintptr_t) {}
+template <typename TCall> static auto WithoutParameterHandler(TCall call) {
+    const auto previous = _set_thread_local_invalid_parameter_handler(IgnoreDescriptorParameter);
+    const auto result = call();
+    _set_thread_local_invalid_parameter_handler(previous);
+    return result;
+}
+std::mutex& DescriptorOffsetLock_nid_no_patch(int descriptor) {
+    // The UCRT hands out at most 8192 descriptors, so each has its own lock.
+    static std::array<std::mutex, 8192> locks;
+    return locks[static_cast<unsigned int>(descriptor) % locks.size()];
+}
 std::int64_t NativePositioned_nid_no_patch(int descriptor, void* buf, std::size_t nbytes, std::int64_t offset, bool write) {
     if (nbytes > static_cast<std::size_t>(std::numeric_limits<DWORD>::max())) {
         throw std::runtime_error("NativePositioned: nbytes exceeds platform limit");
     }
-    const auto handle = reinterpret_cast<HANDLE>(::_get_osfhandle(descriptor));
+    const std::lock_guard lock(DescriptorOffsetLock_nid_no_patch(descriptor));
+    // A descriptor another thread has just closed fails with EBADF, as on the console.
+    const auto handle = reinterpret_cast<HANDLE>(WithoutParameterHandler([descriptor] { return ::_get_osfhandle(descriptor); }));
     if (handle == INVALID_HANDLE_VALUE) {
         errno = EBADF;
         return -1;
@@ -192,6 +209,7 @@ static std::int64_t NativeTransfer(int descriptor, void* buf, std::size_t nbytes
     if (nbytes > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
         throw std::runtime_error("NativeTransfer: nbytes exceeds platform limit");
     }
+    const std::lock_guard lock(DescriptorOffsetLock_nid_no_patch(descriptor));
     return write ? ::_write(descriptor, buf, static_cast<unsigned int>(nbytes)) : ::_read(descriptor, buf, static_cast<unsigned int>(nbytes));
 }
 static bool NativeIsDisk(int descriptor) {
@@ -383,14 +401,6 @@ static int PathError(const char* path) {
 }
 
 #ifdef _WIN32
-extern "C" _invalid_parameter_handler _set_thread_local_invalid_parameter_handler(_invalid_parameter_handler);
-static void IgnoreDescriptorParameter(const wchar_t*, const wchar_t*, const wchar_t*, unsigned int, std::uintptr_t) {}
-template <typename TCall> static int WithoutParameterHandler(TCall call) {
-    const auto previous = _set_thread_local_invalid_parameter_handler(IgnoreDescriptorParameter);
-    const int result = call();
-    _set_thread_local_invalid_parameter_handler(previous);
-    return result;
-}
 bool DescriptorIsOpen_nid_no_patch(int descriptor) {
     return descriptor >= 0 && WithoutParameterHandler([descriptor] { return ::_get_osfhandle(descriptor) == -1 ? -1 : 0; }) == 0;
 }
@@ -419,6 +429,7 @@ int APS5_VABI close_nid_postfix(int d) {
 #ifdef _WIN32
     File::ForgetDirectoryDescriptor(d);
     File::ForgetFileLock(d);
+    const std::lock_guard lock(DescriptorOffsetLock_nid_no_patch(d));
     return _close(d);
 #else
     return ::close(d);
@@ -461,7 +472,11 @@ int APS5_VABI dup2_nid_postfix(int from, int to) {
     if (WithoutParameterHandler([from] { return ::_get_osfhandle(from) == -1 ? -1 : 0; }) != 0) return PosixFailure(GUEST_EBADF);
     if (from == to) return to;
     RejectDirectoryDuplicate(from, __func__);
-    if (WithoutParameterHandler([from, to] { return ::_dup2(from, to); }) != 0) return PosixFailure(SceErrorFromErrno(errno) & 0xffff);
+    {
+        // _dup2 closes the descriptor it replaces.
+        const std::lock_guard lock(DescriptorOffsetLock_nid_no_patch(to));
+        if (WithoutParameterHandler([from, to] { return ::_dup2(from, to); }) != 0) return PosixFailure(SceErrorFromErrno(errno) & 0xffff);
+    }
     File::ForgetDirectoryDescriptor(to);
     File::ForgetFileLock(to);
     File::ForgetRandomDevice(to);

@@ -3,6 +3,9 @@
 
 #include <cstddef>
 #include <cstdint>
+#ifdef _WIN32
+#include <mutex>
+#endif
 
 #include "SceTypes.hpp"
 #include "prx/libc/include/General.hpp"
@@ -24,5 +27,12 @@ std::int64_t NativePositioned_nid_no_patch(int descriptor, void* buf, std::size_
 }
 
 bool DescriptorIsOpen_nid_no_patch(int descriptor);
+#ifdef _WIN32
+// Held across every use of a descriptor's file offset and across its close. A positioned transfer
+// moves the shared offset and then restores it, so a read, write, seek or close of the same
+// descriptor on another thread must not run in between. Duplicated descriptors share an offset
+// but not this lock.
+std::mutex& DescriptorOffsetLock_nid_no_patch(int descriptor);
+#endif
 
 #endif

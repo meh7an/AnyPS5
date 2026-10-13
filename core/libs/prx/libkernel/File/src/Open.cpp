@@ -24,23 +24,27 @@ static int NativeOpen(const std::filesystem::path& p, int nativeFlags, std::uint
     return ::_wopen(p.wstring().c_str(), nativeFlags, static_cast<int>(mode));
 }
 static std::int64_t NativeLseek(int fd, std::int64_t offset, int whence) {
+    const std::lock_guard lock(DescriptorOffsetLock_nid_no_patch(fd));
     return ::_lseeki64(fd, offset, whence);
 }
 static int NativeRead(int fd, void* buf, std::size_t n) {
     if (n > static_cast<std::size_t>(std::numeric_limits<unsigned int>::max())) {
         throw std::runtime_error("sceKernelRead: nbytes exceeds platform limit");
     }
+    const std::lock_guard lock(DescriptorOffsetLock_nid_no_patch(fd));
     return ::_read(fd, buf, static_cast<unsigned int>(n));
 }
 static int NativeWrite(int fd, const void* buf, std::size_t n) {
     if (n > static_cast<std::size_t>(std::numeric_limits<unsigned int>::max())) {
         throw std::runtime_error("sceKernelWrite: nbytes exceeds platform limit");
     }
+    const std::lock_guard lock(DescriptorOffsetLock_nid_no_patch(fd));
     return ::_write(fd, buf, static_cast<unsigned int>(n));
 }
 extern "C" _invalid_parameter_handler _set_thread_local_invalid_parameter_handler(_invalid_parameter_handler);
 static void IgnoreInvalidParameter(const wchar_t*, const wchar_t*, const wchar_t*, unsigned int, std::uintptr_t) {}
 static int NativeClose(int fd) {
+    const std::lock_guard lock(DescriptorOffsetLock_nid_no_patch(fd));
     const auto previous = _set_thread_local_invalid_parameter_handler(IgnoreInvalidParameter);
     const int result = ::_close(fd);
     _set_thread_local_invalid_parameter_handler(previous);
