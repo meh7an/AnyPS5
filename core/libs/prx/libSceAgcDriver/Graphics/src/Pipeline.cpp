@@ -858,7 +858,19 @@ struct LastPipeline {
     VkDevice device = VK_NULL_HANDLE;
     std::uint32_t uses = 0;
     std::uint64_t clears = 0;
+    // The key's parts when it was made from a precomputed prefix: a draw with an equal prefix,
+    // layout and attachment layout has an equal key, found without copying the prefix into one.
+    bool prefixed = false;
+    std::vector<std::byte> prefix;
+    std::vector<std::uint32_t> layoutKey;
+    VkImageLayout attachmentLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 };
+
+// APS5_NO_LAST_PREFIX=1: every draw builds its whole pipeline key before the last pipeline's test.
+bool LastPrefixEnabled() {
+    static const bool enabled = std::getenv("APS5_NO_LAST_PREFIX") == nullptr;
+    return enabled;
+}
 
 // Never destroyed: the pipelines belong to a device that may already be gone when statics die, and
 // the device's teardown (ClearCachedPipelines) is the place to destroy them.
@@ -911,19 +923,13 @@ std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& st
     // The key and its hash need no lock. The key is built in the calling thread's buffer: a fresh
     // kilobyte for every draw was an allocation. A prefix made ahead is copied, and only the
     // record's part is written after it.
-    struct KeyTag {};
-    auto& key = ThreadScratch<std::vector<std::byte>, KeyTag>();
-    if (keyPrefix != nullptr && !keyPrefix->empty()) {
-        key.assign(keyPrefix->begin(), keyPrefix->end());
-        KeyWriter writer(key, keyPrefix->size());
-        writeKeySuffix(writer, resources, attachmentLayout);
-        writer.Finish();
-    } else {
-        pipelineKey(key, context, state, vertexInput, resources, shaders, attachmentLayout);
-    }
     struct LastTag {};
     auto& last = ThreadScratch<LastPipeline, LastTag>();
-    if (!key.empty() && last.uses < 64 && last.device == context.device && last.clears == store.clears.load(std::memory_order_acquire) && last.key == key) {
+    const bool prefixed = keyPrefix != nullptr && !keyPrefix->empty();
+    // The thread's last pipeline while it may be served: every 64th use goes through the store, and
+    // a clear or another device instance retires it.
+    const bool current = last.uses < 64 && last.device == context.device && last.clears == store.clears.load(std::memory_order_acquire);
+    const auto served = [&]() -> std::shared_ptr<Pipeline> {
         // The pool by its control block: the live pool shares the remembered one's only while it
         // is that pool.
         if (auto pipeline = last.pipeline.lock(); pipeline != nullptr && (context.bufferPool == nullptr || (!last.pool.owner_before(context.bufferPool) && !context.bufferPool.owner_before(last.pool)))) {
@@ -931,6 +937,23 @@ std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& st
             store.lastHits.fetch_add(1, std::memory_order_relaxed);
             return pipeline;
         }
+        return nullptr;
+    };
+    if (prefixed && current && last.prefixed && LastPrefixEnabled() && last.attachmentLayout == attachmentLayout && last.layoutKey == resources.LayoutKey() && last.prefix == *keyPrefix) {
+        if (auto pipeline = served()) return pipeline;
+    }
+    struct KeyTag {};
+    auto& key = ThreadScratch<std::vector<std::byte>, KeyTag>();
+    if (prefixed) {
+        key.assign(keyPrefix->begin(), keyPrefix->end());
+        KeyWriter writer(key, keyPrefix->size());
+        writeKeySuffix(writer, resources, attachmentLayout);
+        writer.Finish();
+    } else {
+        pipelineKey(key, context, state, vertexInput, resources, shaders, attachmentLayout);
+    }
+    if (!key.empty() && current && last.key == key) {
+        if (auto pipeline = served()) return pipeline;
     }
     // Under the store's lock, as the clears it counts are made.
     const auto remember = [&](const std::shared_ptr<Pipeline>& pipeline) {
@@ -940,6 +963,12 @@ std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& st
         last.device = context.device;
         last.uses = 0;
         last.clears = store.clears.load(std::memory_order_relaxed);
+        last.prefixed = prefixed;
+        if (prefixed) {
+            last.prefix.assign(keyPrefix->begin(), keyPrefix->end());
+            last.layoutKey.assign(resources.LayoutKey().begin(), resources.LayoutKey().end());
+            last.attachmentLayout = attachmentLayout;
+        }
     };
     const auto hash = key.empty() ? 0 : hashKey(key);
     std::lock_guard lock(store.mutex);
