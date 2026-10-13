@@ -3748,6 +3748,30 @@ struct DrawWrites {
 
 struct DrawWritesTag {};
 
+// The kept snapshots a thread's recent draws took over the upload limit (PrepareDrawBindings): a
+// draw reading the same range in the same collect epoch, with no write stamped anywhere and no
+// mapping changed since, takes the buffer again without the collect and the pool's lookup, whose
+// proof would read the same. APS5_NO_SNAPSHOT_MEMO=1 looks every one up.
+struct SnapshotMemo {
+    struct Entry {
+        std::uint64_t address = 0;
+        std::size_t bytes = 0;
+        std::shared_ptr<Buffer> buffer;
+        std::uint64_t epoch = 0;
+        std::uint64_t tracker = 0;
+        std::uint64_t registry = 0;
+    };
+    std::array<Entry, 4> entries{};
+    std::size_t next = 0;
+};
+
+struct SnapshotMemoTag {};
+
+bool SnapshotMemoEnabled() {
+    static const bool enabled = std::getenv("APS5_NO_SNAPSHOT_MEMO") == nullptr;
+    return enabled;
+}
+
 }
 
 bool ShaderResources::PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved, DrawBindings& result) const {
@@ -3816,17 +3840,29 @@ bool ShaderResources::PrepareDrawBindings(Recorder& recorder, std::span<const Mo
             keep(std::move(snapshot));
         } else {
             const auto registryGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
-            const auto generation = GuestMemory::CollectWrites(begin, bytes);
-            if (parts.enabled) parts.mark(BindingParts::Collect);
-            auto buffer = recorder.ReusableDrawSnapshot(begin, bytes, Recorder::SnapshotUse::Storage, nullptr, generation);
-            if (parts.enabled) parts.mark(BindingParts::Lookup);
-            if (buffer == nullptr) {
-                buffer = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
-                std::memcpy(buffer->Bytes().data(), reinterpret_cast<const void*>(begin), bytes);
-                recorder.KeepDrawSnapshot(begin, bytes, generation, registryGeneration, buffer);
-                if (parts.enabled) ++parts.made;
-            } else if (parts.enabled) {
-                ++parts.reused;
+            const auto epoch = SnapshotMemoEnabled() ? GuestMemory::CollectEpoch() : 0;
+            const auto tracker = epoch != 0 ? GuestMemory::TrackerGeneration() : 0;
+            auto& memo = ThreadScratch<SnapshotMemo, SnapshotMemoTag>();
+            const auto remembered = std::find_if(memo.entries.begin(), memo.entries.end(), [&](const SnapshotMemo::Entry& entry) { return entry.buffer != nullptr && entry.address == begin && entry.bytes == bytes && entry.epoch == epoch && entry.tracker == tracker && entry.registry == registryGeneration; });
+            std::shared_ptr<Buffer> buffer;
+            if (epoch != 0 && remembered != memo.entries.end()) {
+                buffer = remembered->buffer;
+                if (parts.enabled) ++parts.reused;
+            } else {
+                const auto generation = GuestMemory::CollectWrites(begin, bytes);
+                if (parts.enabled) parts.mark(BindingParts::Collect);
+                buffer = recorder.ReusableDrawSnapshot(begin, bytes, Recorder::SnapshotUse::Storage, nullptr, generation);
+                if (parts.enabled) parts.mark(BindingParts::Lookup);
+                if (buffer == nullptr) {
+                    buffer = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+                    std::memcpy(buffer->Bytes().data(), reinterpret_cast<const void*>(begin), bytes);
+                    recorder.KeepDrawSnapshot(begin, bytes, generation, registryGeneration, buffer);
+                    if (parts.enabled) ++parts.made;
+                } else if (parts.enabled) {
+                    ++parts.reused;
+                }
+                // Remembered only when the collect stamped nothing (the generation held).
+                if (epoch != 0 && GuestMemory::TrackerGeneration() == tracker) memo.entries[memo.next++ % memo.entries.size()] = {begin, bytes, buffer, epoch, tracker, registryGeneration};
             }
             keep({begin, std::move(buffer), 0, bytes});
         }
