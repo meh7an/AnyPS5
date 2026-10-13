@@ -1321,8 +1321,21 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         } else if (uploaded(static_cast<std::size_t>(indexBytes))) {
             if (parts.enabled) ++parts.indexUploaded;
             slice = uploads->DrawUpload(static_cast<std::size_t>(indexBytes));
-            GuestMemory::Read(draw.indexAddress, std::span<std::byte>(slice.bytes, static_cast<std::size_t>(indexBytes)), draw.indexSize);
-            read = std::span<const std::byte>(slice.bytes, static_cast<std::size_t>(indexBytes));
+            // Read into the thread's cached staging and scanned there, then written to the slice: the
+            // upload chunk is write-combined memory, which the scan read back uncached.
+            // APS5_NO_INDEX_STAGING=1 scans the slice.
+            static const bool staging = std::getenv("APS5_NO_INDEX_STAGING") == nullptr;
+            if (staging) {
+                struct IndexStagingTag {};
+                auto& staged = ThreadScratch<std::vector<std::byte>, IndexStagingTag>();
+                staged.resize(static_cast<std::size_t>(indexBytes));
+                GuestMemory::Read(draw.indexAddress, staged, draw.indexSize);
+                std::memcpy(slice.bytes, staged.data(), staged.size());
+                read = staged;
+            } else {
+                GuestMemory::Read(draw.indexAddress, std::span<std::byte>(slice.bytes, static_cast<std::size_t>(indexBytes)), draw.indexSize);
+                read = std::span<const std::byte>(slice.bytes, static_cast<std::size_t>(indexBytes));
+            }
         } else {
             copy = CopyDrawInput(context, context.recorder, draw.indexAddress, static_cast<std::size_t>(indexBytes), draw.indexSize, use);
             parts.noteIndexCopy(copy.reused, copy.rewritten);
