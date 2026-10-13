@@ -2199,6 +2199,60 @@ void verifyTwoLaneUniformValues() {
     }
 }
 
+// The stage memo's relocatable base (UserDataKey::relocatableBase): a program whose SRT reads all
+// land at immediate offsets from a user-data pointer (a table the title writes per draw) leaves the
+// pointer's words out of the key; one that follows a pointer read from that table keeps them.
+void verifyRelocatableBase() {
+    using namespace ShaderRecompiler;
+    struct alignas(4096) GuestTables {
+        std::array<std::uint32_t, 64> output{};
+        std::array<std::uint32_t, 8> srt{};
+        std::array<std::uint32_t, 4> buffer{};
+    };
+    static GuestTables guest;
+    const auto addressOf = [](const void* data) { return static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(data)); };
+    const auto outputBase = addressOf(guest.output.data());
+    guest.buffer = {static_cast<std::uint32_t>(outputBase), static_cast<std::uint32_t>((outputBase >> 32u) & 0xffffu), 64u, 0xfacu};
+    const auto bufferAddress = addressOf(guest.buffer.data());
+    // Words 0-1 a pointer to the V# (the nested program's), 4-7 the V# itself (the direct one's).
+    guest.srt = {static_cast<std::uint32_t>(bufferAddress), static_cast<std::uint32_t>(bufferAddress >> 32u), 0u, 0u, guest.buffer[0], guest.buffer[1], guest.buffer[2], guest.buffer[3]};
+    const auto srtAddress = addressOf(guest.srt.data());
+    const std::array<std::uint32_t, 2> userData{static_cast<std::uint32_t>(srtAddress), static_cast<std::uint32_t>(srtAddress >> 32u)};
+    const auto keyFor = [&](std::span<const std::uint32_t> code) {
+        RecompileRequest request{};
+        request.shader = {ShaderStage::Compute, 0x40000u, code, 0, {}};
+        request.target = BufferTarget();
+        request.context.waveSize = 64;
+        request.context.userDataBaseRegister = 0;
+        request.context.userData = userData;
+        request.context.compute = ShaderComputeStageInfo{{64u, 1u, 1u}, 0u, {false, false, false}, false, 1u};
+        request.target.vulkanVersion = 0x00401000u;
+        request.target.spirvVersion = 0x00010300u;
+        request.target.subgroupSize = 64u;
+        request.target.fragmentShaderBarycentricEnabled = false;
+        request.layout.pushConstantSizeBytes = 128;
+        request.useCache = true;
+        AgcDriver::ShaderMemory memory({});
+        static_cast<void>(memory.Capture(request));
+        const auto handle = ResolveSource(request);
+        require(handle != nullptr, "relocatable base: the request has no source");
+        const auto key = UserDataKeyFor(*handle);
+        require(key != nullptr && key->keepBits.size() >= 2u, "relocatable base: the source has no user data key");
+        return key;
+    };
+    // s_load_dwordx2 s[2:3], s[0:1], 0x0; s_load_dwordx4 s[8:11], s[0:1], 0x10; s_waitcnt; s_mul_i32
+    // s4, s2, s3; v_add_nc_u32 v1, s4, v0; buffer_store_dword v0, v1, s[8:11], 0 offen; s_endpgm.
+    const std::array<std::uint32_t, 10> direct{0xf4040080u, 0xfa000000u, 0xf4080200u, 0xfa000010u, 0xbf8cc07fu, 0x93040302u, 0x4a020004u, 0xe0700000u, 0x80020100u, 0xbf810000u};
+    const auto table = keyFor(direct);
+    require(table->relocatableBase == 0 && table->keepBits[0] == 0u && table->keepBits[1] == 0u, "relocatable base: a table read at immediate offsets from a user-data pointer kept the pointer in the key");
+    // The V# loaded through the pointer at the table's word 0: s_load_dwordx4 s[8:11], s[2:3], 0x0.
+    auto nested = direct;
+    nested[2] = 0xf4080201u;
+    nested[3] = 0xfa000000u;
+    const auto followed = keyFor(nested);
+    require(followed->relocatableBase == -1 && followed->keepBits[0] == ~0u && followed->keepBits[1] == ~0u, "relocatable base: a pointer read from the table and followed let the table's pointer relocate");
+}
+
 void verifyBdaReadFallbackFunctions() {
     using namespace ShaderRecompiler;
     const std::array<std::uint32_t, 3> capabilities{spv::CapabilityInt64, spv::CapabilityPhysicalStorageBufferAddresses, spv::CapabilityStorageBuffer8BitAccess};
@@ -2724,6 +2778,7 @@ int main(int argc, char** argv) {
         verifyUnusedUnnormalizedSampler();
         verifyWaveUniformValues();
         verifyTwoLaneUniformValues();
+        verifyRelocatableBase();
         verifyBdaReadFallbackFunctions();
         verifyFunctionLdsBound();
         verifyGuardedNullPointers();

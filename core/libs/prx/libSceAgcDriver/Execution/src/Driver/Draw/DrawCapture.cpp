@@ -102,7 +102,7 @@ bool VariantResultCopies() {
 
 // APS5_PROFILE_DRAW: the memo's outcomes, every 10 s on a [stage-memo] line.
 struct StageMemoCounters {
-    std::atomic<std::uint64_t> lookups{0}, hits{0}, revalidated{0}, copiedWords{0}, absent{0}, mappings{0}, changed{0}, pending{0}, skipped{0};
+    std::atomic<std::uint64_t> lookups{0}, hits{0}, revalidated{0}, copiedWords{0}, relocated{0}, absent{0}, mappings{0}, changed{0}, pending{0}, skipped{0};
     std::atomic<std::uint64_t> inserts{0}, refusedPatches{0}, refusedMismatch{0}, refusedUnwatched{0}, refusedUnstable{0}, evictions{0};
     std::atomic<std::uint64_t> verified{0}, differed{0};
     // Hits that copied the entry's result: into an empty place of the slot, or because a draw held
@@ -139,7 +139,7 @@ void reportStageMemo(std::size_t entries) {
     const auto take = [](std::atomic<std::uint64_t>& counter) { return static_cast<unsigned long long>(counter.exchange(0, std::memory_order_relaxed)); };
     const auto lookups = take(counters.lookups);
     const auto hits = take(counters.hits);
-    std::fprintf(stderr, "[stage-memo] %llu lookups (10 s): %llu hits (%.1f%%, %llu after comparing stamped words, %llu with changed memory copies patched in; result copied by %llu into an empty place, %llu with every served copy held, those held by use count 2/3/more %llu/%llu/%llu); misses: no entry %llu, mappings changed %llu, words changed %llu, pending results %llu, not tried (changing key) %llu; inserts %llu, refused: no patches %llu, patch mismatch %llu, unwatched %llu, unstable %llu; evictions %llu, %zu entries; verify: %llu compared, %llu differed\n", lookups, hits, lookups != 0 ? 100.0 * static_cast<double>(hits) / static_cast<double>(lookups) : 0.0, take(counters.revalidated), take(counters.copiedWords), take(counters.copiedEmpty), take(counters.copiedHeld), take(counters.heldTwo), take(counters.heldThree), take(counters.heldMore), take(counters.absent), take(counters.mappings), take(counters.changed), take(counters.pending), take(counters.skipped), take(counters.inserts), take(counters.refusedPatches), take(counters.refusedMismatch), take(counters.refusedUnwatched), take(counters.refusedUnstable), take(counters.evictions), entries, take(counters.verified), take(counters.differed));
+    std::fprintf(stderr, "[stage-memo] %llu lookups (10 s): %llu hits (%.1f%%, %llu after comparing stamped words, %llu with changed memory copies patched in, %llu at a moved base; result copied by %llu into an empty place, %llu with every served copy held, those held by use count 2/3/more %llu/%llu/%llu); misses: no entry %llu, mappings changed %llu, words changed %llu, pending results %llu, not tried (changing key) %llu; inserts %llu, refused: no patches %llu, patch mismatch %llu, unwatched %llu, unstable %llu; evictions %llu, %zu entries; verify: %llu compared, %llu differed\n", lookups, hits, lookups != 0 ? 100.0 * static_cast<double>(hits) / static_cast<double>(lookups) : 0.0, take(counters.revalidated), take(counters.copiedWords), take(counters.relocated), take(counters.copiedEmpty), take(counters.copiedHeld), take(counters.heldTwo), take(counters.heldThree), take(counters.heldMore), take(counters.absent), take(counters.mappings), take(counters.changed), take(counters.pending), take(counters.skipped), take(counters.inserts), take(counters.refusedPatches), take(counters.refusedMismatch), take(counters.refusedUnwatched), take(counters.refusedUnstable), take(counters.evictions), entries, take(counters.verified), take(counters.differed));
 }
 
 // What a request specializes its prepared shader by besides the user data and the captured words
@@ -209,6 +209,26 @@ std::uint64_t stageMemoKey(const ShaderRecompiler::UserDataKey& key, const void*
     }
     appendSpecializationWords(request, words);
     return hashStageMemoKey(source, pushOffset, words);
+}
+
+// The address a key's relocatable base holds (ShaderRecompiler::UserDataKey::relocatableBase), as
+// the SRT walk forms it: the user word pair as 48 bits, dword aligned.
+std::uint64_t stageMemoBase(const ShaderRecompiler::UserDataKey& key, std::span<const std::uint32_t> userData) {
+    const auto low = static_cast<std::size_t>(key.relocatableBase);
+    const auto word = [&](std::size_t k) { return k < userData.size() ? userData[k] : 0u; };
+    return ((static_cast<std::uint64_t>(word(low + 1)) << 32u) | word(low)) & 0x0000fffffffffffcull;
+}
+
+// The slot of a relocatable stage's key at one base: the memo keeps each entry there as well as at
+// the key's own hash, so stages at that base keep finding it whatever the key's latest entry is
+// (draws sharing a key whose tables differ in more than copied words would otherwise evict each
+// other's entries at every draw).
+std::uint64_t stageMemoExactHash(std::uint64_t hash, std::uint64_t base) {
+    auto mixed = hash ^ (base * 0x9e3779b97f4a7c15ull);
+    mixed ^= mixed >> 33u;
+    mixed *= 0xff51afd7ed558ccdull;
+    mixed ^= mixed >> 33u;
+    return mixed;
 }
 
 // A thread's memo keys by source (ShaderRecompiler::UserDataKeyFor; a source entry lives as long as
@@ -686,6 +706,14 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
         auto& live = ThreadScratch<std::vector<std::pair<std::uint32_t, std::uint32_t>>, CopiedLiveTag>();
         live.clear();
         bool copyCheck = false;
+        // How far this stage's relocatable base lies from the entry's (StageMemoEntry::base): its
+        // reads land that far from the entry's regions, where their words are compared. Such a stage
+        // is looked up at its own base first (an entry made there, validated by its stamps), then at
+        // any base (the key's latest entry); `slotHash` is the slot found.
+        const std::uint64_t liveBase = memoKey->relocatableBase >= 0 ? stageMemoBase(*memoKey, program.userData) : 0;
+        const std::uint64_t exactHash = memoKey->relocatableBase >= 0 ? stageMemoExactHash(memoHash, liveBase) : memoHash;
+        std::uint64_t slotHash = memoHash;
+        std::uint64_t moved = 0;
         // The slot after the lookup's outcome, under the memo's lock.
         const auto settle = [&](StageMemoSlot& slot) {
             if (miss == StageMemoMiss::None) {
@@ -699,6 +727,10 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
                     served = copy;
                     break;
                 }
+            } else if (moved != 0) {
+                // Another base's words differed: this stage's capture is stored, at its own base's
+                // slot too (stageMemoExactHash); the slot counts the misses of its entry's base only.
+                memoStore = true;
             } else {
                 ++slot.misses;
                 memoStore = stageMemoTried(slot.misses);
@@ -707,26 +739,49 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
         {
             std::lock_guard lock(stageMemoMutex);
             entries = stageMemo.size();
-            auto* found = stageMemo.find(memoHash);
-            if (found != nullptr && found->source == handle->source.get() && found->pushOffset == pushOffset && found->entry->key == memoWords) {
+            const auto matches = [&](const StageMemoSlot* slot) { return slot != nullptr && slot->source == handle->source.get() && slot->pushOffset == pushOffset && slot->entry->key == memoWords; };
+            StageMemoSlot* found = nullptr;
+            if (exactHash != memoHash) {
+                auto* exact = stageMemo.find(exactHash);
+                if (matches(exact) && exact->entry->base == liveBase) {
+                    found = exact;
+                    slotHash = exactHash;
+                }
+            }
+            if (found == nullptr) {
+                auto* any = stageMemo.find(memoHash);
+                if (matches(any)) found = any;
+            }
+            if (found != nullptr) {
                 auto& slot = *found;
                 entry = slot.entry;
                 stageMemoOrder.splice(stageMemoOrder.end(), stageMemoOrder, slot.order);
                 copyCheck = !entry->copies.empty();
-                miss = copyCheck || stageMemoTried(slot.misses) ? stageMemoCurrent(*entry, slot.generation, collected) : StageMemoMiss::Skipped;
-                if (miss != StageMemoMiss::Changed || (!StageMemoValues() && !copyCheck)) settle(slot);
+                moved = entry->base.has_value() ? liveBase - *entry->base : 0;
+                if (moved != 0) {
+                    // Another base: the stamps cover the entry's place only, so the words are compared
+                    // where this stage reads them (outside the lock), every time.
+                    miss = entry->mappings != mappings ? StageMemoMiss::Mappings : StageMemoMiss::Changed;
+                    if (miss == StageMemoMiss::Mappings) settle(slot);
+                } else {
+                    miss = copyCheck || stageMemoTried(slot.misses) ? stageMemoCurrent(*entry, slot.generation, collected) : StageMemoMiss::Skipped;
+                    if (miss != StageMemoMiss::Changed || (!StageMemoValues() && !copyCheck)) settle(slot);
+                }
             }
         }
         // A store stamped the words' 64 KiB blocks (any store near them does): the words decide,
         // compared outside the lock after the collects above, as the insert proves a capture's. Equal,
         // they were the guest's at that collect, and a later store stamps newer.
-        if (miss == StageMemoMiss::Changed && (StageMemoValues() || copyCheck)) {
-            if (Graphics::StorageTexture::AnyPendingOverlaps(entry->runs) || Graphics::AnyShadowedOverlaps(entry->runs)) {
+        if (miss == StageMemoMiss::Changed && (moved != 0 || StageMemoValues() || copyCheck)) {
+            struct MovedRunsTag {};
+            ThreadScratchLease<std::vector<std::pair<std::uint64_t, std::uint64_t>>, MovedRunsTag> movedRuns;
+            for (const auto& [begin, end] : entry->runs) movedRuns.value.emplace_back(begin + moved, end + moved);
+            if (Graphics::StorageTexture::AnyPendingOverlaps(movedRuns.value) || Graphics::AnyShadowedOverlaps(movedRuns.value)) {
                 miss = StageMemoMiss::Pending;
             } else {
                 struct MemoWordsTag {};
                 ThreadScratchLease<std::vector<ShaderRecompiler::MemoryRegion>, MemoWordsTag> words;
-                for (const auto& [address, values] : entry->regions) words.value.push_back({address, std::as_bytes(std::span(values))});
+                for (const auto& [address, values] : entry->regions) words.value.push_back({address + moved, std::as_bytes(std::span(values))});
                 const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::DrawCache);
                 if (copyCheck) {
                     // The dispatch cache's validation, its data mask over the copied words.
@@ -743,13 +798,14 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
                     miss = StageMemoMiss::None;
                     countStageMemo(counters.revalidated);
                 }
+                if (miss == StageMemoMiss::None && moved != 0) countStageMemo(counters.relocated);
             }
             std::lock_guard lock(stageMemoMutex);
-            auto* found = stageMemo.find(memoHash);
+            auto* found = stageMemo.find(slotHash);
             if (found != nullptr && found->entry == entry) {
-                // Equal words were the guest's at that collect; changed copied words leave the entry
-                // behind the guest, to be compared again.
-                if (miss == StageMemoMiss::None && live.empty()) found->generation = std::max(found->generation, collected);
+                // Equal words were the guest's at that collect; changed copied words, or words compared
+                // at another base, leave the entry behind the guest, to be compared again.
+                if (miss == StageMemoMiss::None && live.empty() && moved == 0) found->generation = std::max(found->generation, collected);
                 settle(*found);
             }
         }
@@ -768,7 +824,7 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
             applyStageMemoCopies(*entry, live, *served);
             if (fresh) {
                 std::lock_guard lock(stageMemoMutex);
-                auto* found = stageMemo.find(memoHash);
+                auto* found = stageMemo.find(slotHash);
                 // The copy joins the slot's while there is room, else takes the place of one whose
                 // result a draw still holds.
                 if (found != nullptr && found->entry == entry) {
@@ -788,30 +844,39 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
             memoResult = std::move(served);
             if (!VerifyStageMemo()) {
                 countStageMemo(counters.hits);
-                shaderMemory.Seed(entry->regions);
-                // The copied words the guest changed, over the entry's: later stages of the draw read
-                // the guest's.
-                for (const auto& copy : entry->copies) {
-                    const auto word = stageMemoCopiedWord(copy, live);
-                    if (word != copy.base) shaderMemory.SeedWord(copy.address, word);
+                // The words the result was made over where this stage read them: the entry's at the
+                // moved base, with the guest's copied words. Owned with the capture for the draw cache,
+                // and this stage's reads when the base moved.
+                std::shared_ptr<std::vector<std::pair<std::uint64_t, std::vector<std::uint32_t>>>> placed;
+                if (moved != 0 || (wantRegions && !live.empty())) {
+                    placed = std::make_shared<std::vector<std::pair<std::uint64_t, std::vector<std::uint32_t>>>>(entry->regions);
+                    std::uint32_t first = 0;
+                    auto next = live.begin();
+                    for (auto& [address, words] : *placed) {
+                        address += moved;
+                        for (; next != live.end() && next->first < first + words.size(); ++next) words[next->first - first] = next->second;
+                        first += static_cast<std::uint32_t>(words.size());
+                    }
+                }
+                if (moved != 0) {
+                    shaderMemory.Seed(*placed);
+                } else {
+                    shaderMemory.Seed(entry->regions);
+                    // The copied words the guest changed, over the entry's: later stages of the draw
+                    // read the guest's.
+                    for (const auto& copy : entry->copies) {
+                        const auto word = stageMemoCopiedWord(copy, live);
+                        if (word != copy.base) shaderMemory.SeedWord(copy.address, word);
+                    }
                 }
                 if (wantRegions) {
                     stageCapture.regions.clear();
-                    if (live.empty()) {
+                    if (placed == nullptr) {
                         for (const auto& [address, words] : entry->regions) stageCapture.regions.push_back({address, std::as_bytes(std::span(words))});
                         stageCapture.memo = entry;
                     } else {
-                        // The draw cache keeps the words the result was made over: the entry's with
-                        // the guest's copied words, owned with the capture.
-                        auto patched = std::make_shared<std::vector<std::pair<std::uint64_t, std::vector<std::uint32_t>>>>(entry->regions);
-                        std::uint32_t first = 0;
-                        auto next = live.begin();
-                        for (auto& [address, words] : *patched) {
-                            for (; next != live.end() && next->first < first + words.size(); ++next) words[next->first - first] = next->second;
-                            first += static_cast<std::uint32_t>(words.size());
-                        }
-                        for (const auto& [address, words] : *patched) stageCapture.regions.push_back({address, std::as_bytes(std::span(words))});
-                        stageCapture.memo = std::move(patched);
+                        for (const auto& [address, words] : *placed) stageCapture.regions.push_back({address, std::as_bytes(std::span(words))});
+                        stageCapture.memo = std::move(placed);
                     }
                 }
                 regionsDone();
@@ -893,14 +958,14 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
     }
     phaseTiming.Phase(DrawRowRecompile);
     if (memoKey != nullptr && MemoChurnTraced()) traceMemoChurn(memoHash, memoMiss, *handle, request, recent, compiled, program.binary.codeAddress);
-    if (memoKey != nullptr && (memoStore || memoResult != nullptr)) insertStageMemo(memoHash, handle, pushOffset, memoWords, mappings, compiled, memoResult, request.context.userData, recent, program.binary.codeAddress, capture.get());
+    if (memoKey != nullptr && (memoStore || memoResult != nullptr)) insertStageMemo(memoHash, handle, pushOffset, memoWords, mappings, compiled, memoResult, request.context.userData, recent, program.binary.codeAddress, capture.get(), memoKey->relocatableBase >= 0 ? std::optional(stageMemoBase(*memoKey, program.userData)) : std::nullopt);
     // Shared, not copied: the result is immutable (a copy cost a few dozen allocations per stage).
     // The stage capture keeps it for its readers only (see the memo's hit above).
     if (wantRegions) stageCapture.compiled = compiled;
     return compiled;
 }
 
-void Driver::insertStageMemo(std::uint64_t hash, const std::shared_ptr<const ShaderRecompiler::SourceHandle>& handle, std::uint32_t pushOffset, const std::vector<std::uint32_t>& key, std::uint64_t mappings, const std::shared_ptr<const ShaderRecompiler::RecompileResult>& result, const std::shared_ptr<const ShaderRecompiler::RecompileResult>& memoResult, std::span<const std::uint32_t> userData, std::span<const ShaderRecompiler::MemoryRegion> recent, std::uint64_t codeAddress, const ShaderRecompiler::ResourceCapture* capture) {
+void Driver::insertStageMemo(std::uint64_t hash, const std::shared_ptr<const ShaderRecompiler::SourceHandle>& handle, std::uint32_t pushOffset, const std::vector<std::uint32_t>& key, std::uint64_t mappings, const std::shared_ptr<const ShaderRecompiler::RecompileResult>& result, const std::shared_ptr<const ShaderRecompiler::RecompileResult>& memoResult, std::span<const std::uint32_t> userData, std::span<const ShaderRecompiler::MemoryRegion> recent, std::uint64_t codeAddress, const ShaderRecompiler::ResourceCapture* capture, std::optional<std::uint64_t> base) {
     auto& counters = stageMemoCounters();
     if (memoResult != nullptr) {
         // APS5_VERIFY_STAGE_MEMO: the memo's result against the capture's.
@@ -952,6 +1017,7 @@ void Driver::insertStageMemo(std::uint64_t hash, const std::shared_ptr<const Sha
     entry->result = result;
     entry->patches = patches;
     entry->mappings = mappings;
+    entry->base = base;
     entry->regions.reserve(recent.size());
     for (const auto& region : recent) {
         std::vector<std::uint32_t> words(region.bytes.size() / sizeof(std::uint32_t));
@@ -984,20 +1050,25 @@ void Driver::insertStageMemo(std::uint64_t hash, const std::shared_ptr<const Sha
     }
     countStageMemo(counters.inserts);
     std::lock_guard lock(stageMemoMutex);
-    auto [slot, inserted] = stageMemo.try_emplace(hash);
-    if (inserted) {
-        stageMemoOrder.push_back(hash);
-        slot->order = std::prev(stageMemoOrder.end());
-    } else {
-        stageMemoOrder.splice(stageMemoOrder.end(), stageMemoOrder, slot->order);
-    }
-    // The served result belongs to the entry replaced; the misses in a row go on counting.
-    slot->entry = std::move(entry);
-    slot->source = handle->source.get();
-    slot->pushOffset = pushOffset;
-    slot->served = {};
-    slot->generation = generation;
-    // Eviction moves entries in the map: `slot` is not used past this point.
+    const auto place = [&](std::uint64_t at) {
+        auto [slot, inserted] = stageMemo.try_emplace(at);
+        if (inserted) {
+            stageMemoOrder.push_back(at);
+            slot->order = std::prev(stageMemoOrder.end());
+        } else {
+            stageMemoOrder.splice(stageMemoOrder.end(), stageMemoOrder, slot->order);
+        }
+        // The served result belongs to the entry replaced; the misses in a row go on counting.
+        slot->entry = entry;
+        slot->source = handle->source.get();
+        slot->pushOffset = pushOffset;
+        slot->served = {};
+        slot->generation = generation;
+    };
+    // A relocatable stage's entry also goes to its base's slot (stageMemoExactHash).
+    if (base.has_value()) place(stageMemoExactHash(hash, *base));
+    place(hash);
+    // Eviction moves entries in the map: no slot is used past this point.
     while (stageMemo.size() > StageMemoCapacity() && !stageMemoOrder.empty()) {
         stageMemo.erase(stageMemoOrder.front());
         stageMemoOrder.pop_front();

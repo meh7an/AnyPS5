@@ -87,9 +87,16 @@ void ValidatePreparedInputs(const RecompileRequest& request);
 // which UserDataPatchesFor names. A key keeps those bits of each word and, for each inline V# in
 // `bufferBases` (the user words of its words 0 and 1), whether its base is zero: an empty buffer
 // specializes differently. Null when the source has no plan.
+//
+// `relocatableBase` is the low index of a user word pair (else -1) that every SRT read of the plan
+// takes its address from, as the walk forms it (the pair as 48 bits, dword aligned, plus an
+// immediate offset), and that nothing else reads: a table the title writes per draw, its address
+// moving from draw to draw. Neither word is kept: the reads land at the same offsets from any base,
+// and their words decide the result, so a capture's words compared at another base serve it.
 struct UserDataKey {
     std::vector<std::uint32_t> keepBits;
     std::vector<std::pair<std::uint32_t, std::uint32_t>> bufferBases;
+    std::int32_t relocatableBase = -1;
 };
 [[nodiscard]] std::shared_ptr<const UserDataKey> UserDataKeyFor(const SourceHandle& handle);
 // A result word that is a copy of a user word: dword `word` of the guest descriptor of binding

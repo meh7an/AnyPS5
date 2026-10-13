@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <list>
 #include <memory>
+#include <optional>
 #include <vector>
 
 namespace ShaderRecompiler {
@@ -130,6 +131,10 @@ struct StageMemoEntry {
     };
     std::vector<Copy> copies;
     std::vector<std::uint32_t> copyPositions;
+    // The relocatable base the capture read at (UserDataKey::relocatableBase), when the key has one:
+    // every region lies at its offset from it, so a stage at another base compares the words there
+    // (and patches its copies there) instead of the stamps here.
+    std::optional<std::uint64_t> base;
 };
 
 bool DecodeProgramsCurrent(const DrawDecode& decode, const ShaderRegistry& registry);

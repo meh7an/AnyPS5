@@ -43,6 +43,7 @@
 #include "Optimization/include/Optimization/ShaderInfoCollector.hpp"
 #include "Optimization/include/Optimization/SingleLaneAnalysis.hpp"
 #include "Optimization/include/Optimization/SrtWalker.hpp"
+#include "Optimization/SrtWalker/SrtInstructionPredicates.hpp"
 #include "Optimization/include/Optimization/SsaBuilder.hpp"
 #include "SpirvBackend/include/SpirvBackend/SpirvEmitter.hpp"
 #if ANYPS5_ENABLE_SPIRV_TOOLS
@@ -443,8 +444,9 @@ std::int32_t copiedUserWord(const IrResourcePlan& plan, IrValue* value) {
 }
 
 // Marks every user word the values reachable from `root` read (the walk follows a ReadConst into its
-// slot's read); `unknown` when one is read outside the plan's user data.
-void markUserWords(const IrResourcePlan& plan, IrValue* root, std::vector<std::uint8_t>& read, std::unordered_set<const IrValue*>& visited, bool& unknown) {
+// slot's read); `unknown` when one is read outside the plan's user data. The values in `opaque` (a
+// relocatable base's handles, findRelocatableBase) are not followed.
+void markUserWords(const IrResourcePlan& plan, IrValue* root, std::vector<std::uint8_t>& read, std::unordered_set<const IrValue*>& visited, bool& unknown, const std::unordered_set<const IrValue*>* opaque = nullptr) {
     std::vector<IrValue*> stack;
     if (root != nullptr) stack.push_back(root);
     while (!stack.empty()) {
@@ -453,6 +455,7 @@ void markUserWords(const IrResourcePlan& plan, IrValue* root, std::vector<std::u
         if (value == nullptr) continue;
         value = value->Resolve();
         if (value == nullptr || !visited.insert(value).second) continue;
+        if (opaque != nullptr && opaque->contains(value)) continue;
         if (value->Opcode() == IrOpcode::GetUserData) {
             if (value->ArgumentCount() < 1) {
                 unknown = true;
@@ -474,6 +477,38 @@ void markUserWords(const IrResourcePlan& plan, IrValue* root, std::vector<std::u
 bool MemoryCopiesEnabled() {
     static const bool enabled = std::getenv("APS5_NO_MEMORY_COPIES") == nullptr;
     return enabled;
+}
+
+bool RelocatableBasesEnabled() {
+    static const bool enabled = std::getenv("APS5_NO_RELOCATED_STAGE_MEMO") == nullptr;
+    return enabled;
+}
+
+// A plan's relocatable base candidate (UserDataKey::relocatableBase): the low user word of the pair
+// every raw read of the plan addresses, each a LoadAddressU32 of GetAddressResource(word k, word
+// k + 1) at an immediate offset; -1 when a raw read reads through anything else (a pointer read from
+// memory, a buffer, another pair) or at a computed offset. The reads' handles go to `handles`, for
+// the marking to leave opaque: whether something else reads the pair decides (analyzeUserData).
+// APS5_NO_RELOCATED_STAGE_MEMO=1 finds none.
+std::int32_t findRelocatableBase(const IrResourcePlan& plan, std::unordered_set<const IrValue*>& handles) {
+    if (!RelocatableBasesEnabled() || !plan.srtPlanComplete || plan.requiresSpecializationMemory || plan.srtReads.empty()) return -1;
+    std::int32_t base = -1;
+    for (const auto& stored : plan.valueStorage) {
+        const IrValue* value = stored.get();
+        if (value == nullptr || value->IsIdentity()) continue;
+        const auto opcode = value->Opcode();
+        if ((opcode != IrOpcode::LoadAddressU32 && opcode != IrOpcode::ReadConstBuffer) || !Detail::IsRawRead(plan, *value)) continue;
+        if (opcode != IrOpcode::LoadAddressU32 || value->ArgumentCount() < 2) return -1;
+        auto* handle = value->Argument(0)->Resolve();
+        const auto* offset = value->Argument(1)->Resolve();
+        if (handle->Opcode() != IrOpcode::GetAddressResource || handle->ArgumentCount() < 2 || !offset->HasImmediate()) return -1;
+        const auto low = copiedUserWord(plan, handle->Argument(0));
+        const auto high = copiedUserWord(plan, handle->Argument(1));
+        if (low < 0 || high != low + 1 || (base >= 0 && low != base)) return -1;
+        base = low;
+        handles.insert(handle);
+    }
+    return base;
 }
 
 // The SRT read slot `value` is (through bit casts and the lane read of a uniform value): a ReadConst
@@ -588,7 +623,10 @@ std::shared_ptr<const UserDataAnalysis> analyzeUserData(const IrResourcePlan& pl
     std::vector<std::uint8_t> read(count, 0);
     bool unknown = false;
     std::unordered_set<const IrValue*> visited;
-    const auto mark = [&](IrValue* root) { markUserWords(plan, root, read, visited, unknown); };
+    std::unordered_set<const IrValue*> baseHandles;
+    const auto base = findRelocatableBase(plan, baseHandles);
+    const auto* opaque = base >= 0 ? &baseHandles : nullptr;
+    const auto mark = [&](IrValue* root) { markUserWords(plan, root, read, visited, unknown, opaque); };
     const auto& sources = plan.descriptorSources;
     // Sources read as a whole: the samplers', the bindless tables' and the buffers they index.
     std::vector<std::uint8_t> whole(sources.size(), 0);
@@ -660,6 +698,15 @@ std::shared_ptr<const UserDataAnalysis> analyzeUserData(const IrResourcePlan& pl
     }
     std::sort(key->bufferBases.begin(), key->bufferBases.end());
     key->bufferBases.erase(std::unique(key->bufferBases.begin(), key->bufferBases.end()), key->bufferBases.end());
+    if (base >= 0) {
+        // The pair relocates when the reads' handles were its only readers (the marking left them
+        // opaque) and no descriptor copies it; else it is kept whole, as any read word.
+        const auto pair = static_cast<std::size_t>(base);
+        const auto copiesPair = [&](const auto& words) { return std::any_of(words.begin(), words.end(), [&](std::int32_t word) { return word == base || word == base + 1; }); };
+        const bool copied = std::any_of(analysis->bufferCopies.begin(), analysis->bufferCopies.end(), copiesPair) || std::any_of(analysis->imageCopies.begin(), analysis->imageCopies.end(), copiesPair);
+        if (!unknown && read[pair] == 0 && read[pair + 1] == 0 && !copied) key->relocatableBase = base;
+        else key->keepBits[pair] = key->keepBits[pair + 1] = ~0u;
+    }
     analysis->key = std::move(key);
     analyzeMemoryCopies(plan, *analysis);
     return analysis;
