@@ -19,6 +19,7 @@ int APS5_VABI sceAudioOut2ContextDestroy(AudioOut2ContextHandle);
 int APS5_VABI sceAudioOut2ContextPush(AudioOut2ContextHandle, std::uint32_t);
 int APS5_VABI sceAudioOut2PortCreate(AudioOut2ContextHandle, const AudioOut2PortParam*, AudioOut2PortHandle*);
 int APS5_VABI sceAudioOut2PortDestroy(AudioOut2PortHandle);
+int APS5_VABI sceAudioOut2PortGetState(AudioOut2PortHandle, AudioOut2PortState*);
 int APS5_VABI sceAudioOut2PortSetAttributes(AudioOut2PortHandle, const AudioOut2Attribute*, std::uint32_t);
 }
 
@@ -316,6 +317,30 @@ void TestMeasuredMainPortFormats() {
     Require(sceAudioOut2ContextDestroy(context) == 0);
 }
 
+// The state reports the stereo output's channels, never more than the port carries: Wwise mixes a
+// device at the reported count into a buffer sized from the port's format.
+void TestPortStateChannels() {
+    struct Case {
+        std::uint16_t type;
+        std::uint32_t channels;
+        std::uint8_t reported;
+    };
+    constexpr Case cases[] = {
+        {portTypeMain, 1, 1}, {portTypeMain, 2, 2}, {portTypeMain, 8, 2}, {portTypeMain, 12, 2},
+        {portTypePadSpeaker, 1, 1}, {portTypePadVibration, 2, 2},
+    };
+    const auto context = CreateContext();
+    for (const auto& test : cases) {
+        AudioOut2PortHandle port = 0;
+        Require(CreatePort(context, Format(test.channels, formatFloat), &port, test.type) == 0);
+        AudioOut2PortState state{};
+        Require(sceAudioOut2PortGetState(port, &state) == 0);
+        Require(state.num_channels == test.reported);
+        Require(sceAudioOut2PortDestroy(port) == 0);
+    }
+    Require(sceAudioOut2ContextDestroy(context) == 0);
+}
+
 }
 
 int main() {
@@ -339,5 +364,6 @@ int main() {
     TestPadPortsWithoutPadDevice();
     TestSharedBuffer();
     TestMeasuredMainPortFormats();
+    TestPortStateChannels();
     return 0;
 }

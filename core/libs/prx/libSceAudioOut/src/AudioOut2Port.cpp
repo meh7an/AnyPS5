@@ -255,10 +255,14 @@ int APS5_VABI sceAudioOut2PortDestroy(AudioOut2PortHandle port) {
 
 int APS5_VABI sceAudioOut2PortGetState(AudioOut2PortHandle port, AudioOut2PortState* state) {
     std::lock_guard lock(g_portsLock);
-    if (!FromHandle(port)) return SCE_AUDIO_OUT2_ERROR_INVALID_HANDLE;
+    const auto* entry = FromHandle(port);
+    if (!entry) return SCE_AUDIO_OUT2_ERROR_INVALID_HANDLE;
     if (!state) return SCE_AUDIO_OUT2_ERROR_INVALID_ARGUMENT;
     state->output = OUTPUT_MAIN;
-    state->num_channels = AUDIO_OUT2_OUTPUT_CHANNELS;
+    // The output's channels, but never more than the port carries: Wwise mixes a device at this count
+    // into a buffer sized from the port's format, so 2 on a mono pad speaker port overran that buffer
+    // every grain and corrupted the heap (Prince of Persia: The Lost Crown).
+    state->num_channels = static_cast<std::uint8_t>(std::min(entry->channels, AUDIO_OUT2_OUTPUT_CHANNELS));
     state->volume = VOLUME_MAX;
     state->reroute_counter = 0;
     state->flags = 0;
