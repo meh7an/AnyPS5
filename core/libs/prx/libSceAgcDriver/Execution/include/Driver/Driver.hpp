@@ -109,6 +109,12 @@ private:
     void dispatch(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::uint64_t indirectArguments = 0);
     void verifyDataHit(const ShaderSnapshot& snapshot, std::size_t codeOffset, ShaderRecompiler::RecompileRequest request, std::span<const ShaderRecompiler::MemoryRegion> memory, std::uint64_t address, const DispatchVariant& variant, std::span<const std::uint32_t> liveWords, const ShaderRecompiler::RecompileResult& patched);
     static bool drawEntries();
+    bool drawCacheActive();
+    void noteDrawCacheLookup(bool hit);
+    static constexpr std::uint32_t DrawCacheProbeLookups = 2048;
+    static constexpr std::uint64_t DrawCacheParkDraws = 60000;
+    static constexpr std::uint32_t DrawCacheParkDoublings = 6;
+    static constexpr std::uint64_t DrawCacheParkMaxFlips = 600;
     static bool verifyDrawEntries();
     static bool registerKeyEnabled();
     static bool verifyDrawRecipe();
@@ -312,6 +318,13 @@ private:
     std::mutex drawCacheMutex;
     std::uint64_t drawCacheHits = 0, drawCacheEvictions = 0, drawCacheVariants = 0, drawCacheVariantBytes = 0;
     std::optional<DrawKeySightings> drawKeySightings;
+    std::atomic<std::uint64_t> drawCacheDraws{0};
+    std::atomic<std::uint64_t> drawCacheParkedUntil{0};
+    std::atomic<std::uint64_t> drawCacheParkedUntilFlip{0};
+    std::atomic<std::uint32_t> drawCacheFailedWindows{0};
+    std::atomic<std::uint32_t> drawCacheWindowLookups{0};
+    std::atomic<std::uint32_t> drawCacheWindowHits{0};
+    std::atomic<std::uint64_t> drawCacheParks{0};
 
     DrawEntryCounters drawEntryCounters;
 
