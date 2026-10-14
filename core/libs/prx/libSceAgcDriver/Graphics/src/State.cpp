@@ -1379,6 +1379,11 @@ std::vector<RegisterRead>*& RegisterReadLog() {
     return log;
 }
 
+std::atomic<std::uint32_t>& RegisterReadLogsOpen() {
+    static std::atomic<std::uint32_t> open{0};
+    return open;
+}
+
 bool SplitsAlternateAlpha(const State& state) {
     for (std::size_t index = 0; index < state.colors.size() && index < state.blends.size(); ++index) {
         const auto& blend = state.blends[index];

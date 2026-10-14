@@ -123,10 +123,7 @@ std::shared_ptr<DrawDecode> Driver::decodeDraw(const QueueState& queue, const Su
 void Driver::resolveDrawDecode(const QueueState& queue, const Submission& submission, std::shared_ptr<const DrawDecode>& decode, bool registerKey, std::uint64_t drawKey, bool profile) {
     if (decode == nullptr || verifyDrawRecipe()) {
         std::vector<Graphics::RegisterRead> readLog;
-        struct LogScope {
-            explicit LogScope(std::vector<Graphics::RegisterRead>* log) { Graphics::RegisterReadLog() = log; }
-            ~LogScope() { Graphics::RegisterReadLog() = nullptr; }
-        } logScope(verifyDrawRecipe() && registerKey ? &readLog : nullptr);
+        const Graphics::RegisterReadLogScope logScope(verifyDrawRecipe() && registerKey ? &readLog : nullptr);
         auto fresh = decodeDraw(queue, submission);
         if (verifyDrawRecipe() && registerKey) {
             std::uint64_t facadeMismatches = 0;

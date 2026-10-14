@@ -7,6 +7,7 @@
 #include "prx/libSceAgcDriver/Execution/include/QueueState.hpp"
 #include <vector>
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -169,7 +170,27 @@ struct RegisterRead {
     std::uint32_t offset;
 };
 std::vector<RegisterRead>*& RegisterReadLog();
+std::atomic<std::uint32_t>& RegisterReadLogsOpen();
+class RegisterReadLogScope {
+public:
+    explicit RegisterReadLogScope(std::vector<RegisterRead>* log) : active(log != nullptr) {
+        if (!active) return;
+        RegisterReadLogsOpen().fetch_add(1, std::memory_order_relaxed);
+        RegisterReadLog() = log;
+    }
+    ~RegisterReadLogScope() {
+        if (!active) return;
+        RegisterReadLog() = nullptr;
+        RegisterReadLogsOpen().fetch_sub(1, std::memory_order_relaxed);
+    }
+    RegisterReadLogScope(const RegisterReadLogScope&) = delete;
+    RegisterReadLogScope& operator=(const RegisterReadLogScope&) = delete;
+
+private:
+    bool active;
+};
 inline void NoteRegisterRead(RegisterBank bank, std::uint32_t offset) {
+    if (RegisterReadLogsOpen().load(std::memory_order_relaxed) == 0) return;
     if (auto* log = RegisterReadLog()) log->push_back({bank, offset});
 }
 inline const char* RegisterBankName(RegisterBank bank) {
