@@ -360,8 +360,19 @@ public:
     }
 
 private:
+    std::uintptr_t cleanEnd(std::uintptr_t cursor, std::uintptr_t end) const {
+        const auto next = cleanRanges.upper_bound(cursor);
+        if (next == cleanRanges.begin()) return cursor;
+        const auto clean = std::prev(next);
+        return cursor < clean->second ? std::min(end, clean->second) : cursor;
+    }
+
     bool collectable(std::uintptr_t address, std::uintptr_t end) {
         for (auto cursor = address; cursor < end;) {
+            if (const auto clean = cleanEnd(cursor, end); clean != cursor) {
+                cursor = clean;
+                continue;
+            }
             const auto base = cursor & ~(pageBytes - 1);
             if (const auto found = views.find(base); found != views.end()) {
                 if (found->second.protection == PAGE_NOACCESS) return false;
