@@ -47,6 +47,7 @@ struct AudioOut2CapturedPort {
     std::size_t index = 0;
     std::uint64_t generation = 0;
     const void* data = nullptr;
+    std::vector<std::byte> bytes;
 };
 
 using AudioOut2Grain = std::vector<AudioOut2CapturedPort>;
@@ -64,8 +65,10 @@ struct AudioOut2Port {
     const AudioOut2StereoFold* fold = nullptr;
     const void* data = nullptr;
     std::deque<const void*> queuedData;
+    std::deque<std::vector<std::byte>> queuedPcm;
     const void* lastBuffer = nullptr;
     const void* repeatedData = nullptr;
+    std::vector<std::byte> pcm;
     float volume[AUDIO_OUT2_PORT_CHANNELS_MAX] = {1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f};
     std::uint64_t dataSets = 0;
     std::uint64_t attributeTraces = 0;
