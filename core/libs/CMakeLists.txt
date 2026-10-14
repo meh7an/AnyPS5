@@ -167,6 +167,29 @@ if(APS5_ENABLE_TRACY)
     list(APPEND PATCHED_OUTPUTS ${TRACY_CLIENT_COPIED})
 endif()
 
+if(TARGET mimalloc)
+    add_executable(pe_import_first ${CMAKE_CURRENT_SOURCE_DIR}/allocator/PeImportFirst.cpp)
+    target_compile_features(pe_import_first PRIVATE cxx_std_20)
+    if(MINGW)
+        target_compile_options(pe_import_first PRIVATE -fasynchronous-unwind-tables)
+        target_link_options(pe_import_first PRIVATE -static -static-libgcc -static-libstdc++)
+    endif()
+    add_custom_command(
+            OUTPUT ${PATCHED_DIR}/mimalloc.dll
+            COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:mimalloc> ${PATCHED_DIR}/mimalloc.dll
+            COMMAND $<TARGET_FILE:pe_import_first> ${PATCHED_DIR}/mimalloc.dll mimalloc-redirect.dll
+            DEPENDS mimalloc pe_import_first
+            COMMENT "Copying mimalloc.dll beside the libraries, its redirection module imported first"
+    )
+    add_custom_command(
+            OUTPUT ${PATCHED_DIR}/mimalloc-redirect.dll
+            COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE_DIR:mimalloc>/mimalloc-redirect.dll ${PATCHED_DIR}/mimalloc-redirect.dll
+            DEPENDS mimalloc
+            COMMENT "Copying mimalloc-redirect.dll beside the libraries"
+    )
+    list(APPEND PATCHED_OUTPUTS ${PATCHED_DIR}/mimalloc.dll ${PATCHED_DIR}/mimalloc-redirect.dll)
+endif()
+
 add_custom_target(libs DEPENDS ${PATCHED_OUTPUTS})
 
 if(BUILD_TESTING)

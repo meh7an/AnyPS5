@@ -48,16 +48,19 @@ class ReleasePackageTests(unittest.TestCase):
         names = ("libgcc_s_seh-1.dll", "libstdc++-6.dll", "libwinpthread-1.dll")
         for name in names:
             (runtime / name).write_bytes(name.encode())
+        allocator = ("mimalloc.dll", "mimalloc-redirect.dll")
+        for name in allocator:
+            (self.library.parent / name).write_bytes(name.encode())
         compiler = runtime / "g++.exe"
         (self.build / "CMakeCache.txt").write_text("CMAKE_CXX_COMPILER:STRING=" + compiler.as_posix() + "\n", encoding="utf-8")
         (self.build / "core/relinker/relinker.exe").write_bytes(b"Windows executable")
         package_release.package("windows", self.build, self.output, "v1")
         with zipfile.ZipFile(self.output / "prx-windows-v1.zip") as archive:
-            self.assertEqual(set(archive.namelist()), {"libs/libc.prx", *("libs/" + name for name in names)})
-            for name in names:
+            self.assertEqual(set(archive.namelist()), {"libs/libc.prx", *("libs/" + name for name in names + allocator)})
+            for name in names + allocator:
                 self.assertEqual(archive.read("libs/" + name), name.encode())
         with tarfile.open(self.output / "prx-windows-v1.tar.gz") as archive:
-            for name in names:
+            for name in names + allocator:
                 self.assertEqual(archive.extractfile("libs/" + name).read(), name.encode())
         self.assertEqual((self.output / "relinker-v1.exe").read_bytes(), b"Windows executable")
 
