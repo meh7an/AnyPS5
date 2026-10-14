@@ -201,6 +201,7 @@ CompiledVariant sampleVariant() {
     buffer.read = true;
     buffer.atomic = true;
     buffer.scalar = true;
+    buffer.vector = true;
     buffer.descriptorFormatted = true;
     buffer.formattedReadMask = 5u;
     buffer.typedAlignment = 2u;
@@ -1336,7 +1337,7 @@ IrResourcePlan handBuiltPlan() {
     plan.requiresSpecializationMemory = true;
     plan.srtPlanComplete = true;
     plan.resourceTrackingComplete = true;
-    plan.info.buffers = {BufferResource{}, BufferResource{2u, 0x40u, 0x100u, 0u, true, true, true, true, true, 0x7u, true, 4u}};
+    plan.info.buffers = {BufferResource{}, BufferResource{2u, 0x40u, 0x100u, 0u, true, true, true, true, true, 0x7u, true, true, 4u}};
     ImageResource image{};
     image.source = 1u;
     image.resourceClass = ImageResourceClass::Sampled;

@@ -586,7 +586,13 @@ std::uint32_t emulatedCompareState(const ShaderInfo& info, const ResourceSnapsho
 
 void materializeTables(const IrResourcePlan& plan, ResourceSnapshot& snapshot, const std::vector<TableResolution>& tables) {
     for (std::uint32_t i = 0u; i < plan.info.buffers.size(); ++i) {
-        const auto decoded = decodeBufferDescriptor(snapshot.buffers.at(i));
+        auto& value = snapshot.buffers.at(i);
+        if (!plan.info.buffers[i].vector) {
+            value.dwords[1] &= ~0x40000000u;
+            value.dwords[3] &= ~0xc0000000u;
+            continue;
+        }
+        const auto decoded = decodeBufferDescriptor(value);
         if (decoded.Type() != 0u) throw std::runtime_error("buffer descriptor uses an unsupported type");
         if (plan.stage != IrShaderStage::Compute && decoded.AddTid()) throw std::runtime_error("buffer ADD_TID is only valid for compute shaders");
     }

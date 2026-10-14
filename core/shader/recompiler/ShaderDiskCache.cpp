@@ -131,7 +131,7 @@ constexpr std::size_t fieldCount() {
 }
 
 static_assert(fieldCount<ShaderInfo>() == 23, "ShaderInfo changed: update the info encoder");
-static_assert(fieldCount<BufferResource>() == 12, "BufferResource changed: update the info encoder");
+static_assert(fieldCount<BufferResource>() == 13, "BufferResource changed: update the info encoder");
 static_assert(fieldCount<ImageResource>() == 37, "ImageResource changed: update the info encoder");
 static_assert(fieldCount<SamplerResource>() == 7, "SamplerResource changed: update the info encoder");
 static_assert(fieldCount<SampledResourcePair>() == 3, "SampledResourcePair changed: update the info encoder");
@@ -540,6 +540,7 @@ void encodeShaderInfo(Writer& writer, const ShaderInfo& info) {
         out.Value(buffer.descriptorFormatted);
         out.Value(buffer.formattedReadMask);
         out.Value(buffer.scalar);
+        out.Value(buffer.vector);
         out.Value(buffer.typedAlignment);
     });
     writer.List(info.images, [](Writer& out, const ImageResource& image) {
@@ -628,7 +629,7 @@ void encodeShaderInfo(Writer& writer, const ShaderInfo& info) {
 void decodeShaderInfo(Reader& reader, ShaderInfo& info) {
     reader.Value(info.scratchDwords);
     reader.Value(info.sharedMemoryBytes);
-    reader.List(info.buffers, 27, [](Reader& in, BufferResource& buffer) {
+    reader.List(info.buffers, 28, [](Reader& in, BufferResource& buffer) {
         in.Value(buffer.source);
         in.Value(buffer.firstUsePc);
         in.Value(buffer.maxByteExtent);
@@ -640,6 +641,7 @@ void decodeShaderInfo(Reader& reader, ShaderInfo& info) {
         in.Value(buffer.descriptorFormatted);
         in.Value(buffer.formattedReadMask);
         in.Value(buffer.scalar);
+        in.Value(buffer.vector);
         in.Value(buffer.typedAlignment);
     });
     reader.List(info.images, 75, [](Reader& in, ImageResource& image) {
