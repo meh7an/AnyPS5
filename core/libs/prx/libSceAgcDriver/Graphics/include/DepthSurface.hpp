@@ -25,6 +25,9 @@ std::uint64_t HtileDepthClearAddress(std::span<const std::uint32_t> code, std::s
 void NoteHtileDepthClear(std::uint64_t htileAddress);
 bool DepthSurfaceHolds(const Context& context, const GuestTextureResource& resource, const Texture* texture);
 void NoteDepthMetadataFill(std::uint64_t address, std::size_t bytes, std::uint32_t pattern);
+// Whether a fill of [address, address + bytes) covers a depth surface's HTILE, so that
+// NoteDepthMetadataFill changes the surface's pending clear.
+bool DepthMetadataFillCovers(std::uint64_t address, std::size_t bytes);
 VkImageAspectFlags HtileFillClears(std::uint32_t pattern, bool stencilInHtile);
 std::uint64_t HtileMetadataBytes(VkExtent2D extent);
 bool HtileFillCovers(std::uint64_t htile, VkExtent2D extent, std::uint64_t address, std::size_t bytes);

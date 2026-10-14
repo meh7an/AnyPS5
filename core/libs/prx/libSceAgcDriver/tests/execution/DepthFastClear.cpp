@@ -29,7 +29,11 @@ int main() {
         const auto shaders = Compile(*device);
         const Surface surface{reinterpret_cast<std::uintptr_t>(Depth.data()), 0, reinterpret_cast<std::uintptr_t>(Htile.data()), false, VK_FORMAT_D32_SFLOAT};
         const auto htile = surface.htile;
+        Require(!AgcDriver::Graphics::DepthMetadataFillCovers(htile, HtileBytes), "a fill covered the HTILE of a depth surface not drawn yet");
         Require(Draw(*device, shaders, surface, {.depthWrite = true}) == Covered, "a new depth surface was not cleared to DB_DEPTH_CLEAR (1.0)");
+        Require(AgcDriver::Graphics::DepthMetadataFillCovers(htile, HtileBytes), "a fill of the whole HTILE did not cover its depth surface");
+        Require(!AgcDriver::Graphics::DepthMetadataFillCovers(htile, HtileBytes - 4u), "a fill shorter than the HTILE covered its depth surface");
+        Require(!AgcDriver::Graphics::DepthMetadataFillCovers(htile + HtileBytes, HtileBytes), "a fill past the HTILE covered its depth surface");
         Require(Draw(*device, shaders, surface, {}) == 0u, "a draw at depth 0.5 passed LESS against the 0.5 written before it");
         AgcDriver::Graphics::NoteDepthMetadataFill(htile, HtileBytes - 4u, 0u);
         Require(Draw(*device, shaders, surface, {}) == 0u, "a fill shorter than the HTILE cleared the depth");

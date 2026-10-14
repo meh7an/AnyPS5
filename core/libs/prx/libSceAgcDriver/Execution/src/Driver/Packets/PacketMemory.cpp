@@ -60,8 +60,17 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
             }
         }
     }
-    if (opcode == 0x50 && packet.size() >= 7) {
-        if (Pm4::DmaSource(packet) == 2 && Pm4::DmaDestination(packet) != 1) Graphics::NoteDepthMetadataFill(packet[4] | (static_cast<std::uint64_t>(packet[5]) << 32u), packet[6] & 0x3ffffffu, packet[2]);
+    if (opcode == 0x50 && packet.size() >= 7 && Pm4::DmaSource(packet) == 2 && Pm4::DmaDestination(packet) != 1) {
+        const auto address = packet[4] | (static_cast<std::uint64_t>(packet[5]) << 32u);
+        const std::size_t bytes = packet[6] & 0x3ffffffu;
+        // A fill of a depth surface's HTILE is a clear, noted on the surface and applied when a later
+        // draw binds or samples it. Under ring writes the packet loop leaves the draw thread
+        // recording the draws before this packet, and one of them would apply the clear early (a
+        // fog pass then sampled the cleared depth): those draws finish before the clear is noted.
+        if (Graphics::DepthMetadataFillCovers(address, bytes)) {
+            if (auto* back = FrontDrawThread(); DrawThread::RingWrites() && back != nullptr && back->Busy()) back->Drain(DrawThread::Wait::Packet, opcode);
+        }
+        Graphics::NoteDepthMetadataFill(address, bytes, packet[2]);
     }
     if (!drainAll && !endOfPipeInterrupt && (opcode == 0x49 || opcode == 0x37)) {
         if (const auto label = Pm4::DecodeLabelWrite(packet)) {
