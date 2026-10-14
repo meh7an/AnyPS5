@@ -98,13 +98,13 @@ ShaderMemory::Page& ShaderMemory::page(std::uint64_t base) {
     const auto found = pages.find(base);
     if (found != pages.end()) return found->second;
     auto& page = pages[base];
-    ++CaptureTotals().pages;
+    if (CaptureProfiled()) ++CaptureTotals().pages;
     // A page is either mapped whole or read word by word where the guest mapped less than a page,
     // or where recorded GPU work writes into it (a whole-page read would wait for that work).
     if (GuestMemory::Accessible(reinterpret_cast<const void*>(base), PageBytes)) {
         if (WordwisePages() && pendingWrite != nullptr && pendingWrite(base, PageBytes, {}) != PendingWrite::None) {
             page.wordwise = true;
-            ++CaptureTotals().pagesWordwise;
+            if (CaptureProfiled()) ++CaptureTotals().pagesWordwise;
             return page;
         }
         const auto started = CaptureProfiled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -120,7 +120,7 @@ bool ShaderMemory::read(void* context, std::uint64_t address, std::uint32_t* val
     if (address % sizeof(*value) != 0 || address > std::numeric_limits<std::uint64_t>::max() - sizeof(*value)) {
         throw std::runtime_error("AGC driver: invalid shader memory read address");
     }
-    ++CaptureTotals().reads;
+    if (CaptureProfiled()) ++CaptureTotals().reads;
     if (!self.initial.empty()) {
         const auto next = self.initial.upper_bound(address);
         if (next != self.initial.begin()) {
@@ -147,30 +147,30 @@ bool ShaderMemory::read(void* context, std::uint64_t address, std::uint32_t* val
         const auto hookWaits = [&] { return self.hookWaits != nullptr ? self.hookWaits() : 0; };
         const auto report = [&](std::uint64_t waitsBefore, bool unchanged) {
             if (self.hookWaits == nullptr || self.hookWaits() != waitsBefore) self.observe(address, unchanged);
-            else ++CaptureTotals().observationsSkipped;
+            else if (CaptureProfiled()) ++CaptureTotals().observationsSkipped;
         };
         const auto fetchStarted = CaptureProfiled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         if (policy == PendingWrite::KnownValue || policy == PendingWrite::VerifyKnownValue) {
             // The query stored the known dword in `word`.
-            ++CaptureTotals().wordsKnown;
+            if (CaptureProfiled()) ++CaptureTotals().wordsKnown;
             if (policy == PendingWrite::VerifyKnownValue) {
                 std::uint32_t waited = 0;
                 const auto waitsBefore = hookWaits();
                 GuestMemory::Read(address, std::as_writable_bytes(std::span(&waited, 1)), alignof(std::uint32_t));
-                ++CaptureTotals().wordsKnownVerified;
-                if (waited != word) ++CaptureTotals().wordsKnownMismatches;
+                if (CaptureProfiled()) ++CaptureTotals().wordsKnownVerified;
+                if (waited != word && CaptureProfiled()) ++CaptureTotals().wordsKnownMismatches;
                 if (self.observe != nullptr) report(waitsBefore, waited == word);
                 word = waited;
             }
         } else if (policy == PendingWrite::Raw || policy == PendingWrite::VerifyRaw) {
             std::memcpy(&word, reinterpret_cast<const void*>(address), sizeof(word));
-            ++CaptureTotals().wordsRaw;
+            if (CaptureProfiled()) ++CaptureTotals().wordsRaw;
             if (policy == PendingWrite::VerifyRaw) {
                 std::uint32_t waited = 0;
                 const auto waitsBefore = hookWaits();
                 GuestMemory::Read(address, std::as_writable_bytes(std::span(&waited, 1)), alignof(std::uint32_t));
-                ++CaptureTotals().wordsVerified;
-                if (waited != word) ++CaptureTotals().wordMismatches;
+                if (CaptureProfiled()) ++CaptureTotals().wordsVerified;
+                if (waited != word && CaptureProfiled()) ++CaptureTotals().wordMismatches;
                 if (self.observe != nullptr) report(waitsBefore, waited == word);
                 word = waited;
             }
@@ -180,9 +180,9 @@ bool ShaderMemory::read(void* context, std::uint64_t address, std::uint32_t* val
             std::uint32_t before = 0;
             if (observed) std::memcpy(&before, reinterpret_cast<const void*>(address), sizeof(before));
             const auto waitsBefore = observed ? hookWaits() : 0;
-            const auto started = page.wordwise ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+            const auto started = page.wordwise && CaptureProfiled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             GuestMemory::Read(address, std::as_writable_bytes(std::span(&word, 1)), alignof(std::uint32_t));
-            if (page.wordwise) {
+            if (page.wordwise && CaptureProfiled()) {
                 const auto nanoseconds = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count());
                 if (nanoseconds >= WordWaitNanoseconds) {
                     ++CaptureTotals().wordWaits;
