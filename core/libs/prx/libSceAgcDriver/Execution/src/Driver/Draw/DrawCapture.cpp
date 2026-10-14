@@ -29,10 +29,19 @@ ShaderRecompiler::RecompileResult Driver::materializeDrawStage(std::size_t i, st
     auto& stageCapture = stageCaptures[i];
     stageCapture.forgetSerial = GuestMemory::ForgetSerial();
     stageCapture.pushOffset = pushOffset;
-    const auto capture = [&] {
+    // APS5_DUMP_SHADERS: a stage whose capture or materialization fails at draw time is saved as well.
+    const auto dumpOnFailure = [&](auto step) {
+        try {
+            return step();
+        } catch (...) {
+            if (std::getenv("APS5_DUMP_SHADERS") != nullptr) static_cast<void>(dumpRequest(program.binary.codeAddress, request));
+            throw;
+        }
+    };
+    const auto capture = dumpOnFailure([&] {
         const SampledReadScope sampling(evidenceReads);
         return shaderMemory.Capture(invocation);
-    }();
+    });
 
     stageCapture.regions = shaderMemory.TakeRecentRegions();
     recompiled[i] = true;
@@ -75,7 +84,7 @@ ShaderRecompiler::RecompileResult Driver::materializeDrawStage(std::size_t i, st
     phaseTiming.Phase(DrawRowCapture);
 
     timing.Mark("capture_resources");
-    stageCapture.compiled = invocation.Materialize(*capture);
+    stageCapture.compiled = dumpOnFailure([&] { return invocation.Materialize(*capture); });
     timing.Mark("materialize");
     ShaderRecompiler::RecompileResult result = *stageCapture.compiled;
     phaseTiming.Phase(DrawRowRecompile);
