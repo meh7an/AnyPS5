@@ -233,6 +233,7 @@ int OpenInDirectory_nid_no_patch(int directory, const char* path, int flags, std
 }
 
 int APS5_VABI sceKernelClose(int d) {
+    if (IsStandardDescriptor_nid_no_patch(d)) return SCE_KERNEL_ERROR_EPERM;
     if (GuestSockets::IsOpen(d)) return GuestSockets::Close(d) == 0 ? 0 : SceKernelError(*__error_nid_postfix());
     EqueueDescriptorClosed(d);
     File::ForgetRandomDevice(d);

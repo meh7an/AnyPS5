@@ -565,6 +565,7 @@ int APS5_VABI chflags_nid_postfix(const char* path, std::uint64_t flags) {
 }
 
 int APS5_VABI close_nid_postfix(int d) {
+    if (IsStandardDescriptor_nid_no_patch(d)) return PosixFailure(GUEST_EPERM);
     int socketError = 0;
     if (KernelCloseSocket_nid_no_patch(d, &socketError)) {
         if (socketError == 0) return 0;

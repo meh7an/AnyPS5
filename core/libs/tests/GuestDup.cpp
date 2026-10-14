@@ -16,6 +16,7 @@ std::int64_t APS5_VABI send_nid_postfix(int, const void*, std::uint64_t, int);
 std::int64_t APS5_VABI recv_nid_postfix(int, void*, std::uint64_t, int);
 int APS5_VABI open_nid_postfix(const char*, int, int);
 int APS5_VABI fcntl_nid_postfix(int, int, ...);
+int APS5_VABI sceKernelClose(int);
 int* APS5_VABI __error_nid_postfix();
 }
 
@@ -212,10 +213,20 @@ static void DuplicatesShareStatusFlags() {
     for (const int descriptor : {pipe[0], pipe[1], other[0], other[1], duplicate}) Require(close_nid_postfix(descriptor) == 0);
 }
 
+static void StandardDescriptorsStayOpen() {
+    constexpr int GuestEperm = 1;
+    constexpr int KernelEperm = static_cast<int>(0x80020001u);
+    for (const int descriptor : {0, 1, 2}) {
+        RequireFailure(close_nid_postfix(descriptor), GuestEperm);
+        Require(sceKernelClose(descriptor) == KernelEperm);
+    }
+}
+
 int main() {
     DupOutlivesOriginal();
     Dup2ReplacesTarget();
     BadDescriptors();
+    StandardDescriptorsStayOpen();
     SocketDuplicates();
     RandomDeviceDuplicates();
     DuplicatesShareStatusFlags();
