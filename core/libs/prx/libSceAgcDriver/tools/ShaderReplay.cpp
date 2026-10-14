@@ -133,6 +133,19 @@ bool Replay(const char* path) {
                     std::printf("  buffer %zu: V# %08x %08x %08x %08x%s\n", i / 4, v[0], v[1], v[2], v[3], written ? " written" : "");
                 }
             }
+            // Image T#s with the fields that tell surfaces apart: base, extent, format, swizzle mode,
+            // mip range and resource type.
+            for (const auto& binding : result.bindings) {
+                if (binding.role != ShaderRecompiler::DescriptorRole::GuestImages) continue;
+                for (std::size_t i = 0; i + 8 <= binding.guestDescriptor.size(); i += 8) {
+                    const auto* t = binding.guestDescriptor.data() + i;
+                    const auto base = (static_cast<std::uint64_t>(t[0]) | (static_cast<std::uint64_t>(t[1] & 0xffu) << 32u)) << 8u;
+                    const auto width = (((t[2] & 0xfffu) << 2u) | (t[1] >> 30u)) + 1u;
+                    const auto height = ((t[2] >> 14u) & 0x3fffu) + 1u;
+                    std::printf("  image %zu: T# %08x %08x %08x %08x %08x %08x %08x %08x: base 0x%llx %ux%u format %u swizzle %u levels %u-%u type %u\n", i / 8, t[0], t[1], t[2], t[3], t[4], t[5], t[6], t[7],
+                        static_cast<unsigned long long>(base), width, height, (t[1] >> 20u) & 0x1ffu, (t[3] >> 20u) & 0x1fu, (t[3] >> 12u) & 0xfu, (t[3] >> 16u) & 0xfu, t[3] >> 28u);
+                }
+            }
         }
 #if ANYPS5_ENABLE_SPIRV_TOOLS
         if (g_disassemble) {
