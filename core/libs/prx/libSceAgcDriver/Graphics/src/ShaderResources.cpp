@@ -3585,7 +3585,6 @@ std::size_t ShaderResources::DrawUploadLimit() {
 
 std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved) const {
     if ((_set == VK_NULL_HANDLE && fragment.set == VK_NULL_HANDLE) || usesBda) return {};
-    const auto reads = guestMemory.InPlaceReads();
     const auto maxSnapshotBytes = maxDrawSnapshotBytes;
     const auto uploadLimit = DrawUploadLimit();
     std::size_t totalSnapshotBytes = 0;
@@ -3619,8 +3618,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
             size = override->size;
         } else {
             if (!item.guest || item.written || guestMemory.WritesOverlap(item.address, item.size)) continue;
-            const bool direct = std::any_of(reads.begin(), reads.end(), [&](const auto& range) { return item.address >= range.first && item.address < range.second && item.size <= range.second - item.address; });
-            if (!direct || recorder.PendingWriteOverlaps(item.address, item.size)) continue;
+            if (!guestMemory.ReadInPlace(item.address, item.size) || recorder.PendingWriteOverlaps(item.address, item.size)) continue;
         }
         const auto begin = address - item.adjustment;
         const auto bytes = static_cast<std::size_t>(GuestBufferMemory::ViewBytes(size, item.adjustment));

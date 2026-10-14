@@ -3935,6 +3935,20 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> GuestBufferMemory::InPlaceR
     return result;
 }
 
+bool GuestBufferMemory::ReadInPlace(std::uint64_t address, std::size_t bytes) const {
+    if (!uploaded || committed) return false;
+    const auto holds = [&](std::uint64_t begin, std::uint64_t end) { return address >= begin && address < end && bytes <= end - address; };
+    if (space != nullptr) {
+        for (const auto& region : space->base) {
+            if (region.direct != nullptr && holds(region.begin, region.end)) return true;
+        }
+    }
+    for (const auto& region : regions) {
+        if (region.direct != nullptr && holds(region.begin, region.end)) return true;
+    }
+    return false;
+}
+
 std::vector<std::pair<std::uint64_t, std::uint64_t>> GuestBufferMemory::DeviceReads() const {
     std::vector<std::pair<std::uint64_t, std::uint64_t>> result;
     if (!uploaded || committed) return result;
