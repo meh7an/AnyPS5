@@ -3,6 +3,8 @@
 
 #include "prx/libSceAgcDriver/Graphics/include/Shaders.hpp"
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <cstring>
 #include <limits>
 #include <optional>
@@ -107,6 +109,33 @@ struct VertexInputLayout {
     std::vector<VkVertexInputAttributeDescription> attributes;
 };
 
+inline bool VertexFormatSupported(const Context& context, VkFormat format) {
+    struct Known {
+        std::atomic<VkPhysicalDevice> physical{VK_NULL_HANDLE};
+        std::array<std::atomic<std::int8_t>, 256> formats;
+        Known() {
+            for (auto& entry : formats) entry.store(-1, std::memory_order_relaxed);
+        }
+    };
+    static Known known;
+    auto owner = known.physical.load(std::memory_order_acquire);
+    if (owner == VK_NULL_HANDLE && context.physical != VK_NULL_HANDLE) {
+        known.physical.compare_exchange_strong(owner, context.physical, std::memory_order_acq_rel);
+        owner = known.physical.load(std::memory_order_acquire);
+    }
+    const auto slot = static_cast<std::uint32_t>(format);
+    const bool cached = context.physical != VK_NULL_HANDLE && owner == context.physical && slot < known.formats.size();
+    if (cached) {
+        if (const auto answer = known.formats[slot].load(std::memory_order_acquire); answer >= 0) return answer != 0;
+    }
+    Require(context.formatProperties != nullptr, "missing vertex format property query");
+    VkFormatProperties properties{};
+    context.formatProperties(context.physical, format, &properties);
+    const bool supported = (properties.bufferFeatures & VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT) != 0;
+    if (cached) known.formats[slot].store(supported ? 1 : 0, std::memory_order_release);
+    return supported;
+}
+
 inline VertexInputLayout BuildVertexInputLayout(const Context& context, std::span<const ShaderRecompiler::VertexAttribute> attributes) {
     Require(attributes.size() <= context.limits.maxVertexInputBindings && attributes.size() <= context.limits.maxVertexInputAttributes, "vertex input count exceeds device limits");
     VertexInputLayout result;
@@ -121,10 +150,7 @@ inline VertexInputLayout BuildVertexInputLayout(const Context& context, std::spa
         const auto address = fields[0] | (static_cast<std::uint64_t>(fields[1] & 0xffffu) << 32u);
         Require(NullVertexDescriptor(attribute) || (address != 0 && address % format.alignment == 0 && stride % format.alignment == 0), "unaligned vertex buffer");
         Require(stride <= context.limits.maxVertexInputBindingStride, "vertex stride exceeds device limits");
-        Require(context.formatProperties != nullptr, "missing vertex format property query");
-        VkFormatProperties properties{};
-        context.formatProperties(context.physical, format.format, &properties);
-        Require((properties.bufferFeatures & VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT) != 0, "device does not support vertex format " + std::to_string(format.format));
+        if (!VertexFormatSupported(context, format.format)) Require(false, "device does not support vertex format " + std::to_string(format.format));
         const auto binding = static_cast<std::uint32_t>(result.bindings.size());
         result.bindings.push_back({binding, stride, attribute.fetchIndex == 0 ? VK_VERTEX_INPUT_RATE_VERTEX : VK_VERTEX_INPUT_RATE_INSTANCE});
         result.attributes.push_back({attribute.location, binding, format.format, 0});
