@@ -358,6 +358,20 @@ bool Expression(const Byte* p, const _Unwind_Context& context, Word cfa, Word& r
     result = stack[0]; return true;
 }
 
+bool FrameRules(const _Unwind_Context& context, Frame& frame, Rules& rules) {
+    Rules initial;
+    if (!Instructions(frame.cieBegin, frame.cieEnd, frame, ~Word(0), initial, {})) return false;
+#ifdef _WIN32
+    if (frame.returnRegister == 32) {
+        initial.registers[16] = initial.registers[32];
+        initial.registers[32] = {};
+        frame.returnRegister = 16;
+    }
+#endif
+    rules = initial;
+    return Instructions(frame.begin, frame.end, frame, context.registers[16] - !context.signalFrame, rules, initial);
+}
+
 bool GetRules(_Unwind_Context& context, Frame& frame, Rules& rules) {
     if (!DecodeFrame(context, frame)) {
 #ifdef _WIN32
@@ -371,17 +385,7 @@ bool GetRules(_Unwind_Context& context, Frame& frame, Rules& rules) {
         return false;
 #endif
     }
-    Rules initial;
-    if (!Instructions(frame.cieBegin, frame.cieEnd, frame, ~Word(0), initial, {})) return false;
-#ifdef _WIN32
-    if (frame.returnRegister == 32) {
-        initial.registers[16] = initial.registers[32];
-        initial.registers[32] = {};
-        frame.returnRegister = 16;
-    }
-#endif
-    rules = initial;
-    if (!Instructions(frame.begin, frame.end, frame, context.registers[16] - !context.signalFrame, rules, initial)) return false;
+    if (!FrameRules(context, frame, rules)) return false;
     if (rules.cfaExpression) return Expression(rules.cfaExpression, context, 0, context.cfa);
     if (rules.cfaRegister >= 17) return false;
     context.cfa = context.registers[rules.cfaRegister] + rules.cfaOffset;
@@ -472,6 +476,48 @@ _Unwind_Reason_Code PhaseTwo(_Unwind_Context context, _Unwind_Exception* excepti
         }
     }
     return _URC_FATAL_PHASE2_ERROR;
+}
+
+bool FdeRange(const Byte* fde, Word& start, Word& length) {
+    Frame frame;
+    const Byte* p;
+    const char* augmentation;
+    Byte lsdaEncoding;
+    if (!DecodeRange(frame, {0, fde}, p, augmentation, lsdaEncoding)) return false;
+    start = frame.start;
+    length = frame.length;
+    return true;
+}
+
+bool StepWithin(_Unwind_Context& context, const Byte* fde, Word low, Word high) {
+    Frame frame; Rules rules;
+    if (!DecodeCandidate(context, frame, {context.registers[16] - !context.signalFrame, fde}) || !FrameRules(context, frame, rules)) return false;
+    if (rules.cfaExpression || rules.cfaRegister >= 17) return false;
+    const Word cfa = context.registers[rules.cfaRegister] + rules.cfaOffset;
+    _Unwind_Context next = context;
+    for (unsigned i = 0; i < 17; ++i) {
+        const auto& rule = rules.registers[i];
+        switch (rule.kind) {
+        case 0: break;
+        case 1: {
+            const Word address = cfa + rule.value;
+            if (address < low || address > high || high - address < 8) return false;
+            std::memcpy(&next.registers[i], reinterpret_cast<const void*>(address), 8);
+            break;
+        }
+        case 2: if (rule.value < 0 || rule.value >= 17) return false; next.registers[i] = context.registers[rule.value]; break;
+        case 4: next.registers[i] = cfa + rule.value; break;
+        case 5: next.registers[i] = 0; break;
+        default: return false;
+        }
+    }
+    next.registers[7] = cfa;
+    next.registers[16] = next.registers[frame.returnRegister];
+    next.signalFrame = frame.signal;
+    next.cfa = cfa;
+    if (!next.registers[16] || (cfa == context.registers[7] && next.registers[16] == context.registers[16])) return false;
+    context = next;
+    return true;
 }
 }
 
