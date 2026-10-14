@@ -185,7 +185,8 @@ WindowsEntryStub WindowsEntryStubBuilder::Build(const std::uint32_t dataRva, con
         for (const auto& module : guest.UnmatchedImportModules) unmatched.insert(stem(module));
     }
     for (std::size_t index = guestModules.size(); index < libraries.size(); ++index) {
-        if (unmatched.contains(stem(libraries[index]))) imported[index] = true;
+        const auto library = stem(libraries[index]);
+        if (std::any_of(unmatched.begin(), unmatched.end(), [&](const std::string& module) { return module.starts_with(library) || library.starts_with(module); })) imported[index] = true;
     }
 
     std::optional<std::size_t> traceProvider;
