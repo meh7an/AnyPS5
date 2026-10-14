@@ -154,10 +154,11 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         phaseTiming.Phase(DrawRowDecode);
     }
     ShaderMemory shaderMemory(memory, &queryPendingWrite, &observePendingWrite, hookWaitCounter());
-    std::vector<ShaderRecompiler::RecompileResult> results;
+    std::vector<std::shared_ptr<const ShaderRecompiler::RecompileResult>> results;
+    std::array<ShaderRecompiler::RecompileResult, 2> rectStages;
     std::vector<Graphics::CompiledShader> stages;
-    results.reserve(programs.size() + 2u);
-    stages.reserve(programs.size());
+    results.reserve(programs.size() + 1u);
+    stages.reserve(programs.size() + 2u);
     std::uint32_t pushCursorBytes = 0;
 
     std::vector<const ShaderRecompiler::RecompileResult*> programResults(programs.size(), nullptr);
@@ -217,7 +218,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             }
             results.push_back(materializeDrawStage(i, pushCursorBytes, queue, submission, programs, graphics, pixel, vertexInfos, memory, linked, drawParameters, localDevice, shaderMemory, stageCaptures, recompiled, drawHit, matched, matchedRegions, profile, dumpTarget, dumpSlot1, captures, phaseTiming, phaseMs, rejected));
             if (!rejected.empty()) return DrawVerdict::Rejected;
-            programResults[i] = &results.back();
+            programResults[i] = results.back().get();
         }
         const auto& result = *programResults[i];
         if (i == 0 && drawParameters.indirect) {
@@ -242,30 +243,26 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
 
     bool rectListBuilt = false;
 
-    std::size_t rectIndex = 0;
     const auto buildRectList = [&] {
         phaseTiming.Phase(DrawRowVectors);
         require(programs.size() == 2 && programResults[0] != nullptr && programResults[1] != nullptr, "rect-list requires vertex and fragment programs");
         auto rectangle = DrawRectangle(*programs[0].snapshot, programs[1].snapshot, programResults[0]->variantId, programResults[1]->variantId, localDevice->Target());
+        rectStages[0] = std::move(rectangle.control);
+        rectStages[1] = std::move(rectangle.evaluation);
         if (rectListBuilt) {
-            results[rectIndex] = std::move(rectangle.control);
-            results[rectIndex + 1] = std::move(rectangle.evaluation);
             phaseTiming.Phase(DrawRowRectList);
             return;
         }
         require(stages.size() == 2, "rect-list requires vertex and fragment programs");
-        rectIndex = results.size();
-        results.push_back(std::move(rectangle.control));
-        results.push_back(std::move(rectangle.evaluation));
-        stages.insert(stages.begin() + 1, {{Stage::TessellationControl, &results[rectIndex], 0}, {Stage::TessellationEvaluation, &results[rectIndex + 1], 0}});
+        stages.insert(stages.begin() + 1, {{Stage::TessellationControl, &rectStages[0], 0}, {Stage::TessellationEvaluation, &rectStages[1], 0}});
         rectListBuilt = true;
         phaseTiming.Phase(DrawRowRectList);
     };
     if (graphics.rectList) buildRectList();
     if (!programs.empty() && programResults.back() != nullptr && programResults.back()->barycentricEmulation.active) {
         require(!graphics.rectList && graphics.stages.path == Graphics::ShaderPath::Vertex && programs.size() == 2 && programResults[0] != nullptr && stages.size() == 2, "a pixel shader that reads barycentrics without VK_KHR_fragment_shader_barycentric needs a vertex shader before it");
-        results.push_back(ShaderRecompiler::BuildBarycentricGeometryShader(*programResults[0], *programResults[1], localDevice->Target(), localDevice->GeometryLimits()));
-        stages.insert(stages.begin() + 1, Graphics::CompiledShader{Stage::Geometry, &results.back(), 0});
+        results.push_back(std::make_shared<const ShaderRecompiler::RecompileResult>(ShaderRecompiler::BuildBarycentricGeometryShader(*programResults[0], *programResults[1], localDevice->Target(), localDevice->GeometryLimits())));
+        stages.insert(stages.begin() + 1, Graphics::CompiledShader{Stage::Geometry, results.back().get(), 0});
     }
     std::vector<Graphics::GuestMemorySnapshot> snapshots;
     const auto snapshot = [&] {
@@ -299,11 +296,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             for (std::size_t i = 0; i < programs.size(); ++i) {
                 if (programResults[i] == nullptr) continue;
                 resultIndex[i] = results.size();
-                results.push_back(ShaderRecompiler::RecompileResult(*programResults[i]));
-                for (auto& stage : stages) {
-                    if (stage.program == programResults[i]) stage.program = &results[resultIndex[i]];
-                }
-                programResults[i] = &results[resultIndex[i]];
+                results.push_back(matched[i]->compiled);
             }
         }
         recordQueuedLabelsBeforeRead(submission.queue);
@@ -344,11 +337,16 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             }
             for (const auto programIndex : patched) {
                 auto& result = results[resultIndex[programIndex]];
-                const auto pushBytes = result.pushConstants.size();
+                const auto* previous = result.get();
+                const auto pushBytes = result->pushConstants.size();
                 decodeVertexInfo(programIndex);
                 result = materializeDrawStage(programIndex, pushOffsets[programIndex], queue, submission, programs, graphics, pixel, vertexInfos, memory, linked, drawParameters, localDevice, shaderMemory, stageCaptures, recompiled, drawHit, matched, matchedRegions, profile, dumpTarget, dumpSlot1, captures, phaseTiming, phaseMs, rejected);
                 if (!rejected.empty()) return DrawVerdict::Rejected;
-                require(result.pushConstants.size() == pushBytes, "patched program changed its push constant layout");
+                require(result->pushConstants.size() == pushBytes, "patched program changed its push constant layout");
+                for (auto& stage : stages) {
+                    if (stage.program == previous) stage.program = result.get();
+                }
+                programResults[programIndex] = result.get();
             }
             fold(*programResults[0], direct);
             if (graphics.rectList && patched.contains(0)) buildRectList();
