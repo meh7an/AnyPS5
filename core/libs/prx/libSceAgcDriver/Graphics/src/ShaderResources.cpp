@@ -3575,24 +3575,41 @@ std::size_t ShaderResources::MaxDrawSnapshotBytes() {
     return static_cast<std::size_t>(mib * 1024ull * 1024ull);
 }
 
+std::size_t ShaderResources::DrawUploadLimit() {
+    static const std::size_t limit = [] {
+        const char* value = std::getenv("APS5_DRAW_UPLOAD_MAX");
+        return value != nullptr ? static_cast<std::size_t>(std::strtoull(value, nullptr, 10)) : std::size_t{4096};
+    }();
+    return limit;
+}
+
 std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved) const {
     if ((_set == VK_NULL_HANDLE && fragment.set == VK_NULL_HANDLE) || usesBda) return {};
     const auto reads = guestMemory.InPlaceReads();
     const auto maxSnapshotBytes = maxDrawSnapshotBytes;
+    const auto uploadLimit = DrawUploadLimit();
     std::size_t totalSnapshotBytes = 0;
     auto result = std::make_shared<DrawBindings>();
     std::vector<std::size_t> selected;
+    const auto ownCopy = [&](std::uint64_t address, std::size_t bytes) {
+        if (bytes <= uploadLimit) {
+            auto slice = recorder.DrawUpload(bytes);
+            return DrawBindings::Snapshot{address, std::move(slice.buffer), slice.offset, bytes};
+        }
+        return DrawBindings::Snapshot{address, std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT), 0, bytes};
+    };
     for (std::size_t index = 0; index < allocations.size(); ++index) {
         const auto& item = allocations[index];
         const auto override = std::find_if(moved.begin(), moved.end(), [&](const MovedBuffer& entry) { return entry.allocation == index; });
         if (override != moved.end() && !override->words.empty()) {
-            auto buffer = std::make_shared<Buffer>(context, override->size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-            std::memcpy(buffer->Bytes().data(), override->words.data(), override->size);
+            auto snapshot = ownCopy(0, override->size);
+            const auto bytes = snapshot.Bytes();
+            std::memcpy(bytes.data(), override->words.data(), override->size);
             for (const auto& patch : dataPatches) {
-                if (patch.allocation == index && patch.byte < override->size) buffer->Bytes()[patch.byte] = static_cast<std::byte>(patch.adjustment);
+                if (patch.allocation == index && patch.byte < override->size) bytes[patch.byte] = static_cast<std::byte>(patch.adjustment);
             }
             selected.push_back(index);
-            result->snapshots.push_back({0, std::move(buffer)});
+            result->snapshots.push_back(std::move(snapshot));
             continue;
         }
         std::uint64_t address = item.address;
@@ -3608,16 +3625,22 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         const auto begin = address - item.adjustment;
         const auto bytes = static_cast<std::size_t>(GuestBufferMemory::ViewBytes(size, item.adjustment));
         if (override == moved.end() && (bytes > maxSnapshotBytes || totalSnapshotBytes + bytes > maxSnapshotBytes)) continue;
-        const auto registryGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
-        const auto generation = GuestMemory::CollectWrites(begin, bytes);
-        auto buffer = recorder.ReusableDrawSnapshot(begin, bytes, Recorder::SnapshotUse::Storage, nullptr, generation);
-        if (buffer == nullptr) {
-            buffer = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
-            std::memcpy(buffer->Bytes().data(), reinterpret_cast<const void*>(begin), bytes);
-            recorder.KeepDrawSnapshot(begin, bytes, generation, registryGeneration, buffer);
+        if (bytes <= uploadLimit) {
+            auto snapshot = ownCopy(begin, bytes);
+            std::memcpy(snapshot.Bytes().data(), reinterpret_cast<const void*>(begin), bytes);
+            result->snapshots.push_back(std::move(snapshot));
+        } else {
+            const auto registryGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+            const auto generation = GuestMemory::CollectWrites(begin, bytes);
+            auto buffer = recorder.ReusableDrawSnapshot(begin, bytes, Recorder::SnapshotUse::Storage, nullptr, generation);
+            if (buffer == nullptr) {
+                buffer = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+                std::memcpy(buffer->Bytes().data(), reinterpret_cast<const void*>(begin), bytes);
+                recorder.KeepDrawSnapshot(begin, bytes, generation, registryGeneration, buffer);
+            }
+            result->snapshots.push_back({begin, std::move(buffer), 0, bytes});
         }
         selected.push_back(index);
-        result->snapshots.push_back({begin, std::move(buffer)});
         totalSnapshotBytes += bytes;
         CaptureTrace::Log("draw-snapshot batch=%llu address=%llx bytes=%zu", static_cast<unsigned long long>(recorder.Submissions() + 1), static_cast<unsigned long long>(begin), bytes);
     }
@@ -3649,7 +3672,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
             const auto snapshotIndex = snapshotIndices[binding.allocations[element]];
             if (snapshotIndex == selected.size()) continue;
             const auto& snapshot = result->snapshots[snapshotIndex];
-            buffers[offset + element] = {snapshot.buffer->Handle(), 0, snapshot.buffer->Bytes().size()};
+            buffers[offset + element] = {snapshot.buffer->Handle(), snapshot.offset, snapshot.bytes};
         }
     }
     context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets")(context.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
