@@ -31,6 +31,7 @@ def package(platform, build, output, version):
     if platform == "windows":
         runtime = windows_runtime(build)
         files.extend(runtime / name for name in ("libgcc_s_seh-1.dll", "libstdc++-6.dll", "libwinpthread-1.dll"))
+        files.extend(build / "core/libs/libs" / name for name in ("mimalloc.dll", "mimalloc-redirect.dll"))
     binary = build / "core/relinker" / executable
     for file in [*files, binary]:
         if not file.is_file() or file.stat().st_size == 0:
