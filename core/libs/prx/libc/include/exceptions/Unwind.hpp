@@ -227,6 +227,11 @@ inline bool Instructions(const Byte* p, const Byte* end, const Frame& frame, Wor
     }
     return true;
 }
+
+// For the sampler: the range an FDE covers, and one unwind step through it that reads saved registers
+// only from [low, high) (a sampled thread's stack).
+bool FdeRange(const Byte* fde, Word& start, Word& length);
+bool StepWithin(_Unwind_Context& context, const Byte* fde, Word low, Word high);
 }
 
 extern "C" {
