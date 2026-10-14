@@ -1074,7 +1074,7 @@ bool collectWindowsWrites(StampRuns& runs, std::uint64_t first, std::uint64_t st
         return true;
     };
     if (!walk(singlePass || fresh)) return false;
-    if (runs.stamped != 0) collectDirty.fetch_add(1, std::memory_order_relaxed);
+    if (runs.stamped != 0 && MemoryProfiled()) collectDirty.fetch_add(1, std::memory_order_relaxed);
     return fresh || singlePass || runs.stamped == 0 || walk(true);
 }
 #endif
@@ -1088,7 +1088,7 @@ bool walkWrites(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop, 
     const auto dirtyRuns = collectDirtyRuns.load(std::memory_order_relaxed);
     const auto collect = armedOnly ? &GuestWriteWatch::GuestWriteWatchCollectArmed_nid_postfix : &GuestWriteWatch::GuestWriteWatchCollect_nid_postfix;
     const bool complete = collect(static_cast<std::uintptr_t>(first), static_cast<std::size_t>(stop - first), &stampWrittenRun, &runs);
-    if (collectDirtyRuns.load(std::memory_order_relaxed) != dirtyRuns) collectDirty.fetch_add(1, std::memory_order_relaxed);
+    if (MemoryProfiled() && collectDirtyRuns.load(std::memory_order_relaxed) != dirtyRuns) collectDirty.fetch_add(1, std::memory_order_relaxed);
     return complete;
 #endif
 }
@@ -1113,7 +1113,7 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
                 // The current generation, not the memoized one: blocks stamped since (MarkWritten, an
                 // overlapping collect) were written before this caller reads, and an older value would
                 // make every later UnchangedSince fail until the epoch ends.
-                collectMemoHits.fetch_add(1, std::memory_order_relaxed);
+                if (MemoryProfiled()) collectMemoHits.fetch_add(1, std::memory_order_relaxed);
                 return tracker.generation.load(std::memory_order_relaxed);
             }
         }
@@ -1125,7 +1125,7 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
     if (useMemo && sharedCollectMemo()) {
         for (const auto& entry : tracker.memo) {
             if (entry.epoch == epoch && entry.unwatched == unwatchSerial.load(std::memory_order_relaxed) && entry.begin <= cursor && stop <= entry.end) {
-                collectMemoHits.fetch_add(1, std::memory_order_relaxed);
+                if (MemoryProfiled()) collectMemoHits.fetch_add(1, std::memory_order_relaxed);
                 return tracker.generation;
             }
         }
@@ -1163,7 +1163,7 @@ std::uint64_t CollectWritesUncached(std::uint64_t address, std::size_t bytes) {
 
 void BumpCollectEpoch() {
     threadCollectEpoch = nextCollectEpoch.fetch_add(1, std::memory_order_relaxed) + 1;
-    collectEpochBumps.fetch_add(1, std::memory_order_relaxed);
+    if (MemoryProfiled()) collectEpochBumps.fetch_add(1, std::memory_order_relaxed);
 }
 
 std::uint64_t CollectEpochBumps() {
@@ -1867,7 +1867,7 @@ void Read(std::uint64_t address, std::span<std::byte> destination, std::size_t a
     if (const auto guard = readGuard.load(std::memory_order_acquire)) guard(address, destination.size());
     FlushGpuWrites(address, destination.size());
     const TimedAccess timed(CounterRead, destination.size());
-    CountReadCaller(__builtin_return_address(0));
+    if (MemoryProfiled()) CountReadCaller(__builtin_return_address(0));
     const auto* source = reinterpret_cast<const void*>(address);
     try {
         CheckRange(source, destination.size(), alignment);
@@ -1897,7 +1897,7 @@ void ReadCommitted(std::uint64_t address, std::span<std::byte> destination) {
     if (const auto guard = readGuard.load(std::memory_order_acquire)) guard(address, destination.size());
     FlushGpuWrites(address, destination.size());
     const TimedAccess timed(CounterRead, destination.size());
-    CountReadCaller(__builtin_return_address(0));
+    if (MemoryProfiled()) CountReadCaller(__builtin_return_address(0));
     copyCommitted(address, destination);
 }
 
@@ -1905,7 +1905,7 @@ void ReadCommittedUnsynced(std::uint64_t address, std::span<std::byte> destinati
     if (destination.empty()) return;
     if (const auto guard = readGuard.load(std::memory_order_acquire)) guard(address, destination.size());
     const TimedAccess timed(CounterRead, destination.size());
-    CountReadCaller(__builtin_return_address(0));
+    if (MemoryProfiled()) CountReadCaller(__builtin_return_address(0));
     copyCommitted(address, destination);
 }
 
@@ -2007,7 +2007,7 @@ void Write(std::uint64_t address, std::span<const std::byte> source, std::size_t
     const ReadSiteScope site(ReadSite::Store);
     FlushGpuWrites(address, source.size());
     const TimedAccess timed(CounterWrite, source.size());
-    CountWriteCaller(__builtin_return_address(0));
+    if (MemoryProfiled()) CountWriteCaller(__builtin_return_address(0));
     auto* destination = reinterpret_cast<void*>(address);
     CheckRange(destination, source.size(), alignment, true);
     // Stamped like a GPU write: a collect memoized for this packet would not see the page fault.
