@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -97,7 +98,7 @@ struct UnitShadow {
 };
 
 struct Shadows {
-    std::mutex mutex;
+    AgcDriver::Mutex mutex;
     std::map<std::uint64_t, std::shared_ptr<UnitShadow>> byBase;
     std::uint64_t liveBytes = 0;
     std::uint64_t peakBytes = 0;

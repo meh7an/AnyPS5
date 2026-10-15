@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Graphics/include/BdaResources.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include <algorithm>
 #include <atomic>
 #include <bit>
@@ -41,7 +42,7 @@ struct TableEntry {
 };
 
 struct TableCache {
-    std::mutex mutex;
+    AgcDriver::Mutex mutex;
     VkDevice device = VK_NULL_HANDLE;
     std::list<TableEntry> entries;
     std::uint64_t hits = 0;
