@@ -23,6 +23,8 @@ struct DrawProgram {
 
     std::shared_ptr<const ShaderSnapshot> snapshot;
     std::size_t codeOffset = 0;
+    std::uint32_t mergedPointer = 0;
+    bool mergedPointerRequired = false;
 };
 
 struct DrawDecode {

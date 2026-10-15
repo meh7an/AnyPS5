@@ -31,9 +31,7 @@ const auto& registerMasks() {
     return masks;
 }
 
-}
-
-std::uint64_t RegisterStateKey(const QueueState& queue, bool allUserWords, bool incremental) {
+std::uint64_t registerShapeKey(const QueueState& queue, bool incremental) {
     const auto& masks = registerMasks();
     const auto fingerprint = [&](const Registers& registers, Graphics::RegisterBank bank) {
         const auto& mask = masks[static_cast<std::size_t>(bank)];
@@ -41,8 +39,34 @@ std::uint64_t RegisterStateKey(const QueueState& queue, bool allUserWords, bool 
     };
     auto shape = (0xcbf29ce484222325ull ^ fingerprint(queue.context, Graphics::RegisterBank::Context)) * 0x100000001b3ull;
     shape = (shape ^ fingerprint(queue.shader, Graphics::RegisterBank::Shader)) * 0x100000001b3ull;
-    shape = (shape ^ fingerprint(queue.userConfig, Graphics::RegisterBank::UserConfig)) * 0x100000001b3ull;
-    auto exact = shape;
+    return (shape ^ fingerprint(queue.userConfig, Graphics::RegisterBank::UserConfig)) * 0x100000001b3ull;
+}
+
+template<typename TMix>
+void mixDrawPrograms(const QueueState& queue, const ShaderRegistry& registry, TMix&& mix) {
+    for (const auto base : {0x008u, 0x088u, 0x0c8u, 0x108u, 0x148u}) {
+        const auto low = queue.shader.find(base);
+        const auto high = queue.shader.find(base + 1);
+        if (low == queue.shader.end() || high == queue.shader.end()) {
+            mix(0);
+            continue;
+        }
+        const auto address = (static_cast<std::uint64_t>(low->second) << 8u) | (static_cast<std::uint64_t>(high->second & 0xffu) << 40u);
+        auto it = registry.upper_bound(address);
+        if (it == registry.begin()) {
+            mix(1);
+            continue;
+        }
+        --it;
+        for (const auto& snapshot : it->second) mix(reinterpret_cast<std::uintptr_t>(snapshot.get()));
+        mix(address - it->first);
+    }
+}
+
+}
+
+std::uint64_t RegisterStateKey(const QueueState& queue, bool allUserWords, bool incremental) {
+    auto exact = registerShapeKey(queue, incremental);
     const auto words = [&](std::uint32_t base, std::uint32_t count) {
         for (auto it = queue.shader.lower_bound(base); it != queue.shader.end() && it->first < base + count; ++it) {
             exact = (exact ^ it->first) * 0x100000001b3ull;
@@ -70,23 +94,13 @@ std::uint64_t Driver::drawRegisterKey(const QueueState& queue, const ShaderRegis
         key *= 0x100000001b3ull;
     };
     mix(deviceSerial);
-    for (const auto base : {0x008u, 0x088u, 0x0c8u, 0x108u, 0x148u}) {
-        const auto low = queue.shader.find(base);
-        const auto high = queue.shader.find(base + 1);
-        if (low == queue.shader.end() || high == queue.shader.end()) {
-            mix(0);
-            continue;
-        }
-        const auto address = (static_cast<std::uint64_t>(low->second) << 8u) | (static_cast<std::uint64_t>(high->second & 0xffu) << 40u);
-        auto it = registry.upper_bound(address);
-        if (it == registry.begin()) {
-            mix(1);
-            continue;
-        }
-        --it;
-        for (const auto& snapshot : it->second) mix(reinterpret_cast<std::uintptr_t>(snapshot.get()));
-        mix(address - it->first);
-    }
+    mixDrawPrograms(queue, registry, mix);
+    return key;
+}
+
+std::uint64_t Driver::drawDecodeKey(const QueueState& queue, const ShaderRegistry& registry) {
+    auto key = registerShapeKey(queue, true);
+    mixDrawPrograms(queue, registry, [&](std::uint64_t value) { key = (key ^ value) * 0x100000001b3ull; });
     return key;
 }
 

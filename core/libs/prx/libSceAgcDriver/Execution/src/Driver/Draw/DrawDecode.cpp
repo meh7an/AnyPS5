@@ -2,6 +2,13 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ThreadScratch.hpp"
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
+#include <iterator>
+#include <list>
+#include <unordered_map>
 
 namespace AgcDriver::DriverDetail {
 
@@ -10,6 +17,57 @@ namespace {
 std::uint32_t ReadGraphicsRegister(const Registers& registers, std::uint32_t offset) {
     const auto found = registers.find(offset);
     return found == registers.end() ? 0u : found->second;
+}
+
+void readMergedPointer(const QueueState& queue, DrawProgram& program) {
+    const auto pointerBase = program.mergedPointer;
+    if (!program.mergedPointerRequired && !queue.shader.contains(pointerBase) && !queue.shader.contains(pointerBase + 1)) return;
+    const auto low = ReadGraphicsRegister(queue.shader, pointerBase);
+    const auto high = ReadGraphicsRegister(queue.shader, pointerBase + 1);
+    const auto address = static_cast<std::uint64_t>(low) | (static_cast<std::uint64_t>(high) << 32u);
+    require(address != 0 || !program.mergedPointerRequired, "merged shader user-data address is null");
+    if (address == 0) return;
+    GuestMemory::CheckRange(reinterpret_cast<const void*>(address), 8, 4);
+    program.userData[0] = low;
+    program.userData[1] = high;
+}
+
+void rereadUserData(const QueueState& queue, DrawProgram& program) {
+    const std::size_t front = program.mergedPointer != 0 ? 8 : 0;
+    for (std::size_t i = front; i < program.userData.size(); ++i) program.userData[i] = readUserData(queue.shader, program.userDataBase + static_cast<std::uint32_t>(i - front));
+    if (front == 0) return;
+    program.userData[0] = 0;
+    program.userData[1] = 0;
+    readMergedPointer(queue, program);
+}
+
+struct DecodeCacheEntry {
+    std::shared_ptr<const ShaderRegistry> registry;
+    std::uint64_t forgetSerial = 1;
+    std::vector<std::shared_ptr<DrawDecode>> copies;
+    std::size_t replace = 0;
+    std::list<std::uint64_t>::iterator order;
+};
+
+struct DecodeCache {
+    std::unordered_map<std::uint64_t, DecodeCacheEntry> entries;
+    std::list<std::uint64_t> order;
+    std::uint64_t hits = 0, misses = 0, copied = 0, verified = 0, mismatches = 0;
+};
+
+struct DecodeCacheTag;
+
+constexpr std::size_t DecodeCacheEntries = 4096;
+constexpr std::size_t DecodeCacheCopies = 4;
+
+bool DecodeCacheEnabled() {
+    static const bool enabled = std::getenv("APS5_NO_DECODE_CACHE") == nullptr;
+    return enabled;
+}
+
+bool VerifyDecodeCache() {
+    static const bool verify = std::getenv("APS5_VERIFY_DECODE_CACHE") != nullptr;
+    return verify;
 }
 
 }
@@ -67,18 +125,12 @@ void DecodeGraphicsPrograms(DrawDecode& decoded, const QueueState& queue, const 
         const auto initializeMerged = [&](DrawProgram& program, std::uint32_t pointerBase, bool pointerRequired) {
             program.firstUserSgpr = 0;
             program.userData.insert(program.userData.begin(), 8, 0);
+            program.mergedPointer = pointerBase;
+            program.mergedPointerRequired = pointerRequired;
             Graphics::NoteRegisterRead(Graphics::RegisterBank::Shader, pointerBase);
             Graphics::NoteRegisterRead(Graphics::RegisterBank::Shader, pointerBase + 1);
             if (staticAbi) return;
-            if (!pointerRequired && !queue.shader.contains(pointerBase) && !queue.shader.contains(pointerBase + 1)) return;
-            const auto low = ReadGraphicsRegister(queue.shader, pointerBase);
-            const auto high = ReadGraphicsRegister(queue.shader, pointerBase + 1);
-            const auto address = static_cast<std::uint64_t>(low) | (static_cast<std::uint64_t>(high) << 32u);
-            require(address != 0 || !pointerRequired, "merged shader user-data address is null");
-            if (address == 0) return;
-            GuestMemory::CheckRange(reinterpret_cast<const void*>(address), 8, 4);
-            program.userData[0] = low;
-            program.userData[1] = high;
+            readMergedPointer(queue, program);
         };
         const auto& graphics = product->state;
         if (graphics.stages.path == Graphics::ShaderPath::Tessellation) {
@@ -122,6 +174,72 @@ std::shared_ptr<DrawDecode> Driver::decodeDraw(const QueueState& queue, const Su
 }
 
 void Driver::resolveDrawDecode(const QueueState& queue, const Submission& submission, std::shared_ptr<const DrawDecode>& decode, bool registerKey, std::uint64_t drawKey, bool profile) {
+    if (decode == nullptr && !verifyDrawRecipe() && DecodeCacheEnabled()) {
+        auto& cache = ThreadScratch<DecodeCache, DecodeCacheTag>();
+        const auto decodeKey = drawDecodeKey(queue, *submission.shaders);
+        const auto report = [&] {
+            if (!profile && !VerifyDecodeCache()) return;
+            if ((cache.hits + cache.misses) % 500000 != 0) return;
+            std::fprintf(stderr, "[decode-cache] %llu hits (%llu copied first), %llu misses, %zu entries; verified %llu hits: %llu decode mismatches\n", static_cast<unsigned long long>(cache.hits), static_cast<unsigned long long>(cache.copied), static_cast<unsigned long long>(cache.misses), cache.entries.size(), static_cast<unsigned long long>(cache.verified), static_cast<unsigned long long>(cache.mismatches));
+        };
+        const auto serial = GuestMemory::ForgetSerial();
+        const bool settled = (serial & 1u) == 0;
+        const auto found = cache.entries.find(decodeKey);
+        if (found != cache.entries.end() && settled && found->second.forgetSerial == serial && found->second.registry == submission.shaders && DecodeProgramsCurrent(*found->second.copies.front(), *submission.shaders)) {
+            auto& entry = found->second;
+            cache.order.splice(cache.order.end(), cache.order, entry.order);
+            std::shared_ptr<DrawDecode> served;
+            for (const auto& copy : entry.copies) {
+                if (copy.use_count() != 1) continue;
+                std::atomic_thread_fence(std::memory_order_acquire);
+                served = copy;
+                break;
+            }
+            if (served == nullptr) {
+                served = std::make_shared<DrawDecode>(*entry.copies.front());
+                ++cache.copied;
+                if (entry.copies.size() < DecodeCacheCopies) {
+                    entry.copies.push_back(served);
+                } else {
+                    entry.copies[entry.replace] = served;
+                    entry.replace = (entry.replace + 1) % entry.copies.size();
+                }
+            }
+            for (auto& program : served->programs) rereadUserData(queue, program);
+            ++cache.hits;
+            if (VerifyDecodeCache()) {
+                ++cache.verified;
+                const bool same = sameDecode(*decodeDraw(queue, submission), *served);
+                if (!same && ++cache.mismatches <= 20) std::fprintf(stderr, "[decode-cache] verify: a hit at key 0x%llx decodes differently\n", static_cast<unsigned long long>(decodeKey));
+            }
+            report();
+            decode = std::move(served);
+            return;
+        }
+        auto fresh = decodeDraw(queue, submission);
+        ++cache.misses;
+        if (found != cache.entries.end()) {
+            found->second.registry = submission.shaders;
+            found->second.forgetSerial = settled ? serial : 1;
+            found->second.copies.assign(1, fresh);
+            found->second.replace = 0;
+            cache.order.splice(cache.order.end(), cache.order, found->second.order);
+        } else {
+            while (cache.entries.size() >= DecodeCacheEntries && !cache.order.empty()) {
+                cache.entries.erase(cache.order.front());
+                cache.order.pop_front();
+            }
+            auto& entry = cache.entries[decodeKey];
+            entry.registry = submission.shaders;
+            entry.forgetSerial = settled ? serial : 1;
+            entry.copies.push_back(fresh);
+            cache.order.push_back(decodeKey);
+            entry.order = std::prev(cache.order.end());
+        }
+        report();
+        decode = std::move(fresh);
+        return;
+    }
     if (decode == nullptr || verifyDrawRecipe()) {
         std::vector<Graphics::RegisterRead> readLog;
         const Graphics::RegisterReadLogScope logScope(verifyDrawRecipe() && registerKey ? &readLog : nullptr);
