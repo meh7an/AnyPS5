@@ -7,8 +7,10 @@
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ThreadScratch.hpp"
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -881,7 +883,6 @@ struct PipelineStore {
         std::shared_ptr<Pipeline> pipeline;
     };
     AgcDriver::Mutex mutex;
-    std::vector<std::byte> scratchKey;
     // Least recently used first.
     std::list<Entry> entries;
     std::unordered_map<std::uint64_t, std::list<Entry>::iterator> index;
@@ -889,7 +890,18 @@ struct PipelineStore {
     std::uint64_t misses = 0;
     std::uint64_t uncached = 0;
     std::uint64_t evicted = 0;
+    std::atomic<std::uint64_t> lastHits{0};
+    std::atomic<std::uint64_t> clears{0};
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
+};
+
+struct LastPipeline {
+    std::vector<std::byte> key;
+    std::weak_ptr<Pipeline> pipeline;
+    std::weak_ptr<BufferPool> pool;
+    VkDevice device = VK_NULL_HANDLE;
+    std::uint32_t uses = 0;
+    std::uint64_t clears = 0;
 };
 
 // Never destroyed: the pipelines belong to a device that may already be gone when statics die, and
@@ -921,7 +933,7 @@ void reportPipelines(PipelineStore& store) {
     if (now - store.lastReport < std::chrono::seconds(10)) return;
     store.lastReport = now;
     const auto lookups = store.hits + store.misses + store.uncached;
-    AgcDriver::ProfilePrint_nid_no_patch( "[pipecache] %llu lookups over 10 s: %llu hits (%.0f%%), %llu misses, %llu private (no variant id), %llu evicted, %zu cached\n", static_cast<unsigned long long>(lookups), static_cast<unsigned long long>(store.hits), lookups != 0 ? 100.0 * static_cast<double>(store.hits) / static_cast<double>(lookups) : 0.0, static_cast<unsigned long long>(store.misses), static_cast<unsigned long long>(store.uncached), static_cast<unsigned long long>(store.evicted), store.entries.size());
+    AgcDriver::ProfilePrint_nid_no_patch( "[pipecache] %llu lookups over 10 s: %llu hits (%.0f%%), %llu misses, %llu private (no variant id), %llu evicted, %zu cached; %llu draws reused their thread's last pipeline\n", static_cast<unsigned long long>(lookups), static_cast<unsigned long long>(store.hits), lookups != 0 ? 100.0 * static_cast<double>(store.hits) / static_cast<double>(lookups) : 0.0, static_cast<unsigned long long>(store.misses), static_cast<unsigned long long>(store.uncached), static_cast<unsigned long long>(store.evicted), store.entries.size(), static_cast<unsigned long long>(store.lastHits.exchange(0, std::memory_order_relaxed)));
     store.hits = store.misses = store.uncached = store.evicted = 0;
 }
 
@@ -935,15 +947,33 @@ std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& st
     static const bool disabled = std::getenv("APS5_NO_PIPELINE_CACHE") != nullptr;
     if (disabled) return std::make_shared<Pipeline>(context, state, vertexInput, resources, shaders, attachmentLayout);
     auto& store = Pipelines();
+    struct LastTag {};
+    auto& last = ThreadScratch<LastPipeline, LastTag>();
+    struct KeyTag {};
+    auto& key = ThreadScratch<std::vector<std::byte>, KeyTag>();
+    pipelineKey(key, context, state, vertexInput, resources, shaders, attachmentLayout);
+    if (!key.empty() && last.uses < 64 && last.device == context.device && last.clears == store.clears.load(std::memory_order_acquire) && last.key == key) {
+        if (auto pipeline = last.pipeline.lock(); pipeline != nullptr && (context.bufferPool == nullptr || (!last.pool.owner_before(context.bufferPool) && !context.bufferPool.owner_before(last.pool)))) {
+            ++last.uses;
+            store.lastHits.fetch_add(1, std::memory_order_relaxed);
+            return pipeline;
+        }
+    }
+    const auto remember = [&](const std::shared_ptr<Pipeline>& pipeline) {
+        last.key = key;
+        last.pipeline = pipeline;
+        last.pool = context.bufferPool;
+        last.device = context.device;
+        last.uses = 0;
+        last.clears = store.clears.load(std::memory_order_relaxed);
+    };
+    const auto hash = key.empty() ? 0 : hashKey(key);
     std::lock_guard lock(store.mutex);
     reportPipelines(store);
-    auto& key = store.scratchKey;
-    pipelineKey(key, context, state, vertexInput, resources, shaders, attachmentLayout);
     if (key.empty()) {
         ++store.uncached;
         return std::make_shared<Pipeline>(context, state, vertexInput, resources, shaders, attachmentLayout);
     }
-    const auto hash = hashKey(key);
     if (const auto found = store.index.find(hash); found != store.index.end()) {
         const auto it = found->second;
         if (it->key == key) {
@@ -952,6 +982,7 @@ std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& st
             if (alive(*it, context)) {
                 ++store.hits;
                 store.entries.splice(store.entries.end(), store.entries, it);
+                remember(it->pipeline);
                 return it->pipeline;
             }
             abandon(store, it);
@@ -979,12 +1010,14 @@ std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& st
         store.entries.erase(victim);
         ++store.evicted;
     }
+    remember(pipeline);
     return pipeline;
 }
 
 void ClearCachedPipelines(VkDevice device) {
     auto& store = Pipelines();
     std::lock_guard lock(store.mutex);
+    store.clears.fetch_add(1, std::memory_order_release);
     for (auto it = store.entries.begin(); it != store.entries.end();) {
         if (it->device != device) {
             ++it;
