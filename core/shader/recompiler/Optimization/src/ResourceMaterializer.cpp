@@ -3,6 +3,7 @@
 #include "Optimization/ShaderStageInputInfo.hpp"
 #include "RdnaDecoder/RdnaDescriptorFormat.hpp"
 #include "RdnaDecoder/RdnaImageOpDecoder.hpp"
+#include "prx/libc/include/HostThreadLocal.hpp"
 #include "SpirvBackend/SpirvBufferFormat.hpp"
 #include <algorithm>
 #include <array>
@@ -442,8 +443,16 @@ void materializeSnapshot(const IrResourcePlan& plan, const SrtRuntime& runtime, 
     }
     snapshot.userData.assign(runtime.userData.begin(), runtime.userData.begin() + plan.userDataCount);
 
-    std::vector<DescriptorValue> values;
-    std::vector<std::uint8_t> activeSources;
+    struct Scratch {
+        std::vector<DescriptorValue> values;
+        std::vector<std::uint8_t> activeSources;
+    };
+    struct ScratchStorage {};
+    auto& scratch = HostThreadLocal<Scratch, ScratchStorage>();
+    auto& values = scratch.values;
+    auto& activeSources = scratch.activeSources;
+    values.clear();
+    activeSources.clear();
     walker.EvaluateRuntimeSources(plan, plan.materializationSources, runtime, values, snapshot.flattenedSrt, plan.cleanFlatSlots, activeSources, &snapshot.srtPoison, &snapshot.nullRootReads);
 
     std::size_t cursor = 0;
@@ -1024,7 +1033,9 @@ void ResourceMaterializer::Materialize(const IrResourcePlan& program, const SrtR
     }
     SrtWalker walker;
     ResourceSnapshot nextSnapshot;
-    std::vector<TableResolution> tables;
+    struct TablesStorage {};
+    auto& tables = HostThreadLocal<std::vector<TableResolution>, TablesStorage>();
+    tables.clear();
     try {
         materializeSnapshot(plan, runtime, walker, nextSnapshot, tables);
     } catch (...) {

@@ -47,6 +47,7 @@ void DecodeGraphicsPrograms(DrawDecode& decoded, const QueueState& queue, const 
             program,
             codeOffset
         };
+        result.userData.reserve(userCount + 8u);
         for (std::uint32_t i = 0; i < userCount; ++i) {
             Graphics::NoteRegisterRead(Graphics::RegisterBank::Shader, userDataBase + i);
             result.userData.push_back((staticAbi ? ReadGraphicsRegister(queue.shader, userDataBase + i) : readUserData(queue.shader, userDataBase + i)));

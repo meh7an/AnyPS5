@@ -3538,6 +3538,7 @@ std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::MovedR
                 const bool same = !item.dataWords.empty() ? item.dataWords == binding.guestDescriptor : !patched && std::memcmp(item.buffer->Bytes().data(), binding.guestDescriptor.data(), item.size) == 0;
                 if (same) continue;
                 if (item.dataWords.empty() && patched) return std::nullopt;
+                if (moved.empty()) moved.reserve(allocations.size());
                 moved.push_back({index, 0, item.size, binding.guestDescriptor});
                 continue;
             }
@@ -3563,6 +3564,7 @@ std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::MovedR
                 const auto bytes = static_cast<std::size_t>(GuestBufferMemory::ViewBytes(size, item.adjustment));
                 if (!GuestMemory::Accessible(reinterpret_cast<const void*>(begin), bytes)) return std::nullopt;
                 if (guestMemory.WritesOverlap(begin, bytes) || recorder.PendingWriteOverlaps(begin, bytes) || PendingStorageOverlaps(begin, bytes, nullptr) || AnyShadowedOverlaps(begin, bytes)) return std::nullopt;
+                if (moved.empty()) moved.reserve(allocations.size());
                 moved.push_back({index, address, static_cast<std::size_t>(size)});
             }
         }
@@ -3598,6 +3600,10 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         }
         return DrawBindings::Snapshot{address, std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT), 0, bytes};
     };
+    const auto keep = [&](DrawBindings::Snapshot snapshot) {
+        if (result->snapshots.empty()) result->snapshots.reserve(allocations.size());
+        result->snapshots.push_back(std::move(snapshot));
+    };
     for (std::size_t index = 0; index < allocations.size(); ++index) {
         const auto& item = allocations[index];
         const auto override = std::find_if(moved.begin(), moved.end(), [&](const MovedBuffer& entry) { return entry.allocation == index; });
@@ -3609,7 +3615,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
                 if (patch.allocation == index && patch.byte < override->size) bytes[patch.byte] = static_cast<std::byte>(patch.adjustment);
             }
             selected.push_back(index);
-            result->snapshots.push_back(std::move(snapshot));
+            keep(std::move(snapshot));
             continue;
         }
         std::uint64_t address = item.address;
@@ -3627,7 +3633,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         if (bytes <= uploadLimit) {
             auto snapshot = ownCopy(begin, bytes);
             std::memcpy(snapshot.Bytes().data(), reinterpret_cast<const void*>(begin), bytes);
-            result->snapshots.push_back(std::move(snapshot));
+            keep(std::move(snapshot));
         } else {
             const auto registryGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
             const auto generation = GuestMemory::CollectWrites(begin, bytes);
@@ -3637,7 +3643,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
                 std::memcpy(buffer->Bytes().data(), reinterpret_cast<const void*>(begin), bytes);
                 recorder.KeepDrawSnapshot(begin, bytes, generation, registryGeneration, buffer);
             }
-            result->snapshots.push_back({begin, std::move(buffer), 0, bytes});
+            keep({begin, std::move(buffer), 0, bytes});
         }
         selected.push_back(index);
         totalSnapshotBytes += bytes;

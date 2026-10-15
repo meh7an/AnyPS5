@@ -3333,10 +3333,12 @@ void descriptorSnapshotTests() {
             const auto original = findWrite(0).buffers;
             const auto originalThird = findWrite(4).buffers;
             std::vector<ShaderResources::MovedBuffer> moved;
+            std::array<std::vector<std::uint32_t>, 2> words;
             for (std::size_t index = 0; index < 2; ++index) {
                 if ((selected & (1u << index)) == 0) continue;
                 const std::size_t bytes = index == 0 ? 24 : 12;
-                moved.push_back({index, 0, bytes, std::vector<std::uint32_t>(bytes / 4, static_cast<std::uint32_t>(0x12340000u + index))});
+                words[index].assign(bytes / 4, static_cast<std::uint32_t>(0x12340000u + index));
+                moved.push_back({index, 0, bytes, words[index]});
             }
             mock.writes.clear();
             const auto snapshots = resources.PrepareDrawBindings(recorder, moved);
