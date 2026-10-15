@@ -2,8 +2,8 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_SHADERMEMORY_HPP
 
 #include "Recompiler.hpp"
+#include <algorithm>
 #include <array>
-#include <bitset>
 #include <cstddef>
 #include <cstdint>
 #include <map>
@@ -76,11 +76,26 @@ private:
     static constexpr std::size_t PageBytes = 4096;
     static constexpr std::size_t PageWords = PageBytes / sizeof(std::uint32_t);
 
+    class WordMask {
+    public:
+        [[nodiscard]] bool Test(std::size_t index) const { return (bits[index / 64u] >> (index % 64u) & 1u) != 0u; }
+        void Set(std::size_t index) { bits[index / 64u] |= std::uint64_t{1} << (index % 64u); }
+        void SetAll() { bits.fill(~std::uint64_t{0}); }
+        void Reset() { bits.fill(0u); }
+        [[nodiscard]] bool None() const;
+        [[nodiscard]] bool All() const { return std::all_of(bits.begin(), bits.end(), [](std::uint64_t word) { return word == ~std::uint64_t{0}; }); }
+        template<typename TRun>
+        void ForEachRun(TRun&& run) const;
+
+    private:
+        std::array<std::uint64_t, PageWords / 64u> bits{};
+    };
+
     struct Page {
         std::array<std::uint32_t, PageWords> words{};
-        std::bitset<PageWords> valid;
-        std::bitset<PageWords> read;
-        std::bitset<PageWords> recent;
+        WordMask valid;
+        WordMask read;
+        WordMask recent;
         bool wordwise = false;
     };
 
