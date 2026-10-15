@@ -1836,6 +1836,10 @@ std::vector<std::uint32_t> ShaderResources::ContentKey(const CompiledShader& sha
     return key;
 }
 
+void ShaderResources::AppendContentKey(std::vector<std::uint32_t>& key, const CompiledShader& shader, bool dataWords, bool movableBuffers) {
+    VisitContentKey(shader, dataWords, movableBuffers, [&](std::uint32_t word) { key.push_back(word); });
+}
+
 bool MatchesContentKey(const CompiledShader& shader, std::span<const std::uint32_t> key) {
     std::size_t cursor = 0;
     bool equal = true;

@@ -16,6 +16,28 @@ T& ThreadScratch() {
     return *object;
 }
 
+template<typename T, typename Tag>
+class ThreadScratchLease {
+public:
+    ThreadScratchLease() : slot(ThreadScratch<T, Tag>()) {
+        value.swap(slot);
+        value.clear();
+    }
+
+    ~ThreadScratchLease() {
+        value.clear();
+        value.swap(slot);
+    }
+
+    ThreadScratchLease(const ThreadScratchLease&) = delete;
+    ThreadScratchLease& operator=(const ThreadScratchLease&) = delete;
+
+    T value;
+
+private:
+    T& slot;
+};
+
 }
 
 #endif
