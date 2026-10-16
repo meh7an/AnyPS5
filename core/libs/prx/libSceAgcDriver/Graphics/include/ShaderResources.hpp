@@ -6,6 +6,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Sampler.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
+#include "prx/libSceAgcDriver/Execution/include/HashSlotMap.hpp"
 #include "Recompiler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Shaders.hpp"
 #include <array>
@@ -575,18 +576,18 @@ public:
     std::size_t Size() const;
 
 private:
-    void erase(const Key& key);
-    void noteMiss(const Key& key);
-    struct KeyHash {
-        std::size_t operator()(const Key& key) const noexcept {
-            std::uint64_t hash = 14695981039346656037ull;
-            for (const auto word : key) hash = (hash ^ word) * 1099511628211ull;
-            return static_cast<std::size_t>(hash);
-        }
+    struct Entry {
+        Key key;
+        std::uint64_t hash;
+        std::shared_ptr<ShaderResources> resources;
     };
+    using Entries = std::list<Entry>;
+    void noteMiss(const Key& key);
+    static std::uint64_t hashKey(const Key& key);
+    Entries::iterator* lookup(std::uint64_t hash, const Key& key);
     mutable AgcDriver::Mutex mutex;
-    std::list<std::pair<Key, std::shared_ptr<ShaderResources>>> entries;
-    std::unordered_map<Key, decltype(entries)::iterator, KeyHash> index;
+    Entries entries;
+    HashSlotMap<Entries::iterator> index;
 };
 
 // The process-wide cache the device and the draw path share (keys name the device; a device clears
