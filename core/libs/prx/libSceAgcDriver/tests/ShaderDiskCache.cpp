@@ -329,6 +329,29 @@ void verifyResultRoundTrip() {
     require(!ShaderDiskCache::DecodeResult(bytes, decoded), "an incompatible runtime ABI result decodes");
 }
 
+void verifyElementFlags() {
+    ElementFlags flags;
+    std::vector<bool> expected;
+    for (std::size_t index = 0; index < 70; ++index) {
+        flags.push_back(index % 3 == 0);
+        expected.push_back(index % 3 == 0);
+        require(flags == expected, "element flags differ from a vector after " + std::to_string(index + 1) + " entries");
+    }
+    const auto copy = flags;
+    require(copy == flags && copy.size() == 70 && copy.at(69) && !copy.at(68), "a copy of spilled element flags differs");
+    require(std::count(flags.begin(), flags.end(), true) == 24, "spilled element flags do not iterate");
+    auto result = sampleResult();
+    result.bindings[1].bufferWritten = flags;
+    std::vector<std::byte> bytes;
+    ShaderDiskCache::EncodeResult(result, bytes);
+    RecompileResult decoded;
+    require(ShaderDiskCache::DecodeResult(bytes, decoded) && decoded.bindings[1].bufferWritten == expected, "spilled element flags do not round trip");
+    flags.assign(3, true);
+    require(flags == std::vector<bool>{true, true, true}, "assigned element flags kept spilled entries");
+    flags.clear();
+    require(flags.empty() && flags == ElementFlags{}, "cleared element flags are not empty");
+}
+
 void verifyEntryRoundTrip() {
     SampleRequest sample;
     const auto key = sample.Key();
@@ -1852,6 +1875,7 @@ int main(int argc, char** argv) {
         setEnvironment("ANYPS5_SHADER_CACHE_DIR", directory.string());
         verifyAtomicReplacement(directory);
         verifyResultRoundTrip();
+        verifyElementFlags();
         verifyEntryRoundTrip();
         verifyArtifactStorageIsolation();
         verifyKeySensitivity();

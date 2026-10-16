@@ -182,7 +182,7 @@ public:
         out.insert(out.end(), bytes.begin(), bytes.end());
     }
 
-    void Flags(const std::vector<bool>& flags) {
+    void Flags(const ElementFlags& flags) {
         Value<std::uint64_t>(flags.size());
         for (const bool flag : flags) Value(flag);
     }
@@ -271,10 +271,10 @@ public:
         }
     }
 
-    void Flags(std::vector<bool>& flags) {
+    void Flags(ElementFlags& flags) {
         const auto count = Count(1);
-        flags.assign(count, false);
-        for (std::size_t i = 0; i < count; ++i) flags[i] = Get<bool>();
+        flags.clear();
+        for (std::size_t i = 0; i < count; ++i) flags.push_back(Get<bool>());
     }
 
     void Text(std::string& text) {

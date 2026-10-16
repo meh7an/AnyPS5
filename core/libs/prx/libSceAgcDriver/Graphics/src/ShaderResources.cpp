@@ -1789,7 +1789,7 @@ void VisitContentKey(const CompiledShader& shader, bool dataWords, bool movableB
     visit(static_cast<std::uint32_t>(program.PipelineVariantId()));
     visit(static_cast<std::uint32_t>(program.PipelineVariantId() >> 32u));
     visit(static_cast<std::uint32_t>(program.bindings.size()));
-    const auto packBits = [&](const std::vector<bool>& bits) {
+    const auto packBits = [&](const ShaderRecompiler::ElementFlags& bits) {
         visit(static_cast<std::uint32_t>(bits.size()));
         std::uint32_t word = 0;
         for (std::size_t i = 0; i < bits.size(); ++i) {
