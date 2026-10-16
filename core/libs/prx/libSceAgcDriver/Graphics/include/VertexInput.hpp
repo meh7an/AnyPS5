@@ -2,6 +2,7 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_VERTEXINPUT_HPP
 
 #include "prx/libSceAgcDriver/Graphics/include/Shaders.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/InlineList.hpp"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -105,8 +106,8 @@ inline std::string VertexAttributeSignature(const ShaderRecompiler::VertexAttrib
 }
 
 struct VertexInputLayout {
-    std::vector<VkVertexInputBindingDescription> bindings;
-    std::vector<VkVertexInputAttributeDescription> attributes;
+    InlineList<VkVertexInputBindingDescription, 16> bindings;
+    InlineList<VkVertexInputAttributeDescription, 16> attributes;
 };
 
 inline bool VertexFormatSupported(const Context& context, VkFormat format) {
@@ -139,11 +140,19 @@ inline bool VertexFormatSupported(const Context& context, VkFormat format) {
 inline VertexInputLayout BuildVertexInputLayout(const Context& context, std::span<const ShaderRecompiler::VertexAttribute> attributes) {
     Require(attributes.size() <= context.limits.maxVertexInputBindings && attributes.size() <= context.limits.maxVertexInputAttributes, "vertex input count exceeds device limits");
     VertexInputLayout result;
-    std::set<std::uint32_t> locations;
+    std::uint64_t lowLocations = 0;
+    std::set<std::uint32_t> highLocations;
+    const auto firstUse = [&](std::uint32_t location) {
+        if (location >= 64) return highLocations.insert(location).second;
+        const auto bit = std::uint64_t{1} << location;
+        const bool first = (lowLocations & bit) == 0;
+        lowLocations |= bit;
+        return first;
+    };
     for (const auto& attribute : attributes) {
         const auto& fields = attribute.resource.fields;
         const auto format = DecodeVertexFormat(attribute);
-        Require(attribute.location < context.limits.maxVertexInputAttributes && locations.insert(attribute.location).second, "invalid or duplicate vertex attribute location");
+        Require(attribute.location < context.limits.maxVertexInputAttributes && firstUse(attribute.location), "invalid or duplicate vertex attribute location");
         Require(attribute.fetchIndex <= 1, "unsupported vertex fetch index");
         Require((fields[1] & 0x80000000u) == 0 && (fields[3] & 0x00800000u) == 0 && (fields[3] >> 30u) == 0, "unsupported vertex buffer descriptor flags");
         const auto stride = (fields[1] >> 16u) & 0x3fffu;
@@ -222,33 +231,46 @@ struct VertexFetch {
 };
 
 struct VertexCopyPlan {
-    std::vector<std::pair<std::uint64_t, std::uint64_t>> copies;
-    std::vector<std::size_t> copyOf;
-    std::vector<std::uint64_t> offsets;
-    std::vector<std::uint32_t> alignments;
+    InlineList<std::pair<std::uint64_t, std::uint64_t>, 16> copies;
+    InlineList<std::size_t, 16> copyOf;
+    InlineList<std::uint64_t, 16> offsets;
+    InlineList<std::uint32_t, 16> alignments;
 };
 
 inline VertexCopyPlan PlanVertexCopies(std::span<const VertexFetch> fetches) {
     VertexCopyPlan plan;
     plan.copyOf.assign(fetches.size(), 0);
     plan.offsets.assign(fetches.size(), 0);
-    std::vector<std::size_t> order(fetches.size());
-    for (std::size_t i = 0; i < order.size(); ++i) order[i] = i;
-    std::stable_sort(order.begin(), order.end(), [&](std::size_t a, std::size_t b) {
+    std::array<std::size_t, 16> localOrder{};
+    std::vector<std::size_t> heapOrder;
+    auto* order = localOrder.data();
+    if (fetches.size() > localOrder.size()) {
+        heapOrder.resize(fetches.size());
+        order = heapOrder.data();
+    }
+    const auto before = [&](std::size_t a, std::size_t b) {
         const auto& x = fetches[a];
         const auto& y = fetches[b];
         if (x.stride != y.stride) return x.stride < y.stride;
         if (x.fetchIndex != y.fetchIndex) return x.fetchIndex < y.fetchIndex;
         return x.begin < y.begin;
-    });
+    };
+    for (std::size_t i = 0; i < fetches.size(); ++i) {
+        std::size_t at = i;
+        while (at != 0 && before(i, order[at - 1])) {
+            order[at] = order[at - 1];
+            --at;
+        }
+        order[at] = i;
+    }
     std::size_t lead = fetches.size();
-    for (const auto i : order) {
+    for (const auto i : std::span<const std::size_t>(order, fetches.size())) {
         const auto& fetch = fetches[i];
         Require(fetch.begin < fetch.end && fetch.alignment != 0, "empty vertex fetch range");
         const bool joins = lead != fetches.size() && fetch.stride != 0 && fetches[lead].stride == fetch.stride && fetches[lead].fetchIndex == fetch.fetchIndex && fetch.begin - fetches[lead].begin < fetch.stride && (fetch.begin - fetches[lead].begin) % fetch.alignment == 0;
         if (!joins) {
             lead = i;
-            plan.copies.emplace_back(fetch.begin, fetch.end);
+            plan.copies.push_back({fetch.begin, fetch.end});
             plan.alignments.push_back(fetch.alignment);
         }
         plan.alignments.back() = std::max(plan.alignments.back(), fetch.alignment);
@@ -343,9 +365,9 @@ inline std::vector<std::uint32_t> MeshRestartTable(std::span<const std::byte> in
     return starts;
 }
 
-inline std::vector<std::size_t> SoloZeroPaddedFetchIndices(const std::vector<VertexFetch>& fetches, const std::vector<std::size_t>& fetchValid) {
+inline InlineList<std::size_t, 16> SoloZeroPaddedFetchIndices(std::span<const VertexFetch> fetches, std::span<const std::size_t> fetchValid) {
     Require(fetchValid.size() == fetches.size(), "fetch validity does not match the fetch count");
-    std::vector<std::size_t> solo;
+    InlineList<std::size_t, 16> solo;
     for (std::size_t i = 0; i < fetches.size(); ++i) {
         if (fetchValid[i] < fetches[i].end - fetches[i].begin) solo.push_back(i);
     }

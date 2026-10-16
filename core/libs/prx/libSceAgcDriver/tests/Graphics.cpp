@@ -5701,14 +5701,15 @@ void vertexCopyTests() {
     {
         const std::array<VertexFetch, 3> fetches{{{0x1018, 0x1018 + 32 * 9 + 8, 32, 0, 4}, {0x1000, 0x1000 + 32 * 9 + 12, 32, 0, 4}, {0x100c, 0x100c + 32 * 9 + 12, 32, 0, 4}}};
         const auto plan = PlanVertexCopies(fetches);
+        const auto list = [](const auto& values) { return std::vector(values.begin(), values.end()); };
         Require(plan.copies.size() == 1 && plan.copies[0].first == 0x1000 && plan.copies[0].second == 0x1018 + 32 * 9 + 8, "interleaved attributes were not copied as one union");
-        Require(plan.copyOf == std::vector<std::size_t>{0, 0, 0} && plan.offsets == std::vector<std::uint64_t>{0x18, 0, 0xc}, "interleaved attribute offsets are wrong");
-        Require(plan.alignments == std::vector<std::uint32_t>{4}, "the union's alignment is not its attributes'");
+        Require(list(plan.copyOf) == std::vector<std::size_t>{0, 0, 0} && list(plan.offsets) == std::vector<std::uint64_t>{0x18, 0, 0xc}, "interleaved attribute offsets are wrong");
+        Require(list(plan.alignments) == std::vector<std::uint32_t>{4}, "the union's alignment is not its attributes'");
     }
     {
         const std::array<VertexFetch, 2> fetches{{{0x4000, 0x4100, 16, 0, 2}, {0x4004, 0x4104, 16, 0, 4}}};
         const auto plan = PlanVertexCopies(fetches);
-        Require(plan.copies.size() == 1 && plan.alignments == std::vector<std::uint32_t>{4}, "a union did not take its strictest attribute alignment");
+        Require(plan.copies.size() == 1 && plan.alignments.size() == 1 && plan.alignments[0] == 4, "a union did not take its strictest attribute alignment");
     }
     {
         const std::array<VertexFetch, 6> fetches{{
@@ -5761,8 +5762,8 @@ void vertexZeroFillMergeTests() {
     using AgcDriver::Graphics::VertexFetch;
     const std::vector<VertexFetch> fetches{{0x1000u, 0x1000u + 88u, 24u, 0u, 4u}, {0x1010u, 0x1010u + 80u, 24u, 0u, 4u}};
     Require(PlanVertexCopies(fetches).copies.size() == 1, "interleaved attributes share one vertex copy");
-    Require(SoloZeroPaddedFetchIndices(fetches, {88u, 80u}).empty(), "fully valid fetches share the straight copy");
-    const auto solo = SoloZeroPaddedFetchIndices(fetches, {88u, 72u});
+    Require(SoloZeroPaddedFetchIndices(fetches, std::vector<std::size_t>{88u, 80u}).empty(), "fully valid fetches share the straight copy");
+    const auto solo = SoloZeroPaddedFetchIndices(fetches, std::vector<std::size_t>{88u, 72u});
     Require(solo.size() == 1 && solo[0] == 1, "a fetch past the records is copied alone");
 }
 
