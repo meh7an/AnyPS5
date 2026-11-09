@@ -3,10 +3,12 @@
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <cstring>
+#include <exception>
 #include <iostream>
 #include <limits>
 #include <mutex>
@@ -316,6 +318,228 @@ void CheckCoverageThreadAndDriverWrites() {
     Require(Walked(Base + Block, 2 * Block, Base + Block + Page, false), "an uncached collection reused an observation");
 }
 
+std::uint64_t nextOrder = 1000;
+
+void Enter(std::uint64_t order) {
+    BumpCollectEpoch();
+    JoinCollectOrder(order);
+}
+
+template <typename Body>
+void OnOtherThread(Body body) {
+    std::exception_ptr failure;
+    std::thread other([&] {
+        try {
+            body();
+        } catch (...) {
+            failure = std::current_exception();
+        }
+    });
+    other.join();
+    if (failure != nullptr) std::rethrow_exception(failure);
+}
+
+bool WalkedOnOtherThread(std::uint64_t order, std::uint64_t address, std::size_t bytes, std::uint64_t probe, bool cached = true) {
+    bool walked = false;
+    OnOtherThread([&] {
+        Enter(order);
+        walked = Walked(address, bytes, probe, cached);
+    });
+    return walked;
+}
+
+void Observe(std::uint64_t order, std::uint64_t address, std::size_t bytes) {
+    Enter(order);
+    Require(CollectWrites(address, bytes) != 0, "the observing collection failed");
+}
+
+void CheckSharedWalkServesEitherThread(bool shared) {
+    const auto address = Base + 40 * Block;
+    const auto probe = address + Block + Page;
+    const auto hits = SharedCollectHits();
+    auto order = ++nextOrder;
+    Observe(order, address, 4 * Block);
+    Require(WalkedOnOtherThread(order, address + Block, 2 * Block, probe) != shared, shared ? "a committer walked what the worker had observed in the same order" : "the switch left a walk shared between threads");
+    Require(SharedCollectHits() == hits + (shared ? 1 : 0), "the shared hit count does not match the walks answered");
+
+    order = ++nextOrder;
+    OnOtherThread([&] { Observe(order, address, 4 * Block); });
+    Enter(order);
+    Require(Walked(address + Block, 2 * Block, probe) != shared, shared ? "a worker walked what the committer had observed in the same order" : "the switch left a walk shared in the other direction");
+    Require(SharedCollectHits() == hits + (shared ? 2 : 0), "the shared hit count does not match both directions");
+
+    Enter(++nextOrder);
+    Require(Walked(address + Block, 2 * Block, probe), "a store left to the next order was not found");
+}
+
+void CheckSharedWalkKeepsGeneration() {
+    const auto address = Base + 45 * Block;
+    const auto order = ++nextOrder;
+    Enter(order);
+    const auto observed = CollectWrites(address, Block);
+    Require(observed != 0, "the observing collection failed");
+    std::uint64_t reused = 0;
+    OnOtherThread([&] {
+        Enter(order);
+        reused = CollectWrites(address, Block);
+    });
+    Require(reused >= observed, "a shared hit returned a generation older than the walk it reused");
+}
+
+void CheckSharedWalkInvalidation() {
+    const auto address = Base + 50 * Block;
+    const auto probe = address + Page;
+    auto order = ++nextOrder;
+    Observe(order, address, 4 * Block);
+    Require(!WalkedOnOtherThread(order, address, 2 * Block, probe), "the same order did not share the walk");
+    Require(WalkedOnOtherThread(++nextOrder, address, 2 * Block, probe), "another order inherited the walk");
+
+    order = ++nextOrder;
+    Observe(order, address, 4 * Block);
+    Unwatch(Base + 92 * Block, Page);
+    Require(WalkedOnOtherThread(order, address, 2 * Block, probe), "an unwatch left a shared walk valid");
+
+    order = ++nextOrder;
+    Observe(order, address, 4 * Block);
+    GuestAllocations::GuestAllocationsInvalidate_nid_postfix(static_cast<std::uintptr_t>(Base + 93 * Block), Page);
+    Require(WalkedOnOtherThread(order, address, 2 * Block, probe), "a mapping change left a shared walk valid");
+
+    order = ++nextOrder;
+    Observe(order, address, 4 * Block);
+    Require(WalkedOnOtherThread(order, address, 2 * Block, probe, false), "an uncached collection used a shared walk");
+
+    order = ++nextOrder;
+    Observe(order, address, 4 * Block);
+    bool walked = false;
+    OnOtherThread([&] {
+        Enter(order);
+        BumpCollectEpoch();
+        walked = Walked(address, 2 * Block, probe);
+    });
+    Require(walked, "a thread that passed an ordering point used a walk of its old order");
+
+    order = ++nextOrder;
+    Observe(order, address, 4 * Block);
+    OnOtherThread([&] {
+        BumpCollectEpoch();
+        walked = Walked(address, 2 * Block, probe);
+    });
+    Require(walked, "a thread that never joined an order used a shared walk");
+
+    order = ++nextOrder;
+    Observe(order, address, 2 * Block);
+    Observe(order, address + 3 * Block, 2 * Block);
+    Require(WalkedOnOtherThread(order, address + Block, 3 * Block, address + 2 * Block + Page), "a hole between shared walks was treated as observed");
+}
+
+void CheckSharedWalkKeepsDriverWrites() {
+    const auto address = Base + 60 * Block;
+    const auto order = ++nextOrder;
+    Observe(order, address, 4 * Block);
+    const auto before = TrackerGeneration();
+    const auto written = MarkWritten(address + Block, Page);
+    Require(written > before, "the driver write did not advance the tracker");
+    std::uint64_t reused = 0;
+    bool unchanged = true;
+    OnOtherThread([&] {
+        Enter(order);
+        reused = CollectWrites(address, 4 * Block);
+        unchanged = UnchangedSince(address + Block, Page, before);
+    });
+    Require(reused >= written, "a shared walk hid a completed driver write generation");
+    Require(!unchanged, "a shared walk hid a driver write stamp");
+}
+
+void CheckSharedWalkEviction() {
+    const auto address = Base + 70 * Block;
+    const auto probe = address + Page;
+    nextOrder += 16;
+    const auto order = nextOrder;
+    nextOrder += 16;
+    Observe(order, address, 2 * Block);
+    Observe(order + 8, address, 2 * Block);
+    Require(WalkedOnOtherThread(order, address, Block, probe), "an order that lost its slot still shared its walk");
+    Require(!WalkedOnOtherThread(order + 8, address, Block, probe), "a late walk of an older order replaced the newer one");
+}
+
+void CheckSharedCoverageBound() {
+    const auto order = ++nextOrder;
+    const auto capacity = SharedCollectRangesPerOrder;
+    Enter(order);
+    for (std::uint64_t i = 0; i < capacity + 40; ++i) Require(CollectWritesUncached(Base + 2 * i * Page, Page) != 0, "a bounded collection failed");
+    Require(SharedCollectRanges() == capacity, "the shared coverage grew past its bound");
+    Require(!WalkedOnOtherThread(order, Base, Page, Base), "a range inside the bound was not shared");
+    const auto beyond = Base + 2 * (capacity + 10) * Page;
+    Require(WalkedOnOtherThread(order, beyond, Page, beyond), "a range past the bound was treated as observed");
+    Require(SharedCollectRanges() == capacity, "a dropped walk changed the bounded coverage");
+}
+
+#ifndef _WIN32
+void CheckSharedWalkSkipsFailedWalk() {
+    const auto order = ++nextOrder;
+    const auto address = Base + 80 * Block + 3 * Page;
+    Enter(order);
+    SetFailing(true);
+    Require(CollectWrites(address, Page) == 0, "a failed walk returned a generation");
+    SetFailing(false);
+    const auto before = Walks();
+    Require(WalkedOnOtherThread(order, address, Page, address), "a failed walk was shared");
+    Require(Walks() > before, "the thread after a failed walk did not reach the write watch");
+}
+
+void CheckSharedWalkPublishedAfterWalk() {
+    auto& fake = Fake();
+    const auto order = ++nextOrder;
+    const auto address = Base + 85 * Block;
+    {
+        const std::lock_guard lock(fake.mutex);
+        fake.holdNextWalk = true;
+        fake.holding = false;
+        fake.released = false;
+    }
+    std::thread walker([&] { Observe(order, address, Block); });
+    bool holding = false;
+    {
+        std::unique_lock lock(fake.mutex);
+        holding = fake.changed.wait_for(lock, Patience, [&] { return fake.holding; });
+    }
+    std::atomic<bool> returned{false};
+    std::thread reader([&] {
+        Enter(order);
+        static_cast<void>(CollectWrites(address, Block));
+        returned.store(true);
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+    const bool early = returned.load();
+    {
+        const std::lock_guard lock(fake.mutex);
+        fake.released = true;
+    }
+    fake.changed.notify_all();
+    walker.join();
+    reader.join();
+    Require(holding, "the walk did not reach the write watch");
+    Require(!early, "another thread reused a walk still in progress");
+}
+#endif
+
+void CheckSharedWalks() {
+    CheckSharedWalkServesEitherThread(true);
+    CheckSharedWalkKeepsGeneration();
+    CheckSharedWalkInvalidation();
+    CheckSharedWalkKeepsDriverWrites();
+    CheckSharedWalkEviction();
+#ifndef _WIN32
+    CheckSharedWalkSkipsFailedWalk();
+    CheckSharedWalkPublishedAfterWalk();
+#endif
+}
+
+void CheckSharedWalksDisabled() {
+    CheckSharedWalkServesEitherThread(false);
+    Require(SharedCollectHits() == 0 && SharedCollectRanges() == 0, "the switch left shared coverage in use");
+}
+
 }
 
 int main(int argc, char** argv) {
@@ -339,7 +563,10 @@ int main(int argc, char** argv) {
             } else if (selected == "--invalidation") {
                 CheckCoverageGapsAndInvalidations();
                 CheckCoverageThreadAndDriverWrites();
-            } else throw std::runtime_error("unknown collect coverage test");
+            } else if (selected == "--shared") CheckSharedWalks();
+            else if (selected == "--shared-off") CheckSharedWalksDisabled();
+            else if (selected == "--shared-bound") CheckSharedCoverageBound();
+            else throw std::runtime_error("unknown collect coverage test");
             std::cout << "collect coverage test passed\n";
             return 0;
         }

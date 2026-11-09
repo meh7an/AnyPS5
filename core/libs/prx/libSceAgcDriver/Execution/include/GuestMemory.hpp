@@ -119,6 +119,10 @@ bool StoredAllSince_nid_no_patch(std::uint64_t address, std::size_t bytes, std::
 // workers bump before every packet as before. CollectEpochBumps counts the bumps ([guestmem] line).
 void BumpCollectEpoch();
 void AdoptLatestCollectEpoch();
+inline constexpr std::size_t SharedCollectRangesPerOrder = 512;
+void JoinCollectOrder(std::uint64_t order);
+std::uint64_t SharedCollectHits();
+std::size_t SharedCollectRanges();
 std::uint64_t ProofSerial();
 void BreakProofs();
 void MarkProofThread();

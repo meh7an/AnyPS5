@@ -125,6 +125,7 @@ void raiseForgetSlot(std::atomic<std::uint64_t>& slot, std::uint64_t serial) {
 }
 std::atomic<std::uint64_t> forgetBytes{0};
 std::atomic<std::uint64_t> collectMemoHits{0};
+std::atomic<std::uint64_t> sharedCollectHits{0};
 std::atomic<std::uint64_t> collectEpochBumps{0};
 std::atomic<std::uint64_t> unwatchSerial{0};
 // Walks that reported at least one written page (the ones the probe pass used to double), and the
@@ -359,6 +360,7 @@ public:
             AgcDriver::ProfilePrint_nid_no_patch(" %s %llu calls %.0f MiB %.1f s", MemoryCounterNames[i], static_cast<unsigned long long>(totals[i][0]), totals[i][1] / 1048576.0, totals[i][2] / 1e9);
         }
         AgcDriver::ProfilePrint_nid_no_patch(" collect-memo hits %llu, collect epochs %llu", static_cast<unsigned long long>(collectMemoHits.load()), static_cast<unsigned long long>(collectEpochBumps.load()));
+        AgcDriver::ProfilePrint_nid_no_patch(" shared collect hits %llu, ranges %llu", static_cast<unsigned long long>(sharedCollectHits.load()), static_cast<unsigned long long>(SharedCollectRanges()));
         AgcDriver::ProfilePrint_nid_no_patch(" collect-dirty %llu tracker waits %llu / %llu", static_cast<unsigned long long>(collectDirty.load()), static_cast<unsigned long long>(trackerWaits.load()), static_cast<unsigned long long>(trackerAcquisitions.load()));
         AgcDriver::ProfilePrint_nid_no_patch(" | arena 0x%llx+0x%llx image 0x%llx+0x%llx forgets %llu (%.0f MiB)", static_cast<unsigned long long>(PagesBase()), static_cast<unsigned long long>(PagesSize()), static_cast<unsigned long long>(ImagePagesBase()), static_cast<unsigned long long>(ImagePagesSize()), static_cast<unsigned long long>(forgetCalls.load()), forgetBytes.load() / 1048576.0);
         {
@@ -1595,6 +1597,15 @@ std::uint64_t currentCollectEpoch() {
     return nextCollectEpoch.fetch_add(1, std::memory_order_relaxed) + 1;
 }
 
+struct CollectOrderEpochSlot {};
+struct CollectOrderSlot {};
+
+std::uint64_t collectOrder(std::uint64_t epoch) {
+    static const bool disabled = std::getenv("APS5_NO_SHARED_COLLECT_COVERAGE") != nullptr;
+    if (disabled || HostThreadSlot<std::uint64_t, CollectOrderEpochSlot>::Get() != epoch) return 0;
+    return HostThreadSlot<std::uint64_t, CollectOrderSlot>::Get();
+}
+
 bool collectMemoEnabled() {
     static const bool disabled = std::getenv("APS5_NO_COLLECT_MEMO") != nullptr;
     return !disabled;
@@ -1650,6 +1661,44 @@ struct EpochCollectMap {
         ranges.emplace_hint(next, begin, end);
     }
 };
+
+class SharedCollectCoverage {
+public:
+    bool Covers(std::uint64_t order, std::uintptr_t begin, std::uintptr_t end, std::uint64_t unwatched, std::uint64_t mapping) {
+        const std::lock_guard lock(mutex);
+        const auto& map = slots[order % slots.size()];
+        return map.epoch == order && map.unwatched == unwatched && map.mapping == mapping && map.Covers(begin, end);
+    }
+
+    void Record(std::uint64_t order, std::uintptr_t begin, std::uintptr_t end, std::uint64_t unwatched, std::uint64_t mapping) {
+        const std::lock_guard lock(mutex);
+        auto& map = slots[order % slots.size()];
+        if (order < map.epoch || (order == map.epoch && (unwatched < map.unwatched || mapping < map.mapping))) return;
+        if (order != map.epoch || unwatched != map.unwatched || mapping != map.mapping) {
+            map.ranges.clear();
+            map.epoch = order;
+            map.unwatched = unwatched;
+            map.mapping = mapping;
+        }
+        if (map.ranges.size() < SharedCollectRangesPerOrder) map.Record(begin, end);
+    }
+
+    std::size_t Ranges() {
+        const std::lock_guard lock(mutex);
+        std::size_t ranges = 0;
+        for (const auto& map : slots) ranges += map.ranges.size();
+        return ranges;
+    }
+
+private:
+    AgcDriver::Mutex mutex;
+    std::array<EpochCollectMap, 8> slots;
+};
+
+SharedCollectCoverage& sharedCollectCoverage() {
+    static SharedCollectCoverage coverage;
+    return coverage;
+}
 
 EpochCollectMap& epochCollectMap(std::uint64_t epoch, std::uint64_t unwatched, std::uint64_t mapping) {
     struct Slot {};
@@ -1821,8 +1870,14 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
                 return tracker.stable.load(std::memory_order_acquire);
             }
         }
+        if (const auto order = collectOrder(epoch); order != 0 && sharedCollectCoverage().Covers(order, static_cast<std::uintptr_t>(first), static_cast<std::uintptr_t>(stop), unwatched, mapping)) {
+            collectMemoHits.fetch_add(1, std::memory_order_relaxed);
+            sharedCollectHits.fetch_add(1, std::memory_order_relaxed);
+            if (epochCollectMapEnabled()) epochCollectMap(epoch, unwatched, mapping).Record(static_cast<std::uintptr_t>(first), static_cast<std::uintptr_t>(stop));
+            return tracker.stable.load(std::memory_order_acquire);
+        }
     }
-    const auto lock = lockTracker(tracker);
+    auto lock = lockTracker(tracker);
     tracker.initialize();
     if (!tracker.watched || bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address || !tracker.covers(address, bytes)) return 0;
     auto cursor = first;
@@ -1869,7 +1924,11 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
             }
         }
     }
-    return tracker.generation;
+    const std::uint64_t generation = tracker.generation;
+    const auto order = epochal && collectMemoEnabled() && !sharedCollectMemo() ? collectOrder(epoch) : 0;
+    lock.Unlock();
+    if (order != 0) sharedCollectCoverage().Record(order, static_cast<std::uintptr_t>(first), static_cast<std::uintptr_t>(stop), unwatched, mapping);
+    return generation;
 }
 
 }
@@ -1966,6 +2025,19 @@ std::uint64_t ThreadCollectEpoch() {
 
 std::uint64_t UnwatchSerial() {
     return unwatchSerial.load(std::memory_order_acquire);
+}
+
+void JoinCollectOrder(std::uint64_t order) {
+    HostThreadSlot<std::uint64_t, CollectOrderEpochSlot>::Set(HostThreadSlot<std::uint64_t, CollectEpochSlot>::Get());
+    HostThreadSlot<std::uint64_t, CollectOrderSlot>::Set(order);
+}
+
+std::uint64_t SharedCollectHits() {
+    return sharedCollectHits.load(std::memory_order_relaxed);
+}
+
+std::size_t SharedCollectRanges() {
+    return sharedCollectCoverage().Ranges();
 }
 
 void AdoptLatestCollectEpoch() {
